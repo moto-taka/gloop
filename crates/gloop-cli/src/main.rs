@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+mod templates;
 mod wizard;
 
 #[tokio::main]

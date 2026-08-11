@@ -15,6 +15,8 @@ use gloop_core::{
 };
 use serde_json::Value;
 
+use crate::templates::{validate_init_template_name, DEFAULT_TEMPLATE_GOAL};
+
 const INTERACTIVE_NESTING_LIMIT: usize = 8;
 
 #[derive(Debug, Clone, Copy)]
@@ -254,6 +256,130 @@ pub fn interactive_graph() -> Result<Graph> {
 pub fn interactive_graph_with_seed(name: Option<&str>, goal: Option<&str>) -> Result<Graph> {
     let theme = ColorfulTheme::default();
     interactive_graph_inner(&theme, 0, name, goal)
+}
+
+pub fn interactive_template_init() -> Result<Graph> {
+    let theme = ColorfulTheme::default();
+    let template_name = prompt_template_name(&theme, None)?;
+    let description = prompt_optional_description(&theme)?;
+    let base = prompt_template_base(&theme)?;
+    let mut graph = match base {
+        TemplateBase::Builtin(template) => {
+            let knobs = prompt_template_knobs(&theme, template)?;
+            template_graph(
+                &template_name,
+                DEFAULT_TEMPLATE_GOAL,
+                template,
+                knobs.request,
+                Some(knobs.provider_profiles),
+                knobs.loop_cap,
+            )
+        }
+        TemplateBase::Custom => interactive_graph_with_seed(Some(&template_name), Some(DEFAULT_TEMPLATE_GOAL))?,
+    };
+    graph.metadata.name = template_name;
+    if let Some(description) = description {
+        graph.metadata.description = Some(description);
+    }
+    Ok(graph)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TemplateBase {
+    Builtin(GraphTemplate),
+    Custom,
+}
+
+fn prompt_template_name(theme: &ColorfulTheme, default: Option<&str>) -> Result<String> {
+    loop {
+        let mut input = Input::with_theme(theme)
+            .with_prompt("Template name (kebab-case, max 64 characters)");
+        if let Some(default) = default {
+            input = input.default(default.to_owned());
+        }
+        let candidate: String = input.interact_text()?;
+        if let Err(error) = validate_init_template_name(&candidate) {
+            eprintln!("{error}");
+            continue;
+        }
+        return Ok(candidate);
+    }
+}
+
+fn prompt_optional_description(theme: &ColorfulTheme) -> Result<Option<String>> {
+    let value: String = Input::with_theme(theme)
+        .with_prompt("Optional template description")
+        .allow_empty(true)
+        .interact_text()?;
+    if value.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value.trim().to_owned()))
+    }
+}
+
+fn prompt_template_base(theme: &ColorfulTheme) -> Result<TemplateBase> {
+    let labels = [
+        "direct",
+        "plan-implement-verify",
+        "parallel-research-reduce",
+        "review-fix-loop",
+        "custom",
+    ];
+    let selected = Select::with_theme(theme)
+        .with_prompt("Base template")
+        .items(labels)
+        .default(0)
+        .interact()?;
+
+    match selected {
+        0 => Ok(TemplateBase::Builtin(GraphTemplate::Direct)),
+        1 => Ok(TemplateBase::Builtin(GraphTemplate::PlanImplementVerify)),
+        2 => Ok(TemplateBase::Builtin(GraphTemplate::ParallelResearchReduce)),
+        3 => Ok(TemplateBase::Builtin(GraphTemplate::ReviewFixLoop)),
+        4 => Ok(TemplateBase::Custom),
+        _ => unreachable!("invalid base template selection"),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TemplateKnobs {
+    request: Option<String>,
+    provider_profiles: Vec<String>,
+    loop_cap: Option<u32>,
+}
+
+fn prompt_template_knobs(theme: &ColorfulTheme, template: GraphTemplate) -> Result<TemplateKnobs> {
+    let request = prompt_optional_text(theme, "Optional request text")?;
+    let provider_profiles = prompt_csv(theme, "Optional provider profiles (comma-separated)")?;
+    let loop_cap = if matches!(template, GraphTemplate::ReviewFixLoop) {
+        prompt_optional_number(
+            theme,
+            "Optional loop iteration cap",
+            1u32,
+            MAX_LOOP_ITERATIONS,
+        )?
+    } else {
+        None
+    };
+
+    Ok(TemplateKnobs {
+        request,
+        provider_profiles,
+        loop_cap,
+    })
+}
+
+fn prompt_optional_text(theme: &ColorfulTheme, prompt: &str) -> Result<Option<String>> {
+    let value: String = Input::with_theme(theme)
+        .with_prompt(prompt)
+        .allow_empty(true)
+        .interact_text()?;
+    if value.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
 }
 
 fn interactive_graph_inner(

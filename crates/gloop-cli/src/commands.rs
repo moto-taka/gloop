@@ -30,6 +30,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use toml::{Value as TomlValue, map::Map as TomlMap};
 
+use crate::templates;
 use crate::wizard;
 
 const MAX_PROFILE_TOML_BYTES: u64 = 8 * 1024 * 1024;
@@ -110,6 +111,16 @@ pub enum GraphTemplateArg {
 }
 
 impl GraphTemplateArg {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "direct" => Some(Self::Direct),
+            "plan-implement-verify" => Some(Self::PlanImplementVerify),
+            "parallel-research-reduce" => Some(Self::ParallelResearchReduce),
+            "review-fix-loop" => Some(Self::ReviewFixLoop),
+            _ => None,
+        }
+    }
+
     fn to_template(self) -> wizard::GraphTemplate {
         match self {
             Self::Direct => wizard::GraphTemplate::Direct,
@@ -205,6 +216,11 @@ fn summary_exit_code(summary: &RunSummary) -> ExitCode {
     }
 
     ExitCode::VerificationFailed
+}
+
+async fn write_text_no_replace(path: &Path, content: &str) -> std::io::Result<()> {
+    let path = canonical_write_path(path).await?;
+    write_text_new(path.as_path(), content.as_bytes()).await
 }
 
 async fn write_text_atomic(path: &Path, content: &str) -> std::io::Result<()> {
@@ -730,22 +746,82 @@ pub async fn run_foreground(
 }
 
 fn has_unsupported_interactive_seeds(
-    template: GraphTemplateArg,
+    template: &str,
     request: Option<&str>,
     provider_profiles: Option<&str>,
     loop_cap: Option<u32>,
 ) -> bool {
-    template != GraphTemplateArg::Direct
+    template != "direct"
         || request.is_some()
         || provider_profiles.is_some()
         || loop_cap.is_some()
+}
+
+fn parse_provider_profiles(provider_profiles: Option<String>) -> Option<Vec<String>> {
+    provider_profiles.map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>()
+    })
+}
+
+fn graph_from_resolved_template(
+    resolved: templates::ResolvedTemplate,
+    name: String,
+    goal: String,
+    request: Option<String>,
+    provider_profiles: Option<String>,
+    loop_cap: Option<u32>,
+) -> Result<Graph, CommandResult> {
+    match resolved {
+        templates::ResolvedTemplate::Builtin(builtin_name) => {
+            let template = GraphTemplateArg::from_name(builtin_name).expect("builtin template");
+            Ok(wizard::template_graph(
+                name,
+                goal,
+                template.to_template(),
+                request,
+                parse_provider_profiles(provider_profiles),
+                loop_cap,
+            ))
+        }
+        templates::ResolvedTemplate::Project(mut graph) => {
+            if request.is_some() {
+                return Err(CommandResult::failure_json(
+                    ExitCode::InvalidGraph,
+                    "--request is not supported for saved project templates; edit the template YAML or use a built-in template",
+                    None,
+                ));
+            }
+            if provider_profiles.is_some() {
+                return Err(CommandResult::failure_json(
+                    ExitCode::InvalidGraph,
+                    "--provider-profiles is not supported for saved project templates; edit the template YAML or use a built-in template",
+                    None,
+                ));
+            }
+            if loop_cap.is_some() {
+                return Err(CommandResult::failure_json(
+                    ExitCode::InvalidGraph,
+                    "--loop-cap is not supported for saved project templates; edit the template YAML or use a built-in template",
+                    None,
+                ));
+            }
+            templates::apply_new_overrides(&mut graph, &name, &goal);
+            Ok(*graph)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn graph_new(
     name: String,
     goal: String,
-    template: GraphTemplateArg,
+    template: String,
+    repo: PathBuf,
     request: Option<String>,
     provider_profiles: Option<String>,
     loop_cap: Option<u32>,
@@ -756,7 +832,7 @@ pub async fn graph_new(
 ) -> CommandResult {
     if interactive
         && has_unsupported_interactive_seeds(
-            template,
+            &template,
             request.as_deref(),
             provider_profiles.as_deref(),
             loop_cap,
@@ -781,23 +857,28 @@ pub async fn graph_new(
             }
         }
     } else {
-        let providers = provider_profiles.map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
-        });
+        let resolved = match templates::resolve_template(&template, &repo) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                return CommandResult::failure_json(
+                    ExitCode::InvalidGraph,
+                    error.message(),
+                    None,
+                );
+            }
+        };
 
-        wizard::template_graph(
+        match graph_from_resolved_template(
+            resolved,
             name,
             goal,
-            template.to_template(),
             request,
-            providers,
+            provider_profiles,
             loop_cap,
-        )
+        ) {
+            Ok(graph) => graph,
+            Err(result) => return result,
+        }
     };
 
     let issues = graph.validate();
@@ -863,6 +944,193 @@ pub async fn graph_new(
             eprintln!("warnings: {}", warnings.len());
         }
         CommandResult::success_text(yaml)
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn graph_init(
+    name: Option<String>,
+    from: Option<String>,
+    description: Option<String>,
+    request: Option<String>,
+    provider_profiles: Option<String>,
+    loop_cap: Option<u32>,
+    list: bool,
+    force: bool,
+    repo: PathBuf,
+    json_mode: bool,
+) -> CommandResult {
+    if list {
+        let entries = match templates::list_all_templates(&repo) {
+            Ok(entries) => entries,
+            Err(error) => {
+                return CommandResult::failure_json(
+                    ExitCode::Internal,
+                    "failed to list graph templates",
+                    Some(json!({"error": error})),
+                );
+            }
+        };
+
+        if json_mode {
+            let payload = entries
+                .iter()
+                .map(|entry| {
+                    json!({
+                        "name": entry.name,
+                        "source": match entry.source {
+                            templates::TemplateSource::Builtin => "builtin",
+                            templates::TemplateSource::Project => "project",
+                        },
+                        "description": entry.description,
+                    })
+                })
+                .collect::<Vec<_>>();
+            return CommandResult::success_json(json!({
+                "success": true,
+                "templates": payload,
+            }));
+        }
+
+        let mut lines = Vec::new();
+        for entry in &entries {
+            let source = match entry.source {
+                templates::TemplateSource::Builtin => "builtin",
+                templates::TemplateSource::Project => "project",
+            };
+            if let Some(description) = &entry.description {
+                lines.push(format!("{source} {name}: {description}", name = entry.name));
+            } else {
+                lines.push(format!("{source} {name}", name = entry.name));
+            }
+        }
+        return CommandResult::success_text(lines.join("\n"));
+    }
+
+    if !(name.is_some() && from.is_some())
+        && (description.is_some()
+            || request.is_some()
+            || provider_profiles.is_some()
+            || loop_cap.is_some())
+    {
+        return CommandResult::failure_json(
+            ExitCode::InvalidGraph,
+            "interactive graph init does not accept --description, --request, --provider-profiles, or --loop-cap; provide both --name and --from for non-interactive authoring",
+            None,
+        );
+    }
+
+  let graph = if let (Some(template_name), Some(base)) = (name.as_ref(), from.as_ref()) {
+        if let Err(error) = templates::validate_init_template_name(template_name) {
+            return CommandResult::failure_json(ExitCode::InvalidGraph, error, None);
+        }
+
+        let Some(builtin) = GraphTemplateArg::from_name(base) else {
+            return CommandResult::failure_json(
+                ExitCode::InvalidGraph,
+                format!("unknown built-in template base '{base}'"),
+                None,
+            );
+        };
+
+        let mut graph = wizard::template_graph(
+            template_name,
+            templates::DEFAULT_TEMPLATE_GOAL,
+            builtin.to_template(),
+            request,
+            parse_provider_profiles(provider_profiles),
+            loop_cap,
+        );
+        if let Some(description) = description {
+            graph.metadata.description = Some(description);
+        }
+        graph
+    } else if name.is_some() || from.is_some() {
+        return CommandResult::failure_json(
+            ExitCode::InvalidGraph,
+            "non-interactive graph init requires both --name and --from",
+            None,
+        );
+    } else {
+        match wizard::interactive_template_init() {
+            Ok(graph) => graph,
+            Err(error) => {
+                return CommandResult::failure_json(
+                    ExitCode::Internal,
+                    "interactive template authoring failed",
+                    Some(json!({"error": error.to_string()})),
+                );
+            }
+        }
+    };
+
+    let template_name = if let Some(name) = name {
+        name
+    } else {
+        graph.metadata.name.clone()
+    };
+
+    let issues = graph.validate();
+    let (errors, warnings) = split_validation(&issues);
+    if !errors.is_empty() {
+        return CommandResult::failure_json(
+            ExitCode::InvalidGraph,
+            "template graph validation failed",
+            Some(json!({"errors": errors, "warnings": warnings})),
+        );
+    }
+
+    let yaml = match graph.to_yaml() {
+        Ok(yaml) => yaml,
+        Err(error) => {
+            return CommandResult::failure_json(
+                ExitCode::Internal,
+                "failed serialize template graph",
+                Some(json!({"error": error.to_string()})),
+            );
+        }
+    };
+
+    let destination = templates::template_path(&repo, &template_name);
+    let write_result = if force {
+        write_text_atomic(destination.as_path(), &yaml).await
+    } else {
+        write_text_no_replace(destination.as_path(), &yaml).await
+    };
+    if let Err(error) = write_result {
+        if !force && error.kind() == io::ErrorKind::AlreadyExists {
+            return CommandResult::failure_json(
+                ExitCode::InvalidGraph,
+                "template path exists. use --force to overwrite",
+                Some(json!({"path": destination})),
+            );
+        }
+        return CommandResult::failure_json(
+            ExitCode::Internal,
+            "failed to write template",
+            Some(json!({"path": destination, "error": error.to_string()})),
+        );
+    }
+
+    let usage = format!("gloop graph new workflow.yaml --template {template_name}");
+
+    if json_mode {
+        CommandResult::success_json(json!({
+            "success": true,
+            "written": destination,
+            "usage": usage,
+            "warnings": warnings,
+            "validation": issues,
+        }))
+    } else {
+        if !warnings.is_empty() {
+            eprintln!("warnings: {}", warnings.len());
+        }
+        CommandResult::success_text(format!(
+            "saved template to {}\nusage: {}",
+            destination.display(),
+            usage
+        ))
     }
 }
 
@@ -1633,6 +1901,25 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     #[tokio::test]
+    async fn write_text_no_replace_rejects_existing_destination() {
+        let temporary = tempdir().expect("temporary directory");
+        let canonical_root =
+            std::fs::canonicalize(temporary.path()).expect("canonicalize temporary directory");
+        let destination = canonical_root.join("graph.yml");
+        write_text_no_replace(&destination, "first")
+            .await
+            .expect("first write should succeed");
+        let error = write_text_no_replace(&destination, "second")
+            .await
+            .expect_err("second write must fail");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read_to_string(destination).expect("read destination"),
+            "first"
+        );
+    }
+
+    #[tokio::test]
     async fn write_text_atomic_writes_file_without_symlinks() {
         let temporary = tempdir().expect("temporary directory");
         let canonical_root =
@@ -1697,7 +1984,8 @@ mod tests {
         let result = graph_new(
             "seed-name".to_owned(),
             "seed goal".to_owned(),
-            GraphTemplateArg::ReviewFixLoop,
+            "review-fix-loop".to_owned(),
+            PathBuf::from("."),
             None,
             None,
             None,

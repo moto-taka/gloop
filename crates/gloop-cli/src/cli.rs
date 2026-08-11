@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 use crate::commands::{
-    GraphTemplateArg, RenderFormat, graph_explain, graph_new, graph_render, graph_schema,
+    RenderFormat, graph_explain, graph_init, graph_new, graph_render, graph_schema,
     graph_validate, inspect_run_at, present, provider_add, provider_doctor, provider_list,
     provider_probe, replay_run, run_foreground, run_logs,
 };
@@ -98,6 +98,7 @@ struct RunCommand {
 #[derive(Subcommand)]
 enum GraphCommand {
     New(GraphNew),
+    Init(GraphInit),
     Validate(GraphFile),
     Explain(GraphFile),
     Render(GraphRender),
@@ -125,12 +126,14 @@ struct GraphNew {
     goal: String,
 
     #[arg(
-        value_enum,
         long,
         default_value = "direct",
         conflicts_with = "interactive"
     )]
-    template: GraphTemplateArg,
+    template: String,
+
+    #[arg(long = "repo", value_name = "PATH", default_value = ".")]
+    repo: PathBuf,
 
     #[arg(long, conflicts_with = "interactive")]
     request: Option<String>,
@@ -146,6 +149,39 @@ struct GraphNew {
 
     #[arg(long)]
     interactive: bool,
+
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct GraphInit {
+    #[arg(long)]
+    name: Option<String>,
+
+    #[arg(long)]
+    from: Option<String>,
+
+    #[arg(long)]
+    description: Option<String>,
+
+    #[arg(long, conflicts_with = "list")]
+    request: Option<String>,
+
+    #[arg(long, conflicts_with = "list")]
+    provider_profiles: Option<String>,
+
+    #[arg(long = "loop-cap", conflicts_with = "list")]
+    loop_cap: Option<u32>,
+
+    #[arg(long, conflicts_with_all = ["name", "from", "description", "request", "provider_profiles", "loop_cap"])]
+    list: bool,
+
+    #[arg(long)]
+    force: bool,
+
+    #[arg(long = "repo", value_name = "PATH", default_value = ".")]
+    repo: PathBuf,
 
     #[arg(long)]
     json: bool,
@@ -232,6 +268,7 @@ impl Command {
         match self {
             Self::Run(c) => c.json,
             Self::Graph(GraphCommand::New(c)) => c.json,
+            Self::Graph(GraphCommand::Init(c)) => c.json,
             Self::Graph(GraphCommand::Validate(c) | GraphCommand::Explain(c)) => c.json,
             Self::Graph(GraphCommand::Render(c)) => c.json,
             Self::Graph(GraphCommand::Schema(c)) => c.json,
@@ -272,12 +309,28 @@ pub async fn run() -> Result<()> {
                     c.name,
                     c.goal,
                     c.template,
+                    c.repo,
                     c.request,
                     c.provider_profiles,
                     c.loop_cap,
                     c.interactive,
                     c.path,
                     c.force,
+                    c.json,
+                )
+                .await
+            }
+            GraphCommand::Init(c) => {
+                graph_init(
+                    c.name,
+                    c.from,
+                    c.description,
+                    c.request,
+                    c.provider_profiles,
+                    c.loop_cap,
+                    c.list,
+                    c.force,
+                    c.repo,
                     c.json,
                 )
                 .await
