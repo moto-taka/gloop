@@ -14,6 +14,12 @@ Install the latest version directly from the public GitHub repository (works fro
 cargo install --git https://github.com/moto-taka/gloop --locked gloop-cli
 ```
 
+On macOS or Linux with [Homebrew](https://brew.sh/):
+
+```bash
+brew install moto-taka/tap/gloop
+```
+
 The binary is named `gloop`. To install from a local checkout instead, run the command from the repository root:
 
 ```bash
