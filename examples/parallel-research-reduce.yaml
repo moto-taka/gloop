@@ -1,0 +1,46 @@
+apiVersion: gloop.dev/v1alpha1
+kind: Graph
+metadata:
+  name: parallel-research-reduce
+  version: "1.0.0"
+  description: parallel research and synthesis
+spec:
+  goal: Research in parallel and synthesize the result
+  nodes:
+    - id: research_one
+      kind: agent
+      prompt: |
+        Research lane 1 for one objective.
+      fan_out: 2
+      output:
+        format: text
+    - id: research_two
+      kind: agent
+      prompt: |
+        Research lane 2 for one objective.
+      fan_out: 2
+      output:
+        format: text
+    - id: research_three
+      kind: agent
+      prompt: |
+        Research lane 3 for one objective.
+      fan_out: 2
+      output:
+        format: text
+    - id: synthesize
+      kind: reduce
+      prompt: |
+        Combine findings from all lanes into one reconciled recommendation.
+      output:
+        format: text
+  edges:
+    - from: research_one
+      to: synthesize
+      kind: data
+    - from: research_two
+      to: synthesize
+      kind: data
+    - from: research_three
+      to: synthesize
+      kind: data

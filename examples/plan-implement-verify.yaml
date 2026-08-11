@@ -1,0 +1,37 @@
+apiVersion: gloop.dev/v1alpha1
+kind: Graph
+metadata:
+  name: plan-implement-verify
+  version: "1.0.0"
+spec:
+  goal: Plan, implement, and verify the request
+  nodes:
+    - id: plan
+      kind: agent
+      prompt: |
+        Plan role: planner. Write a concrete implementation plan.
+      fan_out: 1
+      output:
+        format: text
+    - id: implement
+      kind: agent
+      prompt: |
+        Plan role: implementer. Execute the plan.
+      fan_out: 1
+      output:
+        format: text
+    - id: verify
+      kind: verify
+      argv:
+        - git
+        - diff
+        - --check
+      output:
+        format: text
+  edges:
+    - from: plan
+      to: implement
+      kind: data
+    - from: implement
+      to: verify
+      kind: data

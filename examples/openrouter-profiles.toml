@@ -1,0 +1,26 @@
+# Copy this file to <project>/.gloop/profiles.toml.
+# The credential is read from the environment and must not be placed here.
+
+[profiles.openrouter-deepseek-v4-flash]
+kind = "openai"
+base_url = "https://openrouter.ai/api/v1/"
+model = "deepseek/deepseek-v4-flash-0731"
+api_key_env = "OPENROUTER_API_KEY"
+timeout_seconds = 900
+parameters = { max_tokens = 8192 }
+
+[profiles.openrouter-luna]
+kind = "openai"
+base_url = "https://openrouter.ai/api/v1/"
+model = "openai/gpt-5.6-luna"
+api_key_env = "OPENROUTER_API_KEY"
+timeout_seconds = 900
+parameters = { max_tokens = 8192 }
+
+[profiles.openrouter]
+kind = "openai"
+base_url = "https://openrouter.ai/api/v1/"
+model = "openai/gpt-oss-20b:free"
+api_key_env = "OPENROUTER_API_KEY"
+timeout_seconds = 90
+parameters = { max_tokens = 256 }

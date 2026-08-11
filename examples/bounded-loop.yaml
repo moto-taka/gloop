@@ -1,0 +1,66 @@
+apiVersion: gloop.dev/v1alpha1
+kind: Graph
+metadata:
+  name: bounded-loop
+  version: "1.0.0"
+spec:
+  goal: Review, refine, and publish within bounded retries
+  nodes:
+    - id: review_fix_loop
+      kind: loop
+      graph:
+        apiVersion: gloop.dev/v1alpha1
+        kind: Graph
+        metadata:
+          name: review-fix-iteration
+          version: "1.0.0"
+        spec:
+          goal: single review-fix iteration
+          nodes:
+            - id: review
+              kind: agent
+              prompt: |
+                Reviewer role: inspect output defects request follow-up fixes.
+              fan_out: 1
+              output:
+                format: text
+            - id: fix
+              kind: agent
+              prompt: |
+                Implement requested fixes.
+              fan_out: 1
+              output:
+                format: text
+            - id: judge
+              kind: verify
+              argv:
+                - git
+                - diff
+                - --check
+              output:
+                format: text
+          edges:
+            - from: review
+              to: fix
+              kind: data
+            - from: fix
+              to: judge
+              kind: data
+          policies:
+            max_parallel: 1
+      until:
+        node: judge
+        status: succeeded
+      max_iterations: 4
+      stagnation_after: 2
+    - id: publish
+      kind: command
+      argv:
+        - printf
+        - "ready for release\n"
+      output:
+        format: text
+  edges:
+    - from: review_fix_loop
+      to: publish
+      kind: control

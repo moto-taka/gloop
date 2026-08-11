@@ -1,0 +1,70 @@
+apiVersion: gloop.dev/v1alpha1
+kind: Graph
+metadata:
+  name: worktree-inherit
+  description: Demonstrate isolated worktree mutation and inherited workspace verify/repair
+  version: "1.0.0"
+spec:
+  goal: Validate worktree workspace and inherited consume
+  policies:
+    max_parallel: 2
+    failure: fail_fast
+  budgets:
+    wall_time_seconds: 120
+    model_calls: 4
+  nodes:
+    - id: bootstrap_workspace
+      kind: command
+      timeout_seconds: 30
+      workspace:
+        mode: worktree
+        base: HEAD
+        auto_commit: false
+      argv:
+        - sh
+        - -c
+        - |
+          set -eu
+          mkdir -p generated
+          printf 'status=ok\n' > generated/worktree_state.txt
+    - id: verify_state
+      kind: verify
+      requires:
+        - bootstrap_workspace
+      workspace:
+        mode: inherit
+        node: bootstrap_workspace
+      timeout_seconds: 30
+      argv:
+        - sh
+        - -c
+        - |
+          set -eu
+          test -f generated/worktree_state.txt
+          grep -q '^status=ok$' generated/worktree_state.txt
+    - id: repair_followup
+      kind: command
+      requires:
+        - verify_state
+        - bootstrap_workspace
+      workspace:
+        mode: inherit
+        node: bootstrap_workspace
+      timeout_seconds: 30
+      argv:
+        - sh
+        - -c
+        - |
+          set -eu
+          printf 'status=repaired\n' > generated/worktree_state.txt
+          grep -q '^status=repaired$' generated/worktree_state.txt
+  edges:
+    - from: bootstrap_workspace
+      to: verify_state
+      kind: data
+    - from: bootstrap_workspace
+      to: repair_followup
+      kind: data
+    - from: verify_state
+      to: repair_followup
+      kind: data

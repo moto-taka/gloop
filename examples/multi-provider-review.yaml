@@ -1,0 +1,73 @@
+apiVersion: gloop.dev/v1alpha1
+kind: Graph
+metadata:
+  name: multi-provider-review
+  version: "1.0.0"
+  description: blind parallel review by multiple providers
+spec:
+  goal: Get parallel independent reviews and synthesize the result
+  policies:
+    max_parallel: 3
+  budgets:
+    wall_time_seconds: 3600
+    model_calls: 4
+  nodes:
+    - id: claude_review
+      kind: agent
+      profile: claude
+      prompt: >
+        Review the following content and output: critical issues, one concrete patch
+        suggestion each, and a short verdict. Use only facts from the provided context.
+      context:
+        include_dependencies: false
+        files:
+          - examples/review-input.md
+      output:
+        format: text
+
+    - id: opencode_review
+      kind: agent
+      profile: opencode
+      model: opencode-go/deepseek-v4-flash
+      prompt: >
+        Blindly review the same content. Identify concrete defects, edge-cases, and
+        any ambiguity. Return a prioritized list with severity.
+      context:
+        include_dependencies: false
+        files:
+          - examples/review-input.md
+      output:
+        format: text
+
+    - id: qwen_review
+      kind: agent
+      profile: qwen
+      prompt: >
+        Independently review the same input. Do not coordinate with other models.
+        Return concise findings with risk/impact and recommendation.
+      context:
+        include_dependencies: false
+        files:
+          - examples/review-input.md
+      output:
+        format: text
+
+    - id: synthesize
+      kind: synthesize
+      profile: claude
+      prompt: >
+        Synthesize three independent reviews into one final recommendation:
+        1) unanimous findings, 2) disagreements and uncertainty, 3) minimal
+        implementation plan.
+      output:
+        format: text
+  edges:
+    - from: claude_review
+      to: synthesize
+      kind: data
+    - from: opencode_review
+      to: synthesize
+      kind: data
+    - from: qwen_review
+      to: synthesize
+      kind: data

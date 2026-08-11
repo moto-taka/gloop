@@ -1,0 +1,28 @@
+apiVersion: gloop.dev/v1alpha1
+kind: Graph
+metadata:
+  name: openrouter-json
+  version: "1.0.0"
+spec:
+  goal: Verify structured output through an OpenRouter profile
+  budgets:
+    wall_time_seconds: 120
+    model_calls: 1
+  nodes:
+    - id: json_check
+      kind: agent
+      profile: openrouter
+      prompt: 'Return only this JSON object with no markdown: {"status":"ok","number":7}'
+      timeout_seconds: 90
+      output:
+        format: json
+        max_bytes: 16384
+        inline_schema:
+          type: object
+          required: [status, number]
+          additionalProperties: false
+          properties:
+            status:
+              const: ok
+            number:
+              const: 7

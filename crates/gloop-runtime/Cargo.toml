@@ -1,0 +1,34 @@
+[package]
+name = "gloop-runtime"
+description = "Foreground graph, loop, artifact, and journal runtime for gloop"
+documentation = "https://docs.rs/gloop-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+futures.workspace = true
+gloop-core = { path = "../gloop-core", version = "0.1.0" }
+gloop-provider = { path = "../gloop-provider", version = "0.1.0" }
+hex.workspace = true
+indexmap.workspace = true
+jsonschema.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

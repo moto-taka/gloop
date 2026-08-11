@@ -1,0 +1,247 @@
+# gloop
+
+`gloop` is a foreground-only Rust CLI for running configurable agent and command graphs. It combines a versioned DAG/loop IR, deterministic non-LLM scheduling, provider profiles, local artifacts, and journal replay without a daemon or cross-project queue.
+
+![gloop graph orchestration](assets/gloop-graph-hero.png)
+
+Compose provider-backed agents and commands into a graph, fan out work in parallel, merge results, and replay the run locally.
+
+## Install
+
+Install the latest version directly from the public GitHub repository (works from any directory):
+
+```bash
+cargo install --git https://github.com/moto-taka/gloop --locked gloop-cli
+```
+
+The binary is named `gloop`. To install from a local checkout instead, run the command from the repository root:
+
+```bash
+cargo install --path crates/gloop-cli --locked
+```
+
+## Quickstart
+
+Create a graph from a template, validate it, and inspect its shape:
+
+```bash
+gloop graph new workflow.yaml \
+  --name direct \
+  --goal "Summarize the latest changes" \
+  --template direct \
+  --request "Summarize the latest changes"
+
+gloop graph validate workflow.yaml
+gloop graph explain workflow.yaml
+gloop graph render workflow.yaml --format mermaid
+```
+
+Try a blind parallel review example:
+
+```bash
+gloop graph validate examples/multi-provider-review.yaml
+gloop run --graph examples/multi-provider-review.yaml --repo .
+```
+
+See [examples/multi-provider-review.yaml](examples/multi-provider-review.yaml), with context in
+[examples/review-input.md](examples/review-input.md). The review graph uses built-in profiles (`claude`, `opencode`, and `qwen`) and requires whichever provider CLIs/auth are installed for your setup.
+
+Create a graph interactively, in the style of TAKT's authoring flow:
+
+```bash
+gloop graph new workflow.yaml --interactive
+```
+
+Run a saved graph in the foreground:
+
+```bash
+gloop run --graph workflow.yaml --repo /path/to/project
+```
+
+For a small task, create and run a one-node graph directly. `--profile` selects the harness/provider and `--model` remains an arbitrary model id or alias:
+
+```bash
+gloop run "Fix the failing authentication test" \
+  --profile codex \
+  --model gpt-5.3-codex-spark \
+  --non-interactive \
+  --repo /path/to/project
+```
+
+Use `--dry-run` to validate and print the generated graph without invoking a provider. With `--json`, stdout contains exactly one final JSON value; progress is written to stderr only in human-readable mode.
+
+Run artifacts are stored under `<repo>/.gloop/runs/<run-id>`. They can be inspected without rerunning any model:
+
+```bash
+gloop inspect .gloop/runs/<run-id> --json
+gloop logs .gloop/runs/<run-id> --json
+gloop replay .gloop/runs/<run-id> --json
+```
+
+## Execution model
+
+The runtime implements:
+
+- deterministic DAG compilation and foreground scheduling;
+- fan-out/fan-in, conditional failure edges, subgraphs, and bounded nested loops;
+- maximum parallelism (256), graph nesting (32), nested node count (10,000), model-call and wall-time budgets;
+- bounded retry (at most 16 attempts) with ordered profile rebinding, loops capped at 1,024 iterations;
+- fail-closed provider retry safety: HTTP 429 rejections may retry, and profile rebinding may recover failures detected before invocation; timeout, transport, 408/409/425/5xx, process, oversized-output, and invalid-output failures are never replayed because the original request may already have been accepted;
+- failed `subgraph`/`loop` attempts are never replayed as a whole because earlier children or iterations may already have succeeded; put retry policies on the individual inner provider nodes instead;
+- serialization of nodes that claim the same resource;
+- command and verification nodes with capped output;
+- run-wide retained-output accounting for stdout/stderr/raw output (64 MiB total);
+- `max_parallel` is a scheduler-wide cap; nested graphs inherit and can lower it (effective cap is the tighter bound in scope);
+- typed provider failures and status-specific CLI exit codes;
+- per-attempt stdout, stderr, normalized output, summary snapshots, and a hash-chained JSONL journal;
+- scheduler replay and completed-run inspection.
+
+Roles are prompt data, not hardcoded runtime concepts. Graph structure, profile, model, prompt, output schema, and retry policy remain configurable per node.
+
+## Provider profiles
+
+Profiles are layered in this order:
+
+1. built-ins;
+2. the OS-specific user config directory (`gloop/profiles.toml`);
+3. `<project>/.gloop/profiles.toml` (opt-in only via `--trust-project-profiles`).
+
+The built-in command profiles are `codex`, `claude`, `qwen`, `cursor-agent`, `pi`, and `opencode`.
+
+Profile kinds:
+
+- `command` for local executables.
+- `openai` for OpenAI-compatible HTTP providers.
+- `anthropic` for Anthropic-compatible HTTP providers.
+
+Provider execution uses environment-sourced credentials (`*_env`/`headers_from`) and local command profiles run with a constrained environment:
+
+- the command process clears inherited environment and only reintroduces required allowlist entries and mapped `env_from` values,
+- sensitive provider keys are redacted from logs and event output.
+- command version probes check required credential presence but do not inject mapped `env_from` secret values into the probe process.
+
+`HOME` is intentionally retained for command profiles so authenticated harnesses such as
+Codex CLI, Claude Code, Qwen, Pi, and OpenCode can reuse their normal user login. Treat every
+configured command harness as trusted local code: it can read files that its operating-system
+user can read, including harness-owned authentication state. Project profiles remain disabled
+unless `--trust-project-profiles` is supplied. Gloop does not add a general filesystem sandbox;
+among the built-ins, `native_sandbox` is currently declared only by the Codex profile.
+
+Example generic command profile:
+
+```toml
+[profiles.my-agent]
+kind = "command"
+argv = ["my-agent", "run"]
+prompt_mode = "argument"
+prompt_args = ["--prompt", "{prompt}"]
+model_args = ["--model", "{model}"]
+version_args = ["--version"]
+output = "jsonl"
+output_pointer = "/result"
+timeout_seconds = 900
+```
+
+Example OpenAI-compatible profile:
+
+```toml
+[profiles.local-openai]
+kind = "openai"
+base_url = "http://127.0.0.1:8000/v1"
+model = "local-model"
+# Optional for endpoints that do not require authentication:
+# api_key_env = "LOCAL_OPENAI_API_KEY"
+```
+
+OpenRouter uses the same adapter. Keep the key in the environment and choose any
+OpenRouter model id in the profile:
+
+```toml
+[profiles.openrouter]
+kind = "openai"
+base_url = "https://openrouter.ai/api/v1/"
+model = "openai/gpt-oss-20b:free"
+api_key_env = "OPENROUTER_API_KEY"
+timeout_seconds = 90
+parameters = { max_tokens = 256 }
+```
+
+Copy [examples/openrouter-profiles.toml](examples/openrouter-profiles.toml) to
+`.gloop/profiles.toml`, then run with `--trust-project-profiles`. The example
+also includes `openrouter-deepseek-v4-flash` and `openrouter-luna`; provider
+model catalogs can change, so confirm their current model ids before a run.
+
+[examples/openrouter-json.yaml](examples/openrouter-json.yaml) is an OpenRouter
+JSON-schema example. Reasoning models can consume output budget before emitting
+assistant text, so use practical `max_tokens` values.
+
+Example Anthropic-compatible profile:
+
+```toml
+[profiles.anthropic-api]
+kind = "anthropic"
+model = "claude-sonnet-4-5"
+api_key_env = "ANTHROPIC_API_KEY"
+max_tokens = 8192
+```
+
+Secrets are referenced by environment-variable name and are not written into the profile. Useful commands:
+
+```bash
+gloop provider list --json
+gloop provider probe codex --json
+gloop provider doctor --json
+gloop provider add my-agent 'kind = "command" argv = ["my-agent"]'
+```
+
+## Graph IR
+
+The schema version is `gloop.dev/v1alpha1`. Supported node kinds are `agent`, `command`, `reduce`, `synthesize`, `verify`, `gate`, `loop`, and `subgraph`. Supported edge kinds are `data`, `control`, `resource`, `conditional`, and `failure`.
+
+Unknown fields are rejected. Outer graphs must be acyclic; repetition is represented by a bounded `loop` node. Agent-like nodes accept optional `profile` and `model` bindings, while output contracts can require text or JSON and an inline or file-based JSON Schema.
+
+Generate the complete machine-readable schema with:
+
+```bash
+gloop graph schema --json
+```
+
+See [docs/SCHEMA.md](docs/SCHEMA.md) and the graphs in [examples](examples).
+
+## Exit codes
+
+| Code | Meaning |
+|---:|---|
+| 0 | ready for human / command succeeded |
+| 2 | blocked or gate rejected |
+| 3 | node or verification failure |
+| 4 | provider/adapter unavailable |
+| 5 | budget exhausted |
+| 6 | invalid graph or arguments |
+| 7 | unresolved provider profile/capability |
+| 130 | cancelled |
+
+## Known limitations
+
+- Execution is foreground-only. There is no daemon, account lease, or cross-project queue.
+- `readonly` is intentionally unsupported without a filesystem sandbox; the run fails explicitly when requested.
+- `worktree` workspace mode uses a dedicated runtime manager for isolated sibling worktrees. It:
+  - runs a Git preflight with `.gloop` excluded from cleanliness checks,
+  - captures the base commit from `HEAD` (or uses a caller-provided explicit base),
+  - generates unique retained worktree branches and paths per run/node,
+  - reuses the same node worktree across retries,
+  - preserves dirty worktrees on failed/cancelled attempts,
+  - does not push, merge, or auto-delete retained worktrees.
+- Worktree mode disables hooks, external filesystem monitors, and external diff/textconv helpers. It re-checks and rejects repository-local `filter.*.clean`, `filter.*.smudge`, `filter.*.process`, `diff.*.command`, and `diff.*.textconv` configuration before Git operations because those programs could otherwise execute during checkout/staging/inspection; use `current`/`inherit` or remove the local driver configuration.
+- Final successful worktree nodes can auto-commit into their dedicated branch when `auto_commit` is enabled, and `inherit` reuses the true source workspace by identity.
+- Cancellation is process-group based on Unix builds (`ProcessGroup`) and direct-child on non-Unix platforms.
+- Profiles accept arbitrary model ids and aliases, but gloop does not yet enumerate remote provider model catalogs or resume native harness sessions; each node invocation is fresh.
+- Empty model/provider outputs are rejected when they do not satisfy node output contracts (including text/JSON output mode checks).
+- Serialized HTTP provider request bodies are capped at 1 MiB; profile `parameters` maps are capped at 256 entries and 256 KiB serialized.
+- Replay validates hash-chain integrity, run-id/sequence order, and schema compatibility before accepting a rerun; replay rehydrates scheduler state from events and summary checks. These unkeyed hashes detect partial/corrupt edits, not a same-user attacker who can consistently rewrite the whole run directory.
+- Replay does not promise byte-identical re-execution of an LLM.
+- External provider CLI/API credentials and billing remain provider-owned. Gloop surfaces provider-level auth/usage failures; it does not charge on behalf of providers.
+
+## Attribution
+
+The clean-room design draws on TAKT's workflow authoring ideas and Bernstein's deterministic runtime ideas, with provider/evolution research informed by the other pinned projects in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). No daemon or queue layer is included in this scope.

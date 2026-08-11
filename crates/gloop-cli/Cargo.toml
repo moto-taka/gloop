@@ -1,0 +1,41 @@
+[package]
+name = "gloop-cli"
+description = "Interactive graph and multi-provider agent CLI"
+documentation = "https://docs.rs/gloop-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "gloop"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+console.workspace = true
+dialoguer.workspace = true
+directories.workspace = true
+gloop-core = { path = "../gloop-core", version = "0.1.0" }
+gloop-provider = { path = "../gloop-provider", version = "0.1.0" }
+gloop-runtime = { path = "../gloop-runtime", version = "0.1.0" }
+indicatif.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+tempfile.workspace = true
+
+[lints]
+workspace = true

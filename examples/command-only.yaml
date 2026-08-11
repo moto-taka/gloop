@@ -1,0 +1,37 @@
+apiVersion: gloop.dev/v1alpha1
+kind: Graph
+metadata:
+  name: command-only
+  version: "1.0.0"
+spec:
+  goal: Run a pure command chain
+  nodes:
+    - id: initialize
+      kind: command
+      argv:
+        - printf
+        - "init\n"
+      output:
+        format: text
+    - id: run_tests
+      kind: command
+      argv:
+        - git
+        - diff
+        - --check
+      output:
+        format: text
+    - id: report
+      kind: command
+      argv:
+        - printf
+        - "done\n"
+      output:
+        format: text
+  edges:
+    - from: initialize
+      to: run_tests
+      kind: data
+    - from: run_tests
+      to: report
+      kind: data

@@ -1,0 +1,16 @@
+apiVersion: gloop.dev/v1alpha1
+kind: Graph
+metadata:
+  name: direct-template
+  version: "1.0.0"
+spec:
+  goal: Complete the request directly
+  nodes:
+    - id: request
+      kind: agent
+      prompt: |
+        Act as an assistant and complete this request.
+      fan_out: 1
+      output:
+        format: text
+  edges: []
