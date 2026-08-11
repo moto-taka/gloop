@@ -18,9 +18,9 @@ clap.workspace = true
 console.workspace = true
 dialoguer.workspace = true
 directories.workspace = true
-gloop-core = { path = "../gloop-core", version = "0.2.0" }
-gloop-provider = { path = "../gloop-provider", version = "0.2.0" }
-gloop-runtime = { path = "../gloop-runtime", version = "0.2.0" }
+gloop-core = { path = "../gloop-core", version = "0.3.0" }
+gloop-provider = { path = "../gloop-provider", version = "0.3.0" }
+gloop-runtime = { path = "../gloop-runtime", version = "0.3.0" }
 indicatif.workspace = true
 schemars.workspace = true
 serde.workspace = true
