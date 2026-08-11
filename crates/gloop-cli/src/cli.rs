@@ -317,6 +317,7 @@ pub async fn run() -> Result<()> {
                     c.path,
                     c.force,
                     c.json,
+                    cli.trust_project_profiles,
                 )
                 .await
             }
@@ -332,6 +333,7 @@ pub async fn run() -> Result<()> {
                     c.force,
                     c.repo,
                     c.json,
+                    cli.trust_project_profiles,
                 )
                 .await
             }

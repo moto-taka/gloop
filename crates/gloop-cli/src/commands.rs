@@ -1,9 +1,4 @@
-use std::{
-    ffi::OsString,
-    fmt, io,
-    path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashSet, fmt, io, path::{Path, PathBuf}};
 
 use anyhow::Result;
 use clap::ValueEnum;
@@ -11,7 +6,8 @@ use gloop_core::{
     FinalStatus, Graph, IssueSeverity, NodeKind, NodeStatus, RunEvent, RunSummary, ValidationIssue,
 };
 use gloop_provider::{
-    AdapterError, ConfigError, PROJECT_CONFIG_PATH, Profile, ProfileStore, ProviderRegistry,
+    AdapterError, ConfigError, PROJECT_CONFIG_PATH, Profile, ProfileKind, ProfileStore,
+    ProviderRegistry,
 };
 use gloop_runtime::{
     JournalError, JournalRead, NodeFailureClass, ProgressEvent, ReplayError, ReplayReport,
@@ -20,16 +16,15 @@ use gloop_runtime::{
 };
 use schemars::schema_for;
 use serde_json::{Value, json};
-use tokio::fs::OpenOptions;
 use tokio::{
     fs,
-    io::AsyncWriteExt,
     signal,
     sync::{Semaphore, mpsc},
 };
 use tokio_util::sync::CancellationToken;
 use toml::{Value as TomlValue, map::Map as TomlMap};
 
+use crate::atomic_write::{write_text_atomic, write_text_no_replace};
 use crate::templates;
 use crate::wizard;
 
@@ -218,132 +213,7 @@ fn summary_exit_code(summary: &RunSummary) -> ExitCode {
     ExitCode::VerificationFailed
 }
 
-async fn write_text_no_replace(path: &Path, content: &str) -> std::io::Result<()> {
-    let path = canonical_write_path(path).await?;
-    write_text_new(path.as_path(), content.as_bytes()).await
-}
-
-async fn write_text_atomic(path: &Path, content: &str) -> std::io::Result<()> {
-    let path = canonical_write_path(path).await?;
-
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_nanos())
-        .unwrap_or_default();
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
-    let mut attempts = 0u32;
-    let tmp_path = loop {
-        let attempt_suffix = if attempts == 0 {
-            String::new()
-        } else {
-            format!(".{attempts}")
-        };
-        let candidate = path.with_file_name(format!(".{file_name}.tmp.{nanos}{attempt_suffix}"));
-        match write_text_new(candidate.as_path(), content.as_bytes()).await {
-            Ok(()) => break candidate,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && attempts < 32 => {
-                attempts += 1;
-            }
-            Err(error) => return Err(error),
-        }
-    };
-    match fs::rename(&tmp_path, &path).await {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = fs::remove_file(&tmp_path).await;
-            Err(error)
-        }
-    }
-}
-
-async fn canonical_write_path(path: &Path) -> io::Result<PathBuf> {
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let canonical_parent = canonical_parent_for_write(parent).await?;
-    let resolved = canonical_parent.join(file_name);
-
-    match fs::symlink_metadata(&resolved).await {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("output path is a symlink: {}", resolved.display()),
-        )),
-        Ok(_) => Ok(resolved),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(resolved),
-        Err(error) => Err(error),
-    }
-}
-
-async fn canonical_parent_for_write(parent: &Path) -> io::Result<PathBuf> {
-    let mut candidate = if parent.is_absolute() {
-        parent.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(parent)
-    };
-    let mut missing = Vec::<OsString>::new();
-
-    loop {
-        match fs::metadata(&candidate).await {
-            Ok(metadata) => {
-                if !metadata.is_dir() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotADirectory,
-                        format!("output parent is not a directory: {}", candidate.display()),
-                    ));
-                }
-                let mut resolved = fs::canonicalize(&candidate).await?;
-                for component in missing.iter().rev() {
-                    resolved.push(component);
-                    match fs::create_dir(&resolved).await {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                            let metadata = fs::symlink_metadata(&resolved).await?;
-                            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    format!(
-                                        "unsafe output parent created concurrently: {}",
-                                        resolved.display()
-                                    ),
-                                ));
-                            }
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-                return Ok(resolved);
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let component = candidate.file_name().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("cannot resolve output parent: {}", parent.display()),
-                    )
-                })?;
-                missing.push(component.to_os_string());
-                candidate = candidate
-                    .parent()
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("cannot resolve output parent: {}", parent.display()),
-                        )
-                    })?
-                    .to_path_buf();
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-async fn validate_journal_file_path(journal_path: &Path) -> io::Result<()> {
+async fn validate_journal_file_path(journal_path: &std::path::Path) -> io::Result<()> {
     let run_dir = journal_path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -401,27 +271,6 @@ async fn validate_journal_file_path(journal_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-async fn write_text_new(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(path).await?;
-    if let Err(error) = file.write_all(content).await {
-        let _ = fs::remove_file(path).await;
-        return Err(error);
-    }
-    if let Err(error) = file.flush().await {
-        let _ = fs::remove_file(path).await;
-        return Err(error);
-    }
-    if let Err(error) = file.sync_all().await {
-        let _ = fs::remove_file(path).await;
-        return Err(error);
-    }
-    Ok(())
-}
-
 fn apply_profile_to_agent_nodes(graph: &mut Graph, profile: &str) {
     for node in &mut graph.spec.nodes {
         match &mut node.kind {
@@ -475,6 +324,74 @@ fn load_profiles_for_repo(
     } else {
         ProfileStore::load(repo)
     }
+}
+
+fn profile_names_in_file(path: &Path) -> HashSet<String> {
+    let Ok(source) = std::fs::read_to_string(path) else {
+        return HashSet::new();
+    };
+    let Ok(value) = source.parse::<TomlValue>() else {
+        return HashSet::new();
+    };
+    value
+        .get("profiles")
+        .and_then(TomlValue::as_table)
+        .map(|table| table.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn profile_kind_name(kind: &ProfileKind) -> &'static str {
+    match kind {
+        ProfileKind::Command(_) => "command",
+        ProfileKind::OpenAi(_) => "openai",
+        ProfileKind::Anthropic(_) => "anthropic",
+    }
+}
+
+fn profile_default_model(kind: &ProfileKind) -> Option<String> {
+    match kind {
+        ProfileKind::OpenAi(profile) => Some(profile.model.clone()),
+        ProfileKind::Anthropic(profile) => Some(profile.model.clone()),
+        ProfileKind::Command(_) => None,
+    }
+}
+
+pub fn build_profile_choices(
+    repo: &Path,
+    trust_project_profiles: bool,
+) -> Result<Vec<wizard::ProfileChoice>, ConfigError> {
+    let store = load_profiles_for_repo(repo, trust_project_profiles)?;
+    let project_names = if trust_project_profiles {
+        profile_names_in_file(&repo.join(PROJECT_CONFIG_PATH))
+    } else {
+        HashSet::new()
+    };
+    let user_names = ProfileStore::user_config_path()
+        .as_deref()
+        .map(profile_names_in_file)
+        .unwrap_or_default();
+
+    let mut choices = store
+        .iter()
+        .map(|(name, profile)| {
+            let source = if project_names.contains(name) {
+                wizard::ProfileSource::Project
+            } else if user_names.contains(name) {
+                wizard::ProfileSource::User
+            } else {
+                wizard::ProfileSource::Builtin
+            };
+            wizard::ProfileChoice {
+                name: name.to_owned(),
+                kind: profile_kind_name(&profile.kind).to_owned(),
+                source,
+                enabled: profile.enabled,
+                default_model: profile_default_model(&profile.kind),
+            }
+        })
+        .collect::<Vec<_>>();
+    choices.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(choices)
 }
 
 fn run_error_code(error: &RunError) -> ExitCode {
@@ -549,7 +466,11 @@ pub async fn run_foreground(
     } else {
         generated = true;
         if interactive {
-            match wizard::interactive_graph() {
+            let profiles = match build_profile_choices(&repo, trust_project_profiles) {
+                Ok(profiles) => profiles,
+                Err(error) => return provider_store_error(error),
+            };
+            match wizard::interactive_graph(&profiles) {
                 Ok(graph) => graph,
                 Err(error) => {
                     return CommandResult::failure_json(
@@ -568,7 +489,11 @@ pub async fn run_foreground(
                 None,
             );
         } else {
-            match wizard::interactive_graph() {
+            let profiles = match build_profile_choices(&repo, trust_project_profiles) {
+                Ok(profiles) => profiles,
+                Err(error) => return provider_store_error(error),
+            };
+            match wizard::interactive_graph(&profiles) {
                 Ok(graph) => graph,
                 Err(error) => {
                     return CommandResult::failure_json(
@@ -816,7 +741,11 @@ fn graph_from_resolved_template(
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::fn_params_excessive_bools
+)]
 pub async fn graph_new(
     name: String,
     goal: String,
@@ -829,6 +758,7 @@ pub async fn graph_new(
     path: Option<PathBuf>,
     force: bool,
     json_mode: bool,
+    trust_project_profiles: bool,
 ) -> CommandResult {
     if interactive
         && has_unsupported_interactive_seeds(
@@ -846,7 +776,22 @@ pub async fn graph_new(
     }
 
     let graph = if interactive {
-        match wizard::interactive_graph_with_seed(Some(name.as_str()), Some(goal.as_str())) {
+        let profiles = match build_profile_choices(&repo, trust_project_profiles) {
+            Ok(profiles) => profiles,
+            Err(error) => return provider_store_error(error),
+        };
+        let persist = path.as_ref().map_or(wizard::EditorPersistTarget::None, |output| {
+            wizard::EditorPersistTarget::GraphFile {
+                path: output.clone(),
+                force,
+            }
+        });
+        match wizard::interactive_graph_with_seed(
+            Some(name.as_str()),
+            Some(goal.as_str()),
+            &profiles,
+            &persist,
+        ) {
             Ok(graph) => graph,
             Err(error) => {
                 return CommandResult::failure_json(
@@ -903,7 +848,7 @@ pub async fn graph_new(
     };
 
     if let Some(path) = path {
-        if path.exists() && !force {
+        if path.exists() && !force && !interactive {
             return CommandResult::failure_json(
                 ExitCode::InvalidGraph,
                 "output path exists. use --force to overwrite",
@@ -911,7 +856,9 @@ pub async fn graph_new(
             );
         }
 
-        if let Err(error) = write_text_atomic(path.as_path(), &yaml).await {
+        if !interactive
+            && let Err(error) = write_text_atomic(path.as_path(), &yaml).await
+        {
             return CommandResult::failure_json(
                 ExitCode::Internal,
                 "failed to write graph",
@@ -947,7 +894,7 @@ pub async fn graph_new(
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::fn_params_excessive_bools)]
 pub async fn graph_init(
     name: Option<String>,
     from: Option<String>,
@@ -959,6 +906,7 @@ pub async fn graph_init(
     force: bool,
     repo: PathBuf,
     json_mode: bool,
+    trust_project_profiles: bool,
 ) -> CommandResult {
     if list {
         let entries = match templates::list_all_templates(&repo) {
@@ -1020,6 +968,8 @@ pub async fn graph_init(
         );
     }
 
+    let interactive_authoring = name.is_none() && from.is_none();
+
   let graph = if let (Some(template_name), Some(base)) = (name.as_ref(), from.as_ref()) {
         if let Err(error) = templates::validate_init_template_name(template_name) {
             return CommandResult::failure_json(ExitCode::InvalidGraph, error, None);
@@ -1052,7 +1002,11 @@ pub async fn graph_init(
             None,
         );
     } else {
-        match wizard::interactive_template_init() {
+        let profiles = match build_profile_choices(&repo, trust_project_profiles) {
+            Ok(profiles) => profiles,
+            Err(error) => return provider_store_error(error),
+        };
+        match wizard::interactive_template_init(&profiles, &repo, force) {
             Ok(graph) => graph,
             Err(error) => {
                 return CommandResult::failure_json(
@@ -1070,6 +1024,8 @@ pub async fn graph_init(
         graph.metadata.name.clone()
     };
 
+    let destination = templates::template_path(&repo, &template_name);
+
     let issues = graph.validate();
     let (errors, warnings) = split_validation(&issues);
     if !errors.is_empty() {
@@ -1080,36 +1036,37 @@ pub async fn graph_init(
         );
     }
 
-    let yaml = match graph.to_yaml() {
-        Ok(yaml) => yaml,
-        Err(error) => {
+    if !interactive_authoring {
+        let yaml = match graph.to_yaml() {
+            Ok(yaml) => yaml,
+            Err(error) => {
+                return CommandResult::failure_json(
+                    ExitCode::Internal,
+                    "failed serialize template graph",
+                    Some(json!({"error": error.to_string()})),
+                );
+            }
+        };
+
+        let write_result = if force {
+            write_text_atomic(destination.as_path(), &yaml).await
+        } else {
+            write_text_no_replace(destination.as_path(), &yaml).await
+        };
+        if let Err(error) = write_result {
+            if !force && error.kind() == io::ErrorKind::AlreadyExists {
+                return CommandResult::failure_json(
+                    ExitCode::InvalidGraph,
+                    "template path exists. use --force to overwrite",
+                    Some(json!({"path": destination})),
+                );
+            }
             return CommandResult::failure_json(
                 ExitCode::Internal,
-                "failed serialize template graph",
-                Some(json!({"error": error.to_string()})),
+                "failed to write template",
+                Some(json!({"path": destination, "error": error.to_string()})),
             );
         }
-    };
-
-    let destination = templates::template_path(&repo, &template_name);
-    let write_result = if force {
-        write_text_atomic(destination.as_path(), &yaml).await
-    } else {
-        write_text_no_replace(destination.as_path(), &yaml).await
-    };
-    if let Err(error) = write_result {
-        if !force && error.kind() == io::ErrorKind::AlreadyExists {
-            return CommandResult::failure_json(
-                ExitCode::InvalidGraph,
-                "template path exists. use --force to overwrite",
-                Some(json!({"path": destination})),
-            );
-        }
-        return CommandResult::failure_json(
-            ExitCode::Internal,
-            "failed to write template",
-            Some(json!({"path": destination, "error": error.to_string()})),
-        );
     }
 
     let usage = format!("gloop graph new workflow.yaml --template {template_name}");
@@ -1894,90 +1851,7 @@ pub fn present(result: CommandResult, json_mode: bool) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use tempfile::tempdir;
-
-    #[cfg(unix)]
-    use std::os::unix::fs::{PermissionsExt, symlink};
-
-    #[tokio::test]
-    async fn write_text_no_replace_rejects_existing_destination() {
-        let temporary = tempdir().expect("temporary directory");
-        let canonical_root =
-            std::fs::canonicalize(temporary.path()).expect("canonicalize temporary directory");
-        let destination = canonical_root.join("graph.yml");
-        write_text_no_replace(&destination, "first")
-            .await
-            .expect("first write should succeed");
-        let error = write_text_no_replace(&destination, "second")
-            .await
-            .expect_err("second write must fail");
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(
-            fs::read_to_string(destination).expect("read destination"),
-            "first"
-        );
-    }
-
-    #[tokio::test]
-    async fn write_text_atomic_writes_file_without_symlinks() {
-        let temporary = tempdir().expect("temporary directory");
-        let canonical_root =
-            std::fs::canonicalize(temporary.path()).expect("canonicalize temporary directory");
-        let destination = canonical_root.join("graph.yml");
-        write_text_atomic(&destination, "ok")
-            .await
-            .expect("write should succeed");
-        assert_eq!(
-            fs::read_to_string(destination).expect("read destination"),
-            "ok"
-        );
-        #[cfg(unix)]
-        assert_eq!(
-            fs::metadata(temporary.path().join("graph.yml"))
-                .expect("destination metadata")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn write_text_atomic_writes_through_canonicalized_symlink_parent() {
-        let temporary = tempdir().expect("temporary directory");
-        let link = temporary.path().join("graphs");
-        let target = tempdir().expect("target directory");
-        symlink(target.path(), &link).expect("symlink parent directory");
-        let destination = link.join("graph.yml");
-        write_text_atomic(&destination, "payload")
-            .await
-            .expect("canonical parent write should succeed");
-        assert_eq!(
-            fs::read_to_string(target.path().join("graph.yml")).expect("read canonical target"),
-            "payload"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn write_text_atomic_rejects_symlink_destination() {
-        let temporary = tempdir().expect("temporary directory");
-        let target = temporary.path().join("target.yml");
-        fs::write(&target, "unchanged").expect("write target");
-        let destination = temporary.path().join("graph.yml");
-        symlink(&target, &destination).expect("symlink destination");
-
-        let error = write_text_atomic(&destination, "payload")
-            .await
-            .expect_err("symlink destination must be rejected");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(
-            fs::read_to_string(target).expect("read target"),
-            "unchanged"
-        );
-    }
+    use std::path::PathBuf;
 
     #[tokio::test]
     async fn interactive_graph_new_rejects_unconsumed_template_seeds() {
@@ -1993,6 +1867,7 @@ mod tests {
             None,
             false,
             true,
+            false,
         )
         .await;
 

@@ -1,9 +1,9 @@
 //! Interactive and template-driven graph builders for gloop.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
-use dialoguer::{Confirm, Input, MultiSelect, Select, theme::ColorfulTheme};
+use dialoguer::{Confirm, Editor, Input, MultiSelect, Select, theme::ColorfulTheme};
 use gloop_core::graph::{
     MAX_CONTEXT_BYTES, MAX_DURATION_SECONDS, MAX_FAN_OUT, MAX_LOOP_ITERATIONS, MAX_OUTPUT_BYTES,
     MAX_PARALLELISM, MAX_RETRY_ATTEMPTS,
@@ -15,11 +15,517 @@ use gloop_core::{
 };
 use serde_json::Value;
 
-use crate::templates::{validate_init_template_name, DEFAULT_TEMPLATE_GOAL};
+use crate::atomic_write::{write_text_atomic_sync, write_text_no_replace_sync};
+use crate::templates::{template_path, validate_init_template_name, DEFAULT_TEMPLATE_GOAL};
 
 const INTERACTIVE_NESTING_LIMIT: usize = 8;
 
-#[derive(Debug, Clone, Copy)]
+/// A configured provider profile available for interactive selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileChoice {
+    pub name: String,
+    pub kind: String,
+    pub source: ProfileSource,
+    pub enabled: bool,
+    pub default_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileSource {
+    Builtin,
+    User,
+    Project,
+}
+
+impl ProfileSource {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::User => "user",
+            Self::Project => "project",
+        }
+    }
+}
+
+pub fn profile_choice_label(choice: &ProfileChoice) -> String {
+    format!(
+        "{}  ({}, {})",
+        choice.name,
+        choice.kind,
+        choice.source.label()
+    )
+}
+
+/// Interactive editor state; mutations are applied through pure helpers.
+#[derive(Debug, Clone)]
+pub struct EditorState {
+    pub graph: Graph,
+    pub depth: usize,
+}
+
+impl EditorState {
+    pub fn new(name: impl Into<String>, goal: impl Into<String>) -> Self {
+        Self {
+            graph: Graph::new(name, goal, Vec::new()),
+            depth: 0,
+        }
+    }
+
+    pub fn from_graph(graph: Graph, depth: usize) -> Self {
+        Self { graph, depth }
+    }
+}
+
+/// Result of a nested interactive editor session.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NestedEditorOutcome {
+    Saved(Box<Graph>),
+    Cancelled,
+}
+
+/// Optional persistence target for the interactive editor save action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditorPersistTarget {
+    None,
+    ProjectTemplate {
+        repo: PathBuf,
+        force: bool,
+    },
+    GraphFile {
+        path: PathBuf,
+        force: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartTemplate {
+    Empty,
+    Builtin(GraphTemplate),
+}
+
+pub fn seed_editor_from_template(
+    name: &str,
+    goal: &str,
+    template: GraphTemplate,
+    knobs: TemplateKnobs,
+) -> EditorState {
+    let graph = template_graph(
+        name,
+        goal,
+        template,
+        knobs.request,
+        Some(knobs.provider_profiles),
+        knobs.loop_cap,
+    );
+    EditorState::from_graph(graph, 0)
+}
+
+pub fn editor_summary_header(state: &EditorState) -> (String, String) {
+    let node_count = state.graph.spec.nodes.len();
+    let edge_count = state.graph.spec.edges.len();
+    let header = format!(
+        "Graph \"{}\": {node_count} nodes, {edge_count} edges",
+        state.graph.metadata.name
+    );
+    let node_line = state
+        .graph
+        .spec
+        .nodes
+        .iter()
+        .map(format_node_summary)
+        .collect::<Vec<_>>()
+        .join(" -> ");
+    (header, node_line)
+}
+
+pub fn format_node_summary(node: &Node) -> String {
+    let kind = match &node.kind {
+        NodeKind::Agent { profile, .. } => profile
+            .as_deref()
+            .map_or_else(|| "agent".to_owned(), |value| format!("agent:{value}")),
+        NodeKind::Reduce { profile, .. } => profile
+            .as_deref()
+            .map_or_else(|| "reduce".to_owned(), |value| format!("reduce:{value}")),
+        NodeKind::Synthesize { profile, .. } => profile
+            .as_deref()
+            .map_or_else(|| "synthesize".to_owned(), |value| format!("synthesize:{value}")),
+        NodeKind::Command { .. } => "command".to_owned(),
+        NodeKind::Verify { .. } => "verify".to_owned(),
+        NodeKind::Gate { .. } => "gate".to_owned(),
+        NodeKind::Loop { .. } => "loop".to_owned(),
+        NodeKind::Subgraph { .. } => "subgraph".to_owned(),
+    };
+    format!("{}({kind})", node.id)
+}
+
+pub fn add_node_to_editor(
+    state: &EditorState,
+    node: Node,
+    dependency_ids: &[&str],
+    selected_indices: &[usize],
+    dependency_drafts: &[DependencyDraft],
+) -> Result<EditorState> {
+    let mut draft = state.graph.clone();
+    draft.spec.edges.extend(build_dependency_edges(
+        dependency_ids,
+        &node.id,
+        selected_indices,
+        dependency_drafts,
+    )?);
+    ensure_workspace_inheritance_edge(&node, &mut draft.spec.edges)?;
+    draft.spec.nodes.push(node);
+    validate_graph_errors(&draft)?;
+    Ok(EditorState {
+        graph: draft,
+        depth: state.depth,
+    })
+}
+
+pub fn workspace_inheritance_dependents(state: &EditorState, source_id: &str) -> Vec<String> {
+    state
+        .graph
+        .spec
+        .nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                &node.workspace,
+                WorkspaceSpec::Inherit { node } if node == source_id
+            )
+        })
+        .map(|node| node.id.clone())
+        .collect()
+}
+
+fn workspace_inherit_source(node: &Node) -> Option<&str> {
+    match &node.workspace {
+        WorkspaceSpec::Inherit { node } => Some(node.as_str()),
+        _ => None,
+    }
+}
+
+fn is_auto_workspace_inheritance_edge(edge: &Edge, source: &str, target: &str) -> bool {
+    edge.from == source
+        && edge.to == target
+        && edge.kind == EdgeKind::Data
+        && edge.when.is_none()
+}
+
+pub fn remove_auto_workspace_inheritance_edge(
+    edges: &mut Vec<Edge>,
+    source: &str,
+    target: &str,
+) {
+    edges.retain(|edge| !is_auto_workspace_inheritance_edge(edge, source, target));
+}
+
+pub fn reconcile_workspace_inheritance_edges(old: &Node, new: &Node, edges: &mut Vec<Edge>) {
+    let old_source = workspace_inherit_source(old);
+    let new_source = workspace_inherit_source(new);
+
+    if old_source == new_source {
+        if new_source.is_some() {
+            let _ = ensure_workspace_inheritance_edge(new, edges);
+        }
+        return;
+    }
+
+    if let Some(source) = old_source {
+        remove_auto_workspace_inheritance_edge(edges, source, &old.id);
+    }
+    if new_source.is_some() {
+        let _ = ensure_workspace_inheritance_edge(new, edges);
+    }
+}
+
+pub fn remove_node_from_editor(state: &EditorState, node_id: &str) -> Result<EditorState> {
+    if !state.graph.spec.nodes.iter().any(|node| node.id == node_id) {
+        return Err(anyhow!("node '{node_id}' was not found"));
+    }
+    let dependents = workspace_inheritance_dependents(state, node_id);
+    if !dependents.is_empty() {
+        return Err(anyhow!(
+            "cannot remove '{node_id}' while nodes inherit its workspace: {}",
+            dependents.join(", ")
+        ));
+    }
+    let mut graph = state.graph.clone();
+    graph.spec.nodes.retain(|node| node.id != node_id);
+    graph
+        .spec
+        .edges
+        .retain(|edge| edge.from != node_id && edge.to != node_id);
+    Ok(EditorState {
+        graph,
+        depth: state.depth,
+    })
+}
+
+pub fn replace_node_in_editor(
+    state: &EditorState,
+    node_id: &str,
+    node: Node,
+) -> Result<EditorState> {
+    if node.id != node_id {
+        return Err(anyhow!("replacement node id must match '{node_id}'"));
+    }
+    let Some(index) = state
+        .graph
+        .spec
+        .nodes
+        .iter()
+        .position(|candidate| candidate.id == node_id)
+    else {
+        return Err(anyhow!("node '{node_id}' was not found"));
+    };
+    let old = state.graph.spec.nodes[index].clone();
+    let mut graph = state.graph.clone();
+    reconcile_workspace_inheritance_edges(&old, &node, &mut graph.spec.edges);
+    graph.spec.nodes[index] = node;
+    validate_graph_errors(&graph)?;
+    Ok(EditorState {
+        graph,
+        depth: state.depth,
+    })
+}
+
+pub fn add_edge_to_editor(state: &EditorState, edge: Edge) -> Result<EditorState> {
+    let mut graph = state.graph.clone();
+    if graph
+        .spec
+        .edges
+        .iter()
+        .any(|existing| existing.from == edge.from && existing.to == edge.to && existing.kind == edge.kind)
+    {
+        return Err(anyhow!(
+            "edge from '{}' to '{}' with kind {:?} already exists",
+            edge.from,
+            edge.to,
+            edge.kind
+        ));
+    }
+    graph.spec.edges.push(edge);
+    validate_graph_errors(&graph)?;
+    Ok(EditorState {
+        graph,
+        depth: state.depth,
+    })
+}
+
+pub fn remove_edge_from_editor(
+    state: &EditorState,
+    from: &str,
+    to: &str,
+    kind: EdgeKind,
+) -> Result<EditorState> {
+    let mut graph = state.graph.clone();
+    let before = graph.spec.edges.len();
+    graph.spec.edges.retain(|edge| {
+        !(edge.from == from && edge.to == to && edge.kind == kind)
+    });
+    if graph.spec.edges.len() == before {
+        return Err(anyhow!("matching edge was not found"));
+    }
+    validate_graph_errors(&graph)?;
+    Ok(EditorState {
+        graph,
+        depth: state.depth,
+    })
+}
+
+pub fn apply_editor_settings(state: &EditorState, settings: GraphSettings) -> EditorState {
+    let mut graph = state.graph.clone();
+    apply_graph_settings(&mut graph, settings);
+    EditorState {
+        graph,
+        depth: state.depth,
+    }
+}
+
+pub fn validation_errors(state: &EditorState) -> Vec<String> {
+    state
+        .graph
+        .validate()
+        .into_iter()
+        .filter(|issue| issue.severity == IssueSeverity::Error)
+        .map(|issue| format!("[{}] at {}: {}", issue.code, issue.path, issue.message))
+        .collect()
+}
+
+pub fn validation_warnings(state: &EditorState) -> Vec<String> {
+    state
+        .graph
+        .validate()
+        .into_iter()
+        .filter(|issue| issue.severity == IssueSeverity::Warning)
+        .map(|issue| format!("[{}] at {}: {}", issue.code, issue.path, issue.message))
+        .collect()
+}
+
+pub fn validate_for_save(state: &EditorState) -> Result<(), Vec<String>> {
+    let mut errors = validation_errors(state);
+    if state.graph.spec.nodes.is_empty() {
+        errors.push("A graph must contain at least one node.".to_owned());
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+#[cfg(test)]
+fn map_profile_selection(
+    profiles: &[ProfileChoice],
+    selected_index: usize,
+) -> Result<Option<String>> {
+    if selected_index < profiles.len() {
+        return Ok(Some(profiles[selected_index].name.clone()));
+    }
+    if selected_index == profiles.len() {
+        return Ok(None);
+    }
+    if selected_index == profiles.len() + 1 {
+        return Err(anyhow!("manual profile entry requires interactive input"));
+    }
+    Err(anyhow!("invalid profile selection index"))
+}
+
+pub fn profile_select_items(profiles: &[ProfileChoice]) -> Vec<String> {
+    let mut items: Vec<String> = profiles.iter().map(profile_choice_label).collect();
+    items.push("(use default routing)".to_owned());
+    items.push("(type a profile name manually)".to_owned());
+    items
+}
+
+pub fn enabled_profile_choices(profiles: &[ProfileChoice]) -> Vec<ProfileChoice> {
+    profiles
+        .iter()
+        .filter(|choice| choice.enabled)
+        .cloned()
+        .collect()
+}
+
+pub fn profile_default_select_index(
+    profiles: &[ProfileChoice],
+    default_profile: Option<&str>,
+) -> usize {
+    match default_profile {
+        None | Some("") => profiles.len(),
+        Some(name) => profiles
+            .iter()
+            .position(|choice| choice.name == name)
+            .unwrap_or(profiles.len() + 1),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManualProfileEntry {
+    DefaultRouting,
+    Accepted(String),
+    KnownDisabled,
+}
+
+pub fn classify_manual_profile_name(name: &str, profiles: &[ProfileChoice]) -> ManualProfileEntry {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return ManualProfileEntry::DefaultRouting;
+    }
+    if let Some(choice) = profiles.iter().find(|choice| choice.name == trimmed) {
+        if choice.enabled {
+            ManualProfileEntry::Accepted(trimmed.to_owned())
+        } else {
+            ManualProfileEntry::KnownDisabled
+        }
+    } else {
+        ManualProfileEntry::Accepted(trimmed.to_owned())
+    }
+}
+
+pub fn profile_model_default(
+    selected_profile: Option<&str>,
+    previous_profile: Option<&str>,
+    previous_model: Option<&str>,
+    profiles: &[ProfileChoice],
+) -> String {
+    let profile_changed = selected_profile != previous_profile;
+    if profile_changed {
+        return selected_profile
+            .and_then(|name| {
+                profiles
+                    .iter()
+                    .find(|choice| choice.name == name)
+                    .and_then(|choice| choice.default_model.clone())
+            })
+            .unwrap_or_default();
+    }
+
+    previous_model
+        .map(str::to_owned)
+        .or_else(|| {
+            selected_profile.and_then(|name| {
+                profiles
+                    .iter()
+                    .find(|choice| choice.name == name)
+                    .and_then(|choice| choice.default_model.clone())
+            })
+        })
+        .unwrap_or_default()
+}
+
+pub fn preflight_template_destination(repo: &Path, name: &str, force: bool) -> Result<(), String> {
+    let destination = template_path(repo, name);
+    if destination.exists() && !force {
+        return Err(format!(
+            "template '{}' already exists at {}; choose another name or use --force",
+            name,
+            destination.display()
+        ));
+    }
+    Ok(())
+}
+
+pub fn try_persist_editor_graph(graph: &Graph, target: &EditorPersistTarget) -> Result<(), String> {
+    let yaml = graph
+        .to_yaml()
+        .map_err(|error| format!("serialization failed: {error}"))?;
+
+    match target {
+        EditorPersistTarget::None => Ok(()),
+        EditorPersistTarget::ProjectTemplate { repo, force } => {
+            let destination = template_path(repo, &graph.metadata.name);
+            write_graph_yaml(&destination, &yaml, *force)
+        }
+        EditorPersistTarget::GraphFile { path, force } => write_graph_yaml(path, &yaml, *force),
+    }
+}
+
+fn write_graph_yaml(destination: &Path, yaml: &str, force: bool) -> Result<(), String> {
+    // Called from the synchronous interactive editor, which itself runs inside
+    // the CLI's Tokio runtime: creating (or blocking on) another runtime here
+    // panics, so persistence uses the shared synchronous primitives directly.
+    let write_result = if force {
+        write_text_atomic_sync(destination, yaml)
+    } else {
+        write_text_no_replace_sync(destination, yaml)
+    };
+
+    write_result.map_err(|error| {
+        if !force && error.kind() == std::io::ErrorKind::AlreadyExists {
+            format!(
+                "output path exists: {}; use --force to overwrite",
+                destination.display()
+            )
+        } else {
+            format!(
+                "failed to write graph to {}: {error}",
+                destination.display()
+            )
+        }
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphTemplate {
     Direct,
     PlanImplementVerify,
@@ -249,46 +755,69 @@ pub fn graph_from_yaml_bytes(contents: impl AsRef<str>) -> Result<Graph> {
         .map_err(|error| anyhow!("failed to parse graph YAML: {error}"))
 }
 
-pub fn interactive_graph() -> Result<Graph> {
-    interactive_graph_with_seed(None, None)
+pub fn interactive_graph(profiles: &[ProfileChoice]) -> Result<Graph> {
+    interactive_graph_with_seed(None, None, profiles, &EditorPersistTarget::None)
 }
 
-pub fn interactive_graph_with_seed(name: Option<&str>, goal: Option<&str>) -> Result<Graph> {
+pub fn interactive_graph_with_seed(
+    name: Option<&str>,
+    goal: Option<&str>,
+    profiles: &[ProfileChoice],
+    persist: &EditorPersistTarget,
+) -> Result<Graph> {
     let theme = ColorfulTheme::default();
-    interactive_graph_inner(&theme, 0, name, goal)
+    let name = prompt_identifier(&theme, "Graph name", name, &[])?;
+    let goal = prompt_nonempty_text(&theme, "Graph goal", goal)?;
+    let start = prompt_start_from(&theme)?;
+    let state = seed_editor_state(&theme, &name, &goal, start, profiles)?;
+    interactive_graph_inner(&theme, state, profiles, persist)
 }
 
-pub fn interactive_template_init() -> Result<Graph> {
+pub fn interactive_template_init(
+    profiles: &[ProfileChoice],
+    repo: &Path,
+    force: bool,
+) -> Result<Graph> {
     let theme = ColorfulTheme::default();
     let template_name = prompt_template_name(&theme, None)?;
+    preflight_template_destination(repo, &template_name, force)
+        .map_err(|error| anyhow!(error))?;
     let description = prompt_optional_description(&theme)?;
-    let base = prompt_template_base(&theme)?;
-    let mut graph = match base {
-        TemplateBase::Builtin(template) => {
-            let knobs = prompt_template_knobs(&theme, template)?;
-            template_graph(
-                &template_name,
-                DEFAULT_TEMPLATE_GOAL,
-                template,
-                knobs.request,
-                Some(knobs.provider_profiles),
-                knobs.loop_cap,
-            )
-        }
-        TemplateBase::Custom => interactive_graph_with_seed(Some(&template_name), Some(DEFAULT_TEMPLATE_GOAL))?,
-    };
-    graph.metadata.name = template_name;
+    let start = prompt_start_from(&theme)?;
+    let mut state = seed_editor_state(
+        &theme,
+        &template_name,
+        DEFAULT_TEMPLATE_GOAL,
+        start,
+        profiles,
+    )?;
+    state.graph.metadata.name = template_name;
     if let Some(description) = description {
-        graph.metadata.description = Some(description);
+        state.graph.metadata.description = Some(description);
     }
-    Ok(graph)
+    interactive_graph_inner(
+        &theme,
+        state,
+        profiles,
+        &EditorPersistTarget::ProjectTemplate {
+            repo: repo.to_path_buf(),
+            force,
+        },
+    )
 }
 
-#[derive(Debug, Clone, Copy)]
-enum TemplateBase {
-    Builtin(GraphTemplate),
-    Custom,
+fn interactive_graph_inner(
+    theme: &ColorfulTheme,
+    state: EditorState,
+    profiles: &[ProfileChoice],
+    persist: &EditorPersistTarget,
+) -> Result<Graph> {
+    match interactive_editor_loop(theme, state, profiles, persist)? {
+        NestedEditorOutcome::Saved(graph) => Ok(*graph),
+        NestedEditorOutcome::Cancelled => Err(anyhow!("graph authoring cancelled")),
+    }
 }
+
 
 fn prompt_template_name(theme: &ColorfulTheme, default: Option<&str>) -> Result<String> {
     loop {
@@ -318,40 +847,69 @@ fn prompt_optional_description(theme: &ColorfulTheme) -> Result<Option<String>> 
     }
 }
 
-fn prompt_template_base(theme: &ColorfulTheme) -> Result<TemplateBase> {
+fn prompt_start_from(theme: &ColorfulTheme) -> Result<StartTemplate> {
     let labels = [
+        "empty graph (build node-by-node)",
         "direct",
         "plan-implement-verify",
         "parallel-research-reduce",
         "review-fix-loop",
-        "custom",
     ];
     let selected = Select::with_theme(theme)
-        .with_prompt("Base template")
+        .with_prompt("Start from")
         .items(labels)
         .default(0)
         .interact()?;
 
-    match selected {
-        0 => Ok(TemplateBase::Builtin(GraphTemplate::Direct)),
-        1 => Ok(TemplateBase::Builtin(GraphTemplate::PlanImplementVerify)),
-        2 => Ok(TemplateBase::Builtin(GraphTemplate::ParallelResearchReduce)),
-        3 => Ok(TemplateBase::Builtin(GraphTemplate::ReviewFixLoop)),
-        4 => Ok(TemplateBase::Custom),
-        _ => unreachable!("invalid base template selection"),
+    Ok(match selected {
+        0 => StartTemplate::Empty,
+        1 => StartTemplate::Builtin(GraphTemplate::Direct),
+        2 => StartTemplate::Builtin(GraphTemplate::PlanImplementVerify),
+        3 => StartTemplate::Builtin(GraphTemplate::ParallelResearchReduce),
+        4 => StartTemplate::Builtin(GraphTemplate::ReviewFixLoop),
+        _ => unreachable!("invalid start template selection"),
+    })
+}
+
+fn seed_editor_state(
+    theme: &ColorfulTheme,
+    name: &str,
+    goal: &str,
+    start: StartTemplate,
+    profiles: &[ProfileChoice],
+) -> Result<EditorState> {
+    match start {
+        StartTemplate::Empty => Ok(EditorState::new(name, goal)),
+        StartTemplate::Builtin(template) => {
+            let knobs = prompt_template_knobs(theme, template, profiles)?;
+            Ok(seed_editor_from_template(name, goal, template, knobs))
+        }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TemplateKnobs {
+pub(crate) struct TemplateKnobs {
     request: Option<String>,
     provider_profiles: Vec<String>,
     loop_cap: Option<u32>,
 }
 
-fn prompt_template_knobs(theme: &ColorfulTheme, template: GraphTemplate) -> Result<TemplateKnobs> {
-    let request = prompt_optional_text(theme, "Optional request text")?;
-    let provider_profiles = prompt_csv(theme, "Optional provider profiles (comma-separated)")?;
+fn template_profile_slot_count(template: GraphTemplate) -> usize {
+    match template {
+        GraphTemplate::Direct => 1,
+        GraphTemplate::PlanImplementVerify | GraphTemplate::ReviewFixLoop => 2,
+        GraphTemplate::ParallelResearchReduce => 4,
+    }
+}
+
+fn prompt_template_knobs(
+    theme: &ColorfulTheme,
+    template: GraphTemplate,
+    profiles: &[ProfileChoice],
+) -> Result<TemplateKnobs> {
+    let request = prompt_optional_text_with_entry(theme, "Optional request text")?;
+    let provider_profiles =
+        prompt_template_provider_profiles(theme, profiles, template_profile_slot_count(template))?;
     let loop_cap = if matches!(template, GraphTemplate::ReviewFixLoop) {
         prompt_optional_number(
             theme,
@@ -370,106 +928,575 @@ fn prompt_template_knobs(theme: &ColorfulTheme, template: GraphTemplate) -> Resu
     })
 }
 
-fn prompt_optional_text(theme: &ColorfulTheme, prompt: &str) -> Result<Option<String>> {
-    let value: String = Input::with_theme(theme)
-        .with_prompt(prompt)
-        .allow_empty(true)
-        .interact_text()?;
-    if value.trim().is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(value))
+fn prompt_template_provider_profiles(
+    theme: &ColorfulTheme,
+    profiles: &[ProfileChoice],
+    slot_count: usize,
+) -> Result<Vec<String>> {
+    if slot_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let enabled = enabled_profile_choices(profiles);
+    let items = profile_select_items(&enabled);
+    let selected = MultiSelect::with_theme(theme)
+        .with_prompt(format!(
+            "Select up to {slot_count} provider profile(s) in slot order (blank selection uses defaults)"
+        ))
+        .items(&items)
+        .interact()?;
+
+    let mut resolved = Vec::new();
+    for index in selected {
+        if resolved.len() >= slot_count {
+            break;
+        }
+        if index < enabled.len() {
+            resolved.push(enabled[index].name.clone());
+        } else if index == enabled.len() + 1 {
+            loop {
+                let manual: String = Input::with_theme(theme)
+                    .with_prompt("Profile name")
+                    .interact_text()?;
+                match classify_manual_profile_name(&manual, profiles) {
+                    ManualProfileEntry::DefaultRouting => break,
+                    ManualProfileEntry::Accepted(name) => {
+                        resolved.push(name);
+                        break;
+                    }
+                    ManualProfileEntry::KnownDisabled => {
+                        eprintln!(
+                            "Profile '{manual}' is disabled; choose an enabled profile or enter another name."
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+fn prompt_optional_text_with_entry(theme: &ColorfulTheme, prompt: &str) -> Result<Option<String>> {
+    let editor_env = std::env::var("EDITOR").ok();
+    let editor_label = editor_env.as_deref().unwrap_or("$EDITOR");
+    let open_editor = format!("Open {editor_label}");
+    let labels = ["Write inline", open_editor.as_str()];
+    let selected = Select::with_theme(theme)
+        .with_prompt(format!("{prompt} entry method"))
+        .items(labels)
+        .default(0)
+        .interact()?;
+
+    if selected == 0 {
+        let value: String = Input::with_theme(theme)
+            .with_prompt(prompt)
+            .allow_empty(true)
+            .interact_text()?;
+        if value.trim().is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(value));
+    }
+
+    match Editor::new().extension("txt").edit("") {
+        Ok(Some(text)) if !text.trim().is_empty() => Ok(Some(text)),
+        Ok(_) => {
+            let value: String = Input::with_theme(theme)
+                .with_prompt(prompt)
+                .allow_empty(true)
+                .interact_text()?;
+            if value.trim().is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(value))
+            }
+        }
+        Err(_) => {
+            eprintln!("No editor available; falling back to inline input.");
+            let value: String = Input::with_theme(theme)
+                .with_prompt(prompt)
+                .allow_empty(true)
+                .interact_text()?;
+            if value.trim().is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(value))
+            }
+        }
     }
 }
 
-fn interactive_graph_inner(
+fn interactive_editor_loop(
     theme: &ColorfulTheme,
-    depth: usize,
-    name_seed: Option<&str>,
-    goal_seed: Option<&str>,
-) -> Result<Graph> {
-    let name = prompt_identifier(theme, "Graph name", name_seed, &[])?;
-    let goal = prompt_nonempty_text(theme, "Graph goal", goal_seed)?;
-    let settings = prompt_graph_settings(theme)?;
-
-    let mut graph = Graph::new(name, goal, Vec::new());
-    apply_graph_settings(&mut graph, settings);
-
+    mut state: EditorState,
+    profiles: &[ProfileChoice],
+    persist: &EditorPersistTarget,
+) -> Result<NestedEditorOutcome> {
     loop {
-        let actions = wizard_actions(depth);
+        let (header, node_line) = editor_summary_header(&state);
+        eprintln!("{header}");
+        if !node_line.is_empty() {
+            eprintln!("{node_line}");
+        }
+
+        let actions = editor_actions(state.depth);
         let labels: Vec<&str> = actions.iter().map(|(label, _)| *label).collect();
         let selected_action = Select::with_theme(theme)
             .with_prompt("Choose an action")
-            .items(&labels)
-            .default(actions.len() - 1)
+            .items(labels)
+            .default(0)
             .interact()?;
         let action = actions[selected_action].1;
 
-        if matches!(action, WizardAction::Finish) {
-            if graph.spec.nodes.is_empty() {
-                eprintln!("A graph must contain at least one node.");
-                continue;
+        match action {
+            EditorAction::AddNode => {
+                state = prompt_add_node(theme, &state, profiles)?;
             }
-            break;
+            EditorAction::EditNode => {
+                state = prompt_edit_node(theme, &state, profiles)?;
+            }
+            EditorAction::RemoveNode => {
+                state = prompt_remove_node(theme, &state)?;
+            }
+            EditorAction::ManageEdges => {
+                prompt_manage_edges(theme, &mut state)?;
+            }
+            EditorAction::GraphSettings => {
+                let settings = prompt_graph_settings_with_defaults(theme, &state.graph)?;
+                state = apply_editor_settings(&state, settings);
+            }
+            EditorAction::Preview => {
+                show_editor_preview(&state);
+            }
+            EditorAction::SaveAndFinish => match validate_for_save(&state) {
+                Ok(()) => match &persist {
+                    EditorPersistTarget::None => {
+                        return Ok(NestedEditorOutcome::Saved(Box::new(state.graph)));
+                    }
+                    target => match try_persist_editor_graph(&state.graph, target) {
+                        Ok(()) => return Ok(NestedEditorOutcome::Saved(Box::new(state.graph))),
+                        Err(error) => {
+                            eprintln!("Save failed: {error}");
+                            eprintln!(
+                                "Returning to the editor. Adjust the template name, output path, or graph and try again."
+                            );
+                        }
+                    },
+                },
+                Err(errors) => {
+                    eprintln!("Cannot save yet:");
+                    for error in errors {
+                        eprintln!("  {error}");
+                    }
+                }
+            },
+            EditorAction::Cancel => {
+                if Confirm::with_theme(theme)
+                    .with_prompt("Discard this graph and exit?")
+                    .default(false)
+                    .interact()?
+                {
+                    return Ok(NestedEditorOutcome::Cancelled);
+                }
+            }
         }
+    }
+}
 
-        let existing_ids: Vec<&str> = graph
-            .spec
-            .nodes
-            .iter()
-            .map(|node| node.id.as_str())
-            .collect();
-        let id = prompt_identifier(theme, "Node ID", None, &existing_ids)?;
-        let mut node = build_node_for_action(theme, action, &id, depth)?;
+fn prompt_add_node(
+    theme: &ColorfulTheme,
+    state: &EditorState,
+    profiles: &[ProfileChoice],
+) -> Result<EditorState> {
+    let node_actions = wizard_actions(state.depth);
+    let labels: Vec<&str> = node_actions.iter().map(|(label, _)| *label).collect();
+    let selected = Select::with_theme(theme)
+        .with_prompt("Add node kind")
+        .items(labels)
+        .default(0)
+        .interact()?;
+    let action = node_actions[selected].1;
 
-        let common_settings = prompt_common_node_settings(theme, &node, &graph.spec.nodes)?;
-        apply_common_node_settings(&mut node, common_settings)?;
-        if let Some(node_output) = node_output_mut(&mut node) {
-            let output = prompt_output_spec(theme)?;
-            *node_output = output;
-        }
+    let existing_ids: Vec<&str> = state
+        .graph
+        .spec
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect();
+    let id = prompt_identifier(theme, "Node ID", None, &existing_ids)?;
+    let Some(mut node) = build_node_for_action(theme, action, &id, state.depth, profiles)? else {
+        return Ok(state.clone());
+    };
 
-        let inherit_source = match &node.workspace {
-            WorkspaceSpec::Inherit { node } => Some(node.as_str()),
-            _ => None,
-        };
-        let dependency_ids: Vec<&str> = graph
-            .spec
-            .nodes
-            .iter()
-            .map(|candidate| candidate.id.as_str())
-            .filter(|candidate| Some(*candidate) != inherit_source)
-            .collect();
-        let selected = if dependency_ids.is_empty() {
-            Vec::new()
-        } else {
-            MultiSelect::with_theme(theme)
-                .with_prompt("Pick dependency edges")
-                .items(&dependency_ids)
-                .interact()?
-        };
-        let dependency_drafts = if selected.is_empty() {
-            Vec::new()
-        } else {
-            select_dependency_drafts(theme, &dependency_ids, &selected, &id)?
-        };
-
-        let mut draft = graph.clone();
-        draft.spec.edges.extend(build_dependency_edges(
-            &dependency_ids,
-            &id,
-            &selected,
-            &dependency_drafts,
-        )?);
-        ensure_workspace_inheritance_edge(&node, &mut draft.spec.edges)?;
-        draft.spec.nodes.push(node);
-        validate_graph_errors(&draft)?;
-        graph = draft;
-        eprintln!("Added node {id}.");
+    let common_settings =
+        prompt_common_node_settings(theme, &node, &state.graph.spec.nodes, profiles)?;
+    if let Err(error) = apply_common_node_settings(&mut node, common_settings) {
+        eprintln!("{error}");
+        return Ok(state.clone());
+    }
+    if let Some(node_output) = node_output_mut(&mut node) {
+        let output = prompt_output_spec(theme)?;
+        *node_output = output;
     }
 
-    validate_graph_errors(&graph)?;
-    Ok(graph)
+    let inherit_source = match &node.workspace {
+        WorkspaceSpec::Inherit { node } => Some(node.as_str()),
+        _ => None,
+    };
+    let dependency_ids: Vec<&str> = state
+        .graph
+        .spec
+        .nodes
+        .iter()
+        .map(|candidate| candidate.id.as_str())
+        .filter(|candidate| Some(*candidate) != inherit_source)
+        .collect();
+    let selected_deps = if dependency_ids.is_empty() {
+        Vec::new()
+    } else {
+        MultiSelect::with_theme(theme)
+            .with_prompt("Pick dependency edges")
+            .items(&dependency_ids)
+            .interact()?
+    };
+    let dependency_drafts = if selected_deps.is_empty() {
+        Vec::new()
+    } else {
+        select_dependency_drafts(theme, &dependency_ids, &selected_deps, &id)?
+    };
+
+    match add_node_to_editor(
+        state,
+        node,
+        &dependency_ids,
+        &selected_deps,
+        &dependency_drafts,
+    ) {
+        Ok(next) => {
+            eprintln!("Added node {id}.");
+            Ok(next)
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            Ok(state.clone())
+        }
+    }
+}
+
+fn prompt_edit_node(
+    theme: &ColorfulTheme,
+    state: &EditorState,
+    profiles: &[ProfileChoice],
+) -> Result<EditorState> {
+    if state.graph.spec.nodes.is_empty() {
+        eprintln!("No nodes to edit.");
+        return Ok(state.clone());
+    }
+    let ids: Vec<&str> = state
+        .graph
+        .spec
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect();
+    let selected = Select::with_theme(theme)
+        .with_prompt("Node to edit")
+        .items(&ids)
+        .default(0)
+        .interact()?;
+    let node_id = ids[selected];
+    let existing = state
+        .graph
+        .spec
+        .nodes
+        .iter()
+        .find(|node| node.id == node_id)
+        .expect("selected node exists")
+        .clone();
+
+    let mut node = edit_node_for_kind(theme, &existing, state.depth, profiles)?;
+    let prior_nodes: Vec<Node> = state
+        .graph
+        .spec
+        .nodes
+        .iter()
+        .filter(|candidate| candidate.id != node_id)
+        .cloned()
+        .collect();
+    let common_settings = prompt_common_node_settings_with_defaults(
+        theme,
+        &node,
+        &prior_nodes,
+        Some(&existing),
+        profiles,
+    )?;
+    apply_common_node_settings(&mut node, common_settings)?;
+    if let Some(node_output) = node_output_mut(&mut node) {
+        let output = prompt_output_spec_with_defaults(theme, existing.output())?;
+        *node_output = output;
+    }
+
+    match replace_node_in_editor(state, node_id, node) {
+        Ok(next) => {
+            eprintln!("Updated node {node_id}.");
+            Ok(next)
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            Ok(state.clone())
+        }
+    }
+}
+
+fn prompt_remove_node(theme: &ColorfulTheme, state: &EditorState) -> Result<EditorState> {
+    if state.graph.spec.nodes.is_empty() {
+        eprintln!("No nodes to remove.");
+        return Ok(state.clone());
+    }
+    let ids: Vec<&str> = state
+        .graph
+        .spec
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect();
+    let selected = Select::with_theme(theme)
+        .with_prompt("Node to remove")
+        .items(&ids)
+        .default(0)
+        .interact()?;
+    let node_id = ids[selected];
+    if !Confirm::with_theme(theme)
+        .with_prompt(format!("Remove node '{node_id}' and its edges?"))
+        .default(false)
+        .interact()?
+    {
+        return Ok(state.clone());
+    }
+    let next = remove_node_from_editor(state, node_id);
+    match next {
+        Ok(state) => {
+            eprintln!("Removed node {node_id}.");
+            Ok(state)
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            Ok(state.clone())
+        }
+    }
+}
+
+fn prompt_manage_edges(theme: &ColorfulTheme, state: &mut EditorState) -> Result<()> {
+    loop {
+        let action = Select::with_theme(theme)
+            .with_prompt("Manage edges")
+            .items(["Add edge", "Remove edge", "Back"])
+            .default(2)
+            .interact()?;
+        match action {
+            0 => {
+                if state.graph.spec.nodes.len() < 2 {
+                    eprintln!("At least two nodes are required to add an edge.");
+                    continue;
+                }
+                let ids: Vec<String> = state
+                    .graph
+                    .spec
+                    .nodes
+                    .iter()
+                    .map(|node| node.id.clone())
+                    .collect();
+                let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+                let from_selected = Select::with_theme(theme)
+                    .with_prompt("Edge from")
+                    .items(&id_refs)
+                    .default(0)
+                    .interact()?;
+                let from = ids[from_selected].clone();
+                let to_selected = Select::with_theme(theme)
+                    .with_prompt("Edge to")
+                    .items(&id_refs)
+                    .default(ids.len().saturating_sub(1))
+                    .interact()?;
+                let to = ids[to_selected].clone();
+                let kind = select_edge_kind(theme, &from, &to)?;
+                let when = if matches!(kind, EdgeKind::Conditional) {
+                    Some(select_conditional_when(theme, &from, &to)?)
+                } else {
+                    None
+                };
+                match add_edge_to_editor(
+                    state,
+                    Edge {
+                        from: from.clone(),
+                        to: to.clone(),
+                        kind,
+                        when,
+                    },
+                ) {
+                    Ok(next) => {
+                        *state = next;
+                        eprintln!("Added edge {from} -> {to}.");
+                    }
+                    Err(error) => eprintln!("{error}"),
+                }
+            }
+            1 => {
+                if state.graph.spec.edges.is_empty() {
+                    eprintln!("No edges to remove.");
+                    continue;
+                }
+                let labels: Vec<String> = state
+                    .graph
+                    .spec
+                    .edges
+                    .iter()
+                    .map(|edge| format!("{} -{:?}-> {}", edge.from, edge.kind, edge.to))
+                    .collect();
+                let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                let selected = Select::with_theme(theme)
+                    .with_prompt("Edge to remove")
+                    .items(&label_refs)
+                    .default(0)
+                    .interact()?;
+                let edge = state.graph.spec.edges[selected].clone();
+                match remove_edge_from_editor(&*state, &edge.from, &edge.to, edge.kind) {
+                    Ok(next) => {
+                        *state = next;
+                        eprintln!("Removed edge {} -> {}.", edge.from, edge.to);
+                    }
+                    Err(error) => eprintln!("{error}"),
+                }
+            }
+            _ => break,
+        }
+    }
+    Ok(())
+}
+
+fn select_edge_kind(theme: &ColorfulTheme, from: &str, to: &str) -> Result<EdgeKind> {
+    let labels = [
+        "data — predecessor output feeds downstream context",
+        "control — ordering only, no data transfer",
+        "resource — serialize access to a shared resource",
+        "conditional — activate when a terminal condition matches",
+        "failure — propagate failure to downstream nodes",
+    ];
+    let selected = Select::with_theme(theme)
+        .with_prompt(format!("Edge kind from '{from}' to '{to}'"))
+        .items(labels)
+        .default(0)
+        .interact()?;
+    Ok(match selected {
+        0 => EdgeKind::Data,
+        1 => EdgeKind::Control,
+        2 => EdgeKind::Resource,
+        3 => EdgeKind::Conditional,
+        4 => EdgeKind::Failure,
+        _ => unreachable!("invalid edge kind selection"),
+    })
+}
+
+fn show_editor_preview(state: &EditorState) {
+    match state.graph.compile() {
+        Ok(compiled) => eprintln!("{}", compiled.render_mermaid()),
+        Err(error) => eprintln!("Mermaid preview unavailable: {error}"),
+    }
+    let errors = validation_errors(state);
+    let warnings = validation_warnings(state);
+    if !errors.is_empty() {
+        eprintln!("Validation errors:");
+        for error in errors {
+            eprintln!("  {error}");
+        }
+    }
+    if !warnings.is_empty() {
+        eprintln!("Validation warnings:");
+        for warning in warnings {
+            eprintln!("  {warning}");
+        }
+    }
+}
+
+fn prompt_graph_settings_with_defaults(
+    theme: &ColorfulTheme,
+    graph: &Graph,
+) -> Result<GraphSettings> {
+    let goal: String = Input::with_theme(theme)
+        .with_prompt("Graph goal")
+        .default(graph.spec.goal.clone())
+        .interact_text()?;
+    let max_parallel = prompt_bounded_number(
+        theme,
+        "Maximum parallel nodes",
+        graph.spec.policies.max_parallel,
+        1,
+        MAX_PARALLELISM,
+    )?;
+    let failure_default = match graph.spec.policies.failure {
+        FailurePolicy::FailFast => 0,
+        FailurePolicy::Continue => 1,
+    };
+    let failure = match Select::with_theme(theme)
+        .with_prompt("Failure policy")
+        .items(["fail_fast", "continue"])
+        .default(failure_default)
+        .interact()?
+    {
+        0 => FailurePolicy::FailFast,
+        1 => FailurePolicy::Continue,
+        _ => unreachable!("invalid failure policy selection"),
+    };
+    let wall_time_seconds = prompt_optional_number_with_default(
+        theme,
+        "Optional wall-time budget in seconds",
+        graph.spec.budgets.wall_time_seconds,
+        0u64,
+        MAX_DURATION_SECONDS,
+    )?;
+    let model_calls = prompt_optional_number_with_default(
+        theme,
+        "Optional model-call budget",
+        graph.spec.budgets.model_calls,
+        0u32,
+        u32::MAX,
+    )?;
+
+    Ok(GraphSettings {
+        max_parallel,
+        failure,
+        budgets: RunBudgets {
+            wall_time_seconds,
+            model_calls,
+        },
+        goal: Some(goal),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorAction {
+    AddNode,
+    EditNode,
+    RemoveNode,
+    ManageEdges,
+    GraphSettings,
+    Preview,
+    SaveAndFinish,
+    Cancel,
+}
+
+fn editor_actions(_depth: usize) -> Vec<(&'static str, EditorAction)> {
+    vec![
+        ("Add node", EditorAction::AddNode),
+        ("Edit node", EditorAction::EditNode),
+        ("Remove node", EditorAction::RemoveNode),
+        ("Manage edges", EditorAction::ManageEdges),
+        ("Graph settings", EditorAction::GraphSettings),
+        ("Preview", EditorAction::Preview),
+        ("Save and finish", EditorAction::SaveAndFinish),
+        ("Cancel", EditorAction::Cancel),
+    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -482,7 +1509,6 @@ enum WizardAction {
     Synthesize,
     Loop,
     Subgraph,
-    Finish,
 }
 
 fn wizard_actions(depth: usize) -> Vec<(&'static str, WizardAction)> {
@@ -498,7 +1524,6 @@ fn wizard_actions(depth: usize) -> Vec<(&'static str, WizardAction)> {
         actions.push(("Add bounded loop node", WizardAction::Loop));
         actions.push(("Add subgraph node", WizardAction::Subgraph));
     }
-    actions.push(("Finish", WizardAction::Finish));
     actions
 }
 
@@ -507,17 +1532,118 @@ fn build_node_for_action(
     action: WizardAction,
     id: &str,
     depth: usize,
-) -> Result<Node> {
+    profiles: &[ProfileChoice],
+) -> Result<Option<Node>> {
     match action {
-        WizardAction::Agent => build_agent_node(theme, id),
-        WizardAction::Command => build_command_node(theme, id),
-        WizardAction::Verify => build_verify_node(theme, id),
-        WizardAction::Gate => build_gate_node(theme, id),
-        WizardAction::Reduce => build_reduce_node(theme, id),
-        WizardAction::Synthesize => build_synthesize_node(theme, id),
-        WizardAction::Loop => build_loop_node(theme, id, depth),
-        WizardAction::Subgraph => build_subgraph_node(theme, id, depth),
-        WizardAction::Finish => Err(anyhow!("finish is not a node action")),
+        WizardAction::Agent => build_agent_node(theme, id, profiles).map(Some),
+        WizardAction::Command => build_command_node(theme, id).map(Some),
+        WizardAction::Verify => build_verify_node(theme, id).map(Some),
+        WizardAction::Gate => build_gate_node(theme, id).map(Some),
+        WizardAction::Reduce => build_reduce_node(theme, id, profiles).map(Some),
+        WizardAction::Synthesize => build_synthesize_node(theme, id, profiles).map(Some),
+        WizardAction::Loop => build_loop_node(theme, id, depth, profiles),
+        WizardAction::Subgraph => build_subgraph_node(theme, id, depth, profiles),
+    }
+}
+
+fn edit_node_for_kind(
+    theme: &ColorfulTheme,
+    existing: &Node,
+    _depth: usize,
+    profiles: &[ProfileChoice],
+) -> Result<Node> {
+    match &existing.kind {
+        NodeKind::Agent {
+            prompt,
+            profile,
+            model,
+            fan_out,
+            ..
+        } => {
+            let prompt_text = prompt_inline_text(prompt)?;
+            let prompt_text = prompt_prompt_text(
+                theme,
+                &format!("Prompt for agent node '{}'", existing.id),
+                Some(&prompt_text),
+            )?;
+            let fan_out = prompt_bounded_number(
+                theme,
+                "Fan out",
+                *fan_out,
+                1,
+                MAX_FAN_OUT,
+            )?;
+            let (profile, model) =
+                prompt_profile_model(theme, &existing.id, "agent", profile.as_deref(), model.as_deref(), profiles)?;
+            let mut node = agent_node(&existing.id, &prompt_text, profile, fan_out);
+            if let NodeKind::Agent {
+                model: node_model, ..
+            } = &mut node.kind
+            {
+                *node_model = model;
+            }
+            Ok(node)
+        }
+        NodeKind::Reduce {
+            prompt, profile, model, ..
+        } => {
+            let prompt_text = prompt_inline_text(prompt)?;
+            let prompt_text = prompt_prompt_text(
+                theme,
+                &format!("Prompt for reduce node '{}'", existing.id),
+                Some(&prompt_text),
+            )?;
+            let (profile, model) =
+                prompt_profile_model(theme, &existing.id, "reduce", profile.as_deref(), model.as_deref(), profiles)?;
+            let mut node = reduce_node(&existing.id, &prompt_text, profile);
+            if let NodeKind::Reduce {
+                model: node_model, ..
+            } = &mut node.kind
+            {
+                *node_model = model;
+            }
+            Ok(node)
+        }
+        NodeKind::Synthesize {
+            prompt, profile, model, ..
+        } => {
+            let prompt_text = prompt_inline_text(prompt)?;
+            let prompt_text = prompt_prompt_text(
+                theme,
+                &format!("Prompt for synthesize node '{}'", existing.id),
+                Some(&prompt_text),
+            )?;
+            let (profile, model) = prompt_profile_model(
+                theme,
+                &existing.id,
+                "synthesize",
+                profile.as_deref(),
+                model.as_deref(),
+                profiles,
+            )?;
+            let mut node = synthesize_node(&existing.id, &prompt_text, profile);
+            if let NodeKind::Synthesize {
+                model: node_model, ..
+            } = &mut node.kind
+            {
+                *node_model = model;
+            }
+            Ok(node)
+        }
+        NodeKind::Command { argv, .. } => Ok(command_node(&existing.id, prompt_command_argv_with_default(theme, &existing.id, argv)?)),
+        NodeKind::Verify { argv, .. } => Ok(verify_node(&existing.id, prompt_command_argv_with_default(theme, &existing.id, argv)?)),
+        NodeKind::Gate { message, .. } => Ok(gate_node(
+            &existing.id,
+            &prompt_prompt_text(
+                theme,
+                &format!("Approval prompt for '{}'", existing.id),
+                Some(message),
+            )?,
+        )),
+        NodeKind::Loop { .. } | NodeKind::Subgraph { .. } => {
+            eprintln!("Loop and subgraph nodes cannot be edited here; remove and re-add to change them.");
+            Ok(existing.clone())
+        }
     }
 }
 
@@ -569,47 +1695,21 @@ fn prompt_nonempty_text(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct GraphSettings {
+pub(crate) struct GraphSettings {
     max_parallel: usize,
     failure: FailurePolicy,
     budgets: RunBudgets,
+    goal: Option<String>,
 }
 
-fn prompt_graph_settings(theme: &ColorfulTheme) -> Result<GraphSettings> {
-    let max_parallel =
-        prompt_bounded_number(theme, "Maximum parallel nodes", 4usize, 1, MAX_PARALLELISM)?;
-    let failure = match Select::with_theme(theme)
-        .with_prompt("Failure policy")
-        .items(["fail_fast", "continue"])
-        .default(0)
-        .interact()?
-    {
-        0 => FailurePolicy::FailFast,
-        1 => FailurePolicy::Continue,
-        _ => unreachable!("invalid failure policy selection"),
-    };
-    let wall_time_seconds = prompt_optional_number(
-        theme,
-        "Optional wall-time budget in seconds",
-        0u64,
-        MAX_DURATION_SECONDS,
-    )?;
-    let model_calls = prompt_optional_number(theme, "Optional model-call budget", 0u32, u32::MAX)?;
-
-    Ok(GraphSettings {
-        max_parallel,
-        failure,
-        budgets: RunBudgets {
-            wall_time_seconds,
-            model_calls,
-        },
-    })
-}
 
 fn apply_graph_settings(graph: &mut Graph, settings: GraphSettings) {
     graph.spec.policies.max_parallel = settings.max_parallel;
     graph.spec.policies.failure = settings.failure;
     graph.spec.budgets = settings.budgets;
+    if let Some(goal) = settings.goal {
+        graph.spec.goal = goal;
+    }
 }
 
 fn prompt_bounded_number<T>(
@@ -677,7 +1777,7 @@ fn validate_graph_errors(graph: &Graph) -> Result<()> {
 }
 
 #[derive(Debug, Clone)]
-struct DependencyDraft {
+pub(crate) struct DependencyDraft {
     kind: EdgeKind,
     when: Option<EdgeCondition>,
 }
@@ -925,14 +2025,36 @@ fn prompt_common_node_settings(
     theme: &ColorfulTheme,
     node: &Node,
     prior_nodes: &[Node],
+    profiles: &[ProfileChoice],
 ) -> Result<CommonNodeSettings> {
-    let resources = prompt_csv(theme, "Resources (comma-separated)")?;
-    let max_attempts =
-        prompt_bounded_number(theme, "Maximum retry attempts", 1u32, 1, MAX_RETRY_ATTEMPTS)?;
+    prompt_common_node_settings_with_defaults(theme, node, prior_nodes, None, profiles)
+}
+
+fn prompt_common_node_settings_with_defaults(
+    theme: &ColorfulTheme,
+    node: &Node,
+    prior_nodes: &[Node],
+    existing: Option<&Node>,
+    profiles: &[ProfileChoice],
+) -> Result<CommonNodeSettings> {
+    let _ = profiles;
+    let defaults = existing.unwrap_or(node);
+    let resources = prompt_csv_with_default(
+        theme,
+        "Resources (comma-separated)",
+        &join_csv(&defaults.resources),
+    )?;
+    let max_attempts = prompt_bounded_number(
+        theme,
+        "Maximum retry attempts",
+        defaults.retry.max_attempts,
+        1,
+        MAX_RETRY_ATTEMPTS,
+    )?;
     let backoff_seconds = prompt_bounded_number(
         theme,
         "Retry backoff in seconds",
-        0u64,
+        defaults.retry.backoff_seconds,
         0,
         MAX_DURATION_SECONDS,
     )?;
@@ -940,9 +2062,10 @@ fn prompt_common_node_settings(
         let max_rebind_profiles = usize::try_from(max_attempts - 1)
             .context("retry attempt count does not fit this platform")?;
         loop {
-            let profiles = prompt_csv(
+            let profiles = prompt_csv_with_default(
                 theme,
                 "Retry rebind profiles in attempt order (comma-separated)",
+                &join_csv(&defaults.retry.rebind_profiles),
             )?;
             if profiles.len() <= max_rebind_profiles {
                 break profiles;
@@ -955,25 +2078,30 @@ fn prompt_common_node_settings(
     } else {
         Vec::new()
     };
-    let timeout_seconds = prompt_optional_number(
+    let timeout_seconds = prompt_optional_number_with_default(
         theme,
         "Optional node timeout in seconds",
+        defaults.timeout_seconds,
         0u64,
         MAX_DURATION_SECONDS,
     )?;
-    let workspace = prompt_workspace(theme, node, prior_nodes)?;
+    let workspace = prompt_workspace_with_default(theme, node, prior_nodes, &defaults.workspace)?;
     let include_dependencies = Confirm::with_theme(theme)
         .with_prompt("Include dependency outputs in context?")
-        .default(true)
+        .default(defaults.context.include_dependencies)
         .interact()?;
-    let files = prompt_csv(theme, "Additional context files (comma-separated)")?
-        .into_iter()
-        .map(PathBuf::from)
-        .collect();
+    let files = prompt_csv_with_default(
+        theme,
+        "Additional context files (comma-separated)",
+        &join_csv_paths(&defaults.context.files),
+    )?
+    .into_iter()
+    .map(PathBuf::from)
+    .collect();
     let max_bytes = prompt_bounded_number(
         theme,
         "Maximum context bytes",
-        256 * 1024,
+        defaults.context.max_bytes,
         0,
         MAX_CONTEXT_BYTES,
     )?;
@@ -995,13 +2123,115 @@ fn prompt_common_node_settings(
     })
 }
 
-fn prompt_csv(theme: &ColorfulTheme, prompt: &str) -> Result<Vec<String>> {
+fn join_csv(values: &[String]) -> String {
+    values.join(", ")
+}
+
+fn join_csv_paths(values: &[PathBuf]) -> String {
+    values
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn prompt_csv_with_default(theme: &ColorfulTheme, prompt: &str, default: &str) -> Result<Vec<String>> {
     let value: String = Input::with_theme(theme)
         .with_prompt(prompt)
+        .default(default.to_owned())
         .allow_empty(true)
         .interact_text()?;
     Ok(parse_csv(&value))
 }
+
+fn prompt_optional_number_with_default<T>(
+    theme: &ColorfulTheme,
+    prompt: &str,
+    default: Option<T>,
+    minimum: T,
+    maximum: T,
+) -> Result<Option<T>>
+where
+    T: Copy + PartialOrd + std::fmt::Display + std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    if let Some(current) = default {
+        let action = Select::with_theme(theme)
+            .with_prompt(format!("{prompt} (current: {current})"))
+            .items(["Keep current value", "Change value", "Clear value"])
+            .default(0)
+            .interact()?;
+        let selected_action = match action {
+            0 => OptionalNumberAction::Keep,
+            1 => OptionalNumberAction::Change,
+            _ => OptionalNumberAction::Clear,
+        };
+        let changed = if selected_action == OptionalNumberAction::Change {
+            Some(prompt_bounded_number(theme, prompt, current, minimum, maximum)?)
+        } else {
+            None
+        };
+        return Ok(resolve_optional_number(
+            selected_action,
+            Some(current),
+            changed,
+        ));
+    }
+
+    loop {
+        let value: String = Input::with_theme(theme)
+            .with_prompt(format!("{prompt} (blank for none)"))
+            .allow_empty(true)
+            .interact_text()?;
+        if value.trim().is_empty() {
+            return Ok(None);
+        }
+        match value.trim().parse::<T>() {
+            Ok(parsed) if (minimum..=maximum).contains(&parsed) => return Ok(Some(parsed)),
+            Ok(_) => eprintln!("Value must be between {minimum} and {maximum}."),
+            Err(error) => eprintln!("Invalid number: {error}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionalNumberAction {
+    Keep,
+    Change,
+    Clear,
+}
+
+pub fn resolve_optional_number<T>(
+    action: OptionalNumberAction,
+    current: Option<T>,
+    changed: Option<T>,
+) -> Option<T> {
+    match action {
+        OptionalNumberAction::Keep => current,
+        OptionalNumberAction::Change => changed,
+        OptionalNumberAction::Clear => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionalModelAction {
+    Keep,
+    Change,
+    Clear,
+}
+
+pub fn resolve_optional_model(
+    action: OptionalModelAction,
+    current: Option<&str>,
+    changed: Option<String>,
+) -> Option<String> {
+    match action {
+        OptionalModelAction::Keep => current.map(str::to_owned),
+        OptionalModelAction::Change => changed,
+        OptionalModelAction::Clear => None,
+    }
+}
+
 
 fn parse_csv(value: &str) -> Vec<String> {
     let mut values = Vec::new();
@@ -1025,11 +2255,17 @@ enum WorkspaceChoice {
     Inherit,
 }
 
-fn prompt_workspace(
+fn prompt_workspace_with_default(
     theme: &ColorfulTheme,
     node: &Node,
     prior_nodes: &[Node],
+    default: &WorkspaceSpec,
 ) -> Result<WorkspaceSpec> {
+    let default_choice = match default {
+        WorkspaceSpec::Current | WorkspaceSpec::Readonly => WorkspaceChoice::Current,
+        WorkspaceSpec::Worktree { .. } => WorkspaceChoice::Worktree,
+        WorkspaceSpec::Inherit { .. } => WorkspaceChoice::Inherit,
+    };
     let mut choices = vec![("current", WorkspaceChoice::Current)];
     if node.fan_out() == 1 {
         choices.push(("worktree", WorkspaceChoice::Worktree));
@@ -1040,22 +2276,38 @@ fn prompt_workspace(
         choices.push(("inherit a prior node's workspace", WorkspaceChoice::Inherit));
     }
     let labels: Vec<&str> = choices.iter().map(|(label, _)| *label).collect();
+    let default_index = choices
+        .iter()
+        .position(|(_, choice)| *choice == default_choice)
+        .unwrap_or(0);
     let selected = Select::with_theme(theme)
         .with_prompt("Workspace mode")
-        .items(&labels)
-        .default(0)
+        .items(labels)
+        .default(default_index)
         .interact()?;
 
     match choices[selected].1 {
         WorkspaceChoice::Current => Ok(WorkspaceSpec::Current),
         WorkspaceChoice::Worktree => {
+            let default_base = match default {
+                WorkspaceSpec::Worktree { base, .. } => base.clone().unwrap_or_default(),
+                _ => String::new(),
+            };
+            let default_auto_commit = matches!(
+                default,
+                WorkspaceSpec::Worktree {
+                    auto_commit: true,
+                    ..
+                }
+            );
             let base: String = Input::with_theme(theme)
                 .with_prompt("Optional worktree base revision (blank uses captured run base)")
+                .default(default_base)
                 .allow_empty(true)
                 .interact_text()?;
             let auto_commit = Confirm::with_theme(theme)
                 .with_prompt("Auto-commit successful changes in the retained worktree?")
-                .default(false)
+                .default(default_auto_commit)
                 .interact()?;
             Ok(WorkspaceSpec::Worktree {
                 base: (!base.trim().is_empty()).then(|| base.trim().to_owned()),
@@ -1064,10 +2316,17 @@ fn prompt_workspace(
         }
         WorkspaceChoice::Inherit => {
             let ids: Vec<&str> = prior_nodes.iter().map(|prior| prior.id.as_str()).collect();
+            let default_index = match default {
+                WorkspaceSpec::Inherit { node } => ids
+                    .iter()
+                    .position(|id| *id == node.as_str())
+                    .unwrap_or(ids.len().saturating_sub(1)),
+                _ => ids.len().saturating_sub(1),
+            };
             let selected = Select::with_theme(theme)
                 .with_prompt("Prior node whose workspace should be inherited")
                 .items(&ids)
-                .default(ids.len() - 1)
+                .default(default_index)
                 .interact()?;
             eprintln!(
                 "A direct success/default data edge from '{}' will be added automatically.",
@@ -1172,38 +2431,207 @@ fn node_output_mut(node: &mut Node) -> Option<&mut OutputSpec> {
     }
 }
 
+fn prompt_output_spec_with_defaults(
+    theme: &ColorfulTheme,
+    existing: Option<&OutputSpec>,
+) -> Result<OutputSpec> {
+    let default_format = existing.map_or(0, |value| match value.format {
+        OutputFormat::Text => 0,
+        OutputFormat::Json => 1,
+    });
+    let format = match Select::with_theme(theme)
+        .with_prompt("Output format")
+        .items(["text", "json"])
+        .default(default_format)
+        .interact()?
+    {
+        0 => OutputFormat::Text,
+        1 => OutputFormat::Json,
+        _ => unreachable!("invalid output format selection"),
+    };
+    let max_bytes = prompt_bounded_number(
+        theme,
+        "Maximum output bytes",
+        existing.map_or(1024 * 1024, |value| value.max_bytes),
+        0,
+        MAX_OUTPUT_BYTES,
+    )?;
+    Ok(merge_output_spec_edits(existing, format, max_bytes))
+}
+
+pub fn merge_output_spec_edits(
+    existing: Option<&OutputSpec>,
+    format: OutputFormat,
+    max_bytes: usize,
+) -> OutputSpec {
+    OutputSpec {
+        format,
+        schema: existing.and_then(|value| value.schema.clone()),
+        inline_schema: existing.and_then(|value| value.inline_schema.clone()),
+        max_bytes,
+    }
+}
+
+fn prompt_prompt_text(
+    theme: &ColorfulTheme,
+    prompt: &str,
+    default: Option<&str>,
+) -> Result<String> {
+    let editor_env = std::env::var("EDITOR").ok();
+    let editor_label = editor_env
+        .as_deref()
+        .unwrap_or("$EDITOR");
+    let open_editor = format!("Open {editor_label}");
+    let labels = ["Write inline", open_editor.as_str()];
+    let selected = Select::with_theme(theme)
+        .with_prompt(format!("{prompt} entry method"))
+        .items(labels)
+        .default(0)
+        .interact()?;
+
+    if selected == 0 {
+        return prompt_nonempty_text(theme, prompt, default);
+    }
+
+    let initial = default.unwrap_or("");
+    match Editor::new().extension("txt").edit(initial) {
+        Ok(Some(text)) if !text.trim().is_empty() => Ok(text),
+        Ok(_) => prompt_nonempty_text(theme, prompt, default),
+        Err(_) => {
+            eprintln!("No editor available; falling back to inline input.");
+            prompt_nonempty_text(theme, prompt, default)
+        }
+    }
+}
+
+fn prompt_inline_text(prompt: &PromptSpec) -> Result<String> {
+    match prompt {
+        PromptSpec::Inline(text) => Ok(text.clone()),
+        PromptSpec::Package { .. } => Err(anyhow!(
+            "only inline prompts are editable in the wizard (package prompts)"
+        )),
+    }
+}
+
 fn prompt_profile_model(
     theme: &ColorfulTheme,
     id: &str,
     kind: &str,
+    default_profile: Option<&str>,
+    default_model: Option<&str>,
+    profiles: &[ProfileChoice],
 ) -> Result<(Option<String>, Option<String>)> {
-    let profile: String = Input::with_theme(theme)
-        .with_prompt(format!("Optional {kind} profile id for '{id}'"))
-        .allow_empty(true)
-        .interact_text()?;
-    let profile = if profile.trim().is_empty() {
-        None
-    } else {
-        Some(profile.trim().to_owned())
+    let enabled = enabled_profile_choices(profiles);
+    let items = profile_select_items(&enabled);
+    let default_index = profile_default_select_index(&enabled, default_profile);
+    let selected = Select::with_theme(theme)
+        .with_prompt(format!("{kind} profile for '{id}'"))
+        .items(&items)
+        .default(default_index)
+        .interact()?;
+
+    let profile = match selected.cmp(&enabled.len()) {
+        std::cmp::Ordering::Less => Some(enabled[selected].name.clone()),
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Greater => loop {
+            let manual: String = Input::with_theme(theme)
+                .with_prompt("Profile name")
+                .default(default_profile.unwrap_or("").to_owned())
+                .interact_text()?;
+            match classify_manual_profile_name(&manual, profiles) {
+                ManualProfileEntry::DefaultRouting => break None,
+                ManualProfileEntry::Accepted(name) => break Some(name),
+                ManualProfileEntry::KnownDisabled => {
+                    eprintln!(
+                        "Profile '{manual}' is disabled; choose an enabled profile or enter another name."
+                    );
+                }
+            }
+        },
     };
 
-    let model: String = Input::with_theme(theme)
-        .with_prompt(format!("Optional {kind} model id for '{id}'"))
-        .allow_empty(true)
-        .interact_text()?;
-    let model = if model.trim().is_empty() {
-        None
-    } else {
-        Some(model.trim().to_owned())
-    };
+    let model = prompt_optional_model(
+        theme,
+        id,
+        kind,
+        default_model,
+        profile.as_deref(),
+        default_profile,
+        profiles,
+    )?;
 
     Ok((profile, model))
 }
 
-fn build_agent_node(theme: &ColorfulTheme, id: &str) -> Result<Node> {
-    let prompt = prompt_nonempty_text(theme, &format!("Prompt for agent node '{id}'"), None)?;
+fn prompt_optional_model(
+    theme: &ColorfulTheme,
+    id: &str,
+    kind: &str,
+    default_model: Option<&str>,
+    selected_profile: Option<&str>,
+    previous_profile: Option<&str>,
+    profiles: &[ProfileChoice],
+) -> Result<Option<String>> {
+    if let Some(current) = default_model {
+        let action = Select::with_theme(theme)
+            .with_prompt(format!("Optional {kind} model id for '{id}' (current: {current})"))
+            .items(["Keep current value", "Change value", "Clear value"])
+            .default(0)
+            .interact()?;
+        let action = match action {
+            0 => OptionalModelAction::Keep,
+            1 => OptionalModelAction::Change,
+            _ => OptionalModelAction::Clear,
+        };
+        let changed = if action == OptionalModelAction::Change {
+            let model_default = profile_model_default(
+                selected_profile,
+                previous_profile,
+                Some(current),
+                profiles,
+            );
+            let model: String = Input::with_theme(theme)
+                .with_prompt(format!(
+                    "Optional {kind} model id for '{id}' (blank keeps provider default)"
+                ))
+                .default(model_default)
+                .allow_empty(true)
+                .interact_text()?;
+            if model.trim().is_empty() {
+                None
+            } else {
+                Some(model.trim().to_owned())
+            }
+        } else {
+            None
+        };
+        return Ok(resolve_optional_model(action, Some(current), changed));
+    }
+
+    let model_default = profile_model_default(
+        selected_profile,
+        previous_profile,
+        default_model,
+        profiles,
+    );
+    let model: String = Input::with_theme(theme)
+        .with_prompt(format!(
+            "Optional {kind} model id for '{id}' (blank keeps provider default)"
+        ))
+        .default(model_default)
+        .allow_empty(true)
+        .interact_text()?;
+    Ok(if model.trim().is_empty() {
+        None
+    } else {
+        Some(model.trim().to_owned())
+    })
+}
+
+fn build_agent_node(theme: &ColorfulTheme, id: &str, profiles: &[ProfileChoice]) -> Result<Node> {
+    let prompt = prompt_prompt_text(theme, &format!("Prompt for agent node '{id}'"), None)?;
     let fan_out = prompt_bounded_number(theme, "Fan out", 1usize, 1, MAX_FAN_OUT)?;
-    let (profile, model) = prompt_profile_model(theme, id, "agent")?;
+    let (profile, model) = prompt_profile_model(theme, id, "agent", None, None, profiles)?;
 
     let mut node = agent_node(id, &prompt, profile, fan_out);
     if let NodeKind::Agent {
@@ -1215,9 +2643,9 @@ fn build_agent_node(theme: &ColorfulTheme, id: &str) -> Result<Node> {
     Ok(node)
 }
 
-fn build_reduce_node(theme: &ColorfulTheme, id: &str) -> Result<Node> {
-    let prompt = prompt_nonempty_text(theme, &format!("Prompt for reduce node '{id}'"), None)?;
-    let (profile, model) = prompt_profile_model(theme, id, "reduce")?;
+fn build_reduce_node(theme: &ColorfulTheme, id: &str, profiles: &[ProfileChoice]) -> Result<Node> {
+    let prompt = prompt_prompt_text(theme, &format!("Prompt for reduce node '{id}'"), None)?;
+    let (profile, model) = prompt_profile_model(theme, id, "reduce", None, None, profiles)?;
     let mut node = reduce_node(id, &prompt, profile);
     if let NodeKind::Reduce {
         model: node_model, ..
@@ -1228,9 +2656,13 @@ fn build_reduce_node(theme: &ColorfulTheme, id: &str) -> Result<Node> {
     Ok(node)
 }
 
-fn build_synthesize_node(theme: &ColorfulTheme, id: &str) -> Result<Node> {
-    let prompt = prompt_nonempty_text(theme, &format!("Prompt for synthesize node '{id}'"), None)?;
-    let (profile, model) = prompt_profile_model(theme, id, "synthesize")?;
+fn build_synthesize_node(
+    theme: &ColorfulTheme,
+    id: &str,
+    profiles: &[ProfileChoice],
+) -> Result<Node> {
+    let prompt = prompt_prompt_text(theme, &format!("Prompt for synthesize node '{id}'"), None)?;
+    let (profile, model) = prompt_profile_model(theme, id, "synthesize", None, None, profiles)?;
     let mut node = synthesize_node(id, &prompt, profile);
     if let NodeKind::Synthesize {
         model: node_model, ..
@@ -1272,14 +2704,95 @@ fn prompt_command_argv(theme: &ColorfulTheme, id: &str) -> Result<Vec<String>> {
 }
 
 fn build_gate_node(theme: &ColorfulTheme, id: &str) -> Result<Node> {
-    let message = prompt_nonempty_text(theme, &format!("Approval prompt for '{id}'"), None)?;
+    let message = prompt_prompt_text(theme, &format!("Approval prompt for '{id}'"), None)?;
     Ok(gate_node(id, &message))
 }
 
-fn build_loop_node(theme: &ColorfulTheme, id: &str, depth: usize) -> Result<Node> {
+pub fn shell_quote_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "''".to_owned();
+    }
+    if arg
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "-_./:".contains(character))
+    {
+        return arg.to_owned();
+    }
+    if !arg.contains('\'') {
+        return format!("'{arg}'");
+    }
+    format!(
+        "\"{}\"",
+        arg.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\t', "\\t")
+    )
+}
+
+pub fn format_argv_for_shell(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| shell_quote_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn prompt_command_argv_with_default(
+    theme: &ColorfulTheme,
+    id: &str,
+    argv: &[String],
+) -> Result<Vec<String>> {
+    let executable_default = argv.first().map_or("", String::as_str);
+    let args_default = if argv.len() > 1 {
+        format_argv_for_shell(&argv[1..])
+    } else {
+        String::new()
+    };
+    let executable = prompt_nonempty_text(
+        theme,
+        &format!("Executable for '{id}'"),
+        Some(executable_default),
+    )?;
+
+    loop {
+        let args_text: String = Input::with_theme(theme)
+            .with_prompt("Arguments (quoted tokens supported, e.g. \"a b\" '--flag')")
+            .default(args_default.clone())
+            .allow_empty(true)
+            .interact_text()?;
+        let mut parsed_argv = vec![executable.trim().to_owned()];
+        if args_text.trim().is_empty() {
+            return Ok(parsed_argv);
+        }
+        match parse_argv(&args_text) {
+            Ok(arguments) => {
+                parsed_argv.extend(arguments);
+                return Ok(parsed_argv);
+            }
+            Err(error) => eprintln!("Invalid arguments: {error}. Please try again."),
+        }
+    }
+}
+
+fn build_loop_node(
+    theme: &ColorfulTheme,
+    id: &str,
+    depth: usize,
+    profiles: &[ProfileChoice],
+) -> Result<Option<Node>> {
     let nested_name = format!("{id}-body");
     let nested_goal = format!("Bounded iteration body for {id}");
-    let nested = interactive_graph_inner(theme, depth + 1, Some(&nested_name), Some(&nested_goal))?;
+    let mut nested_state = EditorState::new(&nested_name, &nested_goal);
+    nested_state.depth = depth + 1;
+    let nested = match interactive_editor_loop(
+        theme,
+        nested_state,
+        profiles,
+        &EditorPersistTarget::None,
+    )? {
+        NestedEditorOutcome::Saved(graph) => *graph,
+        NestedEditorOutcome::Cancelled => return Ok(None),
+    };
     let nested_ids: Vec<&str> = nested
         .spec
         .nodes
@@ -1309,7 +2822,7 @@ fn build_loop_node(theme: &ColorfulTheme, id: &str, depth: usize) -> Result<Node
         max_iterations,
     )?;
 
-    Ok(loop_node(
+    Ok(Some(loop_node(
         id,
         nested,
         LoopCondition {
@@ -1321,14 +2834,29 @@ fn build_loop_node(theme: &ColorfulTheme, id: &str, depth: usize) -> Result<Node
         },
         max_iterations,
         stagnation_after,
-    ))
+    )))
 }
 
-fn build_subgraph_node(theme: &ColorfulTheme, id: &str, depth: usize) -> Result<Node> {
+fn build_subgraph_node(
+    theme: &ColorfulTheme,
+    id: &str,
+    depth: usize,
+    profiles: &[ProfileChoice],
+) -> Result<Option<Node>> {
     let nested_name = format!("{id}-graph");
     let nested_goal = format!("Nested workflow for {id}");
-    let nested = interactive_graph_inner(theme, depth + 1, Some(&nested_name), Some(&nested_goal))?;
-    Ok(subgraph_node(id, nested))
+    let mut nested_state = EditorState::new(&nested_name, &nested_goal);
+    nested_state.depth = depth + 1;
+    let nested = match interactive_editor_loop(
+        theme,
+        nested_state,
+        profiles,
+        &EditorPersistTarget::None,
+    )? {
+        NestedEditorOutcome::Saved(graph) => *graph,
+        NestedEditorOutcome::Cancelled => return Ok(None),
+    };
+    Ok(Some(subgraph_node(id, nested)))
 }
 
 fn loop_node(
@@ -1566,11 +3094,21 @@ fn is_valid_identifier(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommonNodeSettings, DependencyDraft, Edge, EdgeCondition, EdgeKind, Graph, GraphSettings,
-        GraphTemplate, NodeKind, NodeStatus, WizardAction, apply_common_node_settings,
-        apply_graph_settings, build_dependency_edges, ensure_workspace_inheritance_edge,
-        graph_from_yaml_bytes, is_valid_json_pointer, loop_node, node_output_mut, parse_csv,
-        parse_json_literal, subgraph_node, template_graph, wizard_actions,
+        CommonNodeSettings, DependencyDraft, Edge, EdgeCondition, EdgeKind, EditorPersistTarget,
+        EditorState, Graph, GraphSettings, GraphTemplate, ManualProfileEntry,
+        NestedEditorOutcome, NodeKind, NodeStatus, OptionalModelAction, OptionalNumberAction,
+        ProfileChoice, ProfileSource, WizardAction, add_edge_to_editor, add_node_to_editor,
+        apply_common_node_settings, apply_graph_settings, build_dependency_edges,
+        classify_manual_profile_name, editor_summary_header, enabled_profile_choices,
+        ensure_workspace_inheritance_edge, format_argv_for_shell, format_node_summary,
+        graph_from_yaml_bytes, is_valid_json_pointer, loop_node, map_profile_selection,
+        merge_output_spec_edits, node_output_mut, parse_csv, parse_json_literal,
+        preflight_template_destination, profile_choice_label, profile_default_select_index,
+        profile_model_default, profile_select_items, remove_edge_from_editor, remove_node_from_editor,
+        replace_node_in_editor, resolve_optional_model, resolve_optional_number,
+        seed_editor_from_template, shell_quote_arg,
+        subgraph_node, template_graph, try_persist_editor_graph, validate_for_save,
+        wizard_actions, workspace_inheritance_dependents,
     };
     use super::{parse_argv, synthesize_node};
     use gloop_core::{
@@ -1901,6 +3439,7 @@ mod tests {
                     wall_time_seconds: Some(600),
                     model_calls: Some(20),
                 },
+                goal: None,
             },
         );
         assert_no_validation_errors(&graph);
@@ -2118,5 +3657,434 @@ spec:
             .filter(|issue| issue.severity == IssueSeverity::Error)
             .collect();
         assert!(errors.is_empty(), "validation errors: {errors:#?}");
+    }
+
+    #[test]
+    fn template_seeding_lands_in_editor_state() {
+        let state = seed_editor_from_template(
+            "seeded",
+            "seed goal",
+            GraphTemplate::Direct,
+            super::TemplateKnobs {
+                request: Some("do work".to_owned()),
+                provider_profiles: vec!["codex".to_owned()],
+                loop_cap: None,
+            },
+        );
+        assert_eq!(state.graph.metadata.name, "seeded");
+        assert_eq!(state.graph.spec.goal, "seed goal");
+        assert_eq!(state.graph.spec.nodes.len(), 1);
+        assert_eq!(state.graph.spec.nodes[0].id, "request");
+    }
+
+    #[test]
+    fn profile_choice_rendering_and_selection_mapping() {
+        let profiles = vec![ProfileChoice {
+            name: "codex".to_owned(),
+            kind: "command".to_owned(),
+            source: ProfileSource::Builtin,
+            enabled: true,
+            default_model: None,
+        }];
+        assert_eq!(profile_choice_label(&profiles[0]), "codex  (command, builtin)");
+        let items = profile_select_items(&profiles);
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            map_profile_selection(&profiles, 0).expect("profile"),
+            Some("codex".to_owned())
+        );
+        assert_eq!(map_profile_selection(&profiles, 1).expect("default routing"), None);
+    }
+
+    #[test]
+    fn editor_edge_add_and_remove() {
+        let mut state = EditorState::new("edges", "test edges");
+        state.graph.spec.nodes = vec![
+            super::agent_node("a", "prompt", None, 1),
+            super::command_node("b", vec!["true".to_owned()]),
+        ];
+        state = add_edge_to_editor(&state, Edge::data("a", "b")).expect("add edge");
+        assert_eq!(state.graph.spec.edges.len(), 1);
+        state = remove_edge_from_editor(&state, "a", "b", EdgeKind::Data).expect("remove edge");
+        assert!(state.graph.spec.edges.is_empty());
+    }
+
+    #[test]
+    fn editor_edit_and_remove_node() {
+        let mut state = EditorState::new("nodes", "test nodes");
+        let node = super::agent_node("worker", "prompt", Some("codex".to_owned()), 1);
+        state = add_node_to_editor(&state, node, &[], &[], &[]).expect("add node");
+        let updated = super::agent_node("worker", "updated prompt", Some("claude".to_owned()), 1);
+        state = replace_node_in_editor(&state, "worker", updated).expect("edit node");
+        match &state.graph.spec.nodes[0].kind {
+            NodeKind::Agent { prompt, profile, .. } => {
+                assert_eq!(prompt, &gloop_core::PromptSpec::Inline("updated prompt".to_owned()));
+                assert_eq!(profile.as_deref(), Some("claude"));
+            }
+            _ => panic!("expected agent node"),
+        }
+        state = remove_node_from_editor(&state, "worker").expect("remove node");
+        assert!(state.graph.spec.nodes.is_empty());
+    }
+
+    #[test]
+    fn save_blocked_by_validation_returns_errors() {
+        let state = EditorState::new("empty", "no nodes yet");
+        let errors = validate_for_save(&state).expect_err("empty graph cannot save");
+        assert!(errors.iter().any(|error| error.contains("at least one node")));
+    }
+
+    #[test]
+    fn editor_summary_header_formats_node_line() {
+        let mut state = EditorState::new("flow", "goal");
+        state.graph.spec.nodes = vec![
+            super::agent_node("implement", "prompt", Some("codex".to_owned()), 1),
+            super::verify_node("test", vec!["true".to_owned()]),
+        ];
+        state.graph.spec.edges.push(Edge::data("implement", "test"));
+        let (header, node_line) = editor_summary_header(&state);
+        assert!(header.contains("2 nodes, 1 edges"));
+        assert!(node_line.contains("implement(agent:codex)"));
+        assert!(node_line.contains("test(verify)"));
+        assert_eq!(format_node_summary(&state.graph.spec.nodes[0]), "implement(agent:codex)");
+    }
+
+    #[test]
+    fn persist_collision_can_be_retried_without_losing_graph_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = EditorState::new("dup", "goal");
+        state.graph.spec.nodes = vec![super::agent_node("worker", "prompt", None, 1)];
+        let target = EditorPersistTarget::ProjectTemplate {
+            repo: dir.path().to_path_buf(),
+            force: false,
+        };
+        try_persist_editor_graph(&state.graph, &target).expect("first save");
+        let error = try_persist_editor_graph(&state.graph, &target).expect_err("collision");
+        assert!(error.contains("output path exists"));
+        let forced = EditorPersistTarget::ProjectTemplate {
+            repo: dir.path().to_path_buf(),
+            force: true,
+        };
+        try_persist_editor_graph(&state.graph, &forced).expect("forced overwrite");
+        assert_eq!(state.graph.spec.nodes.len(), 1);
+    }
+
+    #[test]
+    fn preflight_template_destination_rejects_existing_template() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let destination = super::template_path(dir.path(), "existing");
+        std::fs::create_dir_all(destination.parent().unwrap()).expect("templates dir");
+        std::fs::write(&destination, "existing").expect("seed template");
+        let error =
+            preflight_template_destination(dir.path(), "existing", false).expect_err("collision");
+        assert!(error.contains("already exists"));
+    }
+
+    #[test]
+    fn nested_editor_cancel_preserves_parent_state() {
+        let parent = EditorState::new("parent", "goal");
+        let parent = add_node_to_editor(
+            &parent,
+            super::agent_node("seed", "prompt", None, 1),
+            &[],
+            &[],
+            &[],
+        )
+        .expect("seed parent node");
+        let preserved = match NestedEditorOutcome::Cancelled {
+            NestedEditorOutcome::Cancelled => parent.clone(),
+            NestedEditorOutcome::Saved(_) => panic!("cancel should not replace parent state"),
+        };
+        assert_eq!(preserved.graph.spec.nodes.len(), 1);
+        assert_eq!(preserved.graph.spec.nodes[0].id, "seed");
+    }
+
+    #[test]
+    fn removal_blocked_when_other_nodes_inherit_workspace() {
+        let mut owner = super::agent_node("owner", "prompt", None, 1);
+        owner.workspace = WorkspaceSpec::Current;
+        let mut follower = super::command_node("follower", vec!["true".to_owned()]);
+        follower.workspace = WorkspaceSpec::Inherit {
+            node: "owner".to_owned(),
+        };
+        let state = EditorState::from_graph(
+            Graph::new("inherit", "goal", vec![owner, follower]),
+            0,
+        );
+        assert_eq!(
+            workspace_inheritance_dependents(&state, "owner"),
+            vec!["follower".to_owned()]
+        );
+        let error = remove_node_from_editor(&state, "owner").expect_err("blocked removal");
+        assert!(error.to_string().contains("follower"));
+    }
+
+    #[test]
+    fn workspace_edit_reconciles_auto_inheritance_edges() {
+        let owner = super::agent_node("owner", "prompt", None, 1);
+        let mut follower = super::command_node("follower", vec!["true".to_owned()]);
+        follower.workspace = WorkspaceSpec::Inherit {
+            node: "owner".to_owned(),
+        };
+        let mut state = EditorState::from_graph(
+            Graph::new("inherit", "goal", vec![owner.clone(), follower.clone()]),
+            0,
+        );
+        ensure_workspace_inheritance_edge(&follower, &mut state.graph.spec.edges)
+            .expect("initial inherit edge");
+        let mut updated = follower.clone();
+        updated.workspace = WorkspaceSpec::Current;
+        state = replace_node_in_editor(&state, "follower", updated).expect("clear inherit");
+        assert!(
+            !state
+                .graph
+                .spec
+                .edges
+                .iter()
+                .any(|edge| edge.from == "owner" && edge.to == "follower")
+        );
+
+        let mut reinherit = state.graph.spec.nodes[1].clone();
+        reinherit.workspace = WorkspaceSpec::Inherit {
+            node: "owner".to_owned(),
+        };
+        state = replace_node_in_editor(&state, "follower", reinherit).expect("restore inherit");
+        assert!(
+            state
+                .graph
+                .spec
+                .edges
+                .iter()
+                .any(|edge| edge.from == "owner" && edge.to == "follower")
+        );
+    }
+
+    #[test]
+    fn output_schema_preserved_on_edit() {
+        let existing = gloop_core::OutputSpec {
+            format: OutputFormat::Json,
+            schema: Some(PathBuf::from("schemas/out.json")),
+            inline_schema: Some(json!({"type": "object"})),
+            max_bytes: 4096,
+        };
+        let merged = merge_output_spec_edits(Some(&existing), OutputFormat::Json, 8192);
+        assert_eq!(merged.schema, existing.schema);
+        assert_eq!(merged.inline_schema, existing.inline_schema);
+        assert_eq!(merged.max_bytes, 8192);
+    }
+
+    #[test]
+    fn default_routing_is_default_profile_selection() {
+        let profiles = vec![
+            ProfileChoice {
+                name: "codex".to_owned(),
+                kind: "command".to_owned(),
+                source: ProfileSource::Builtin,
+                enabled: true,
+                default_model: None,
+            },
+            ProfileChoice {
+                name: "claude".to_owned(),
+                kind: "anthropic".to_owned(),
+                source: ProfileSource::Builtin,
+                enabled: true,
+                default_model: None,
+            },
+        ];
+        assert_eq!(profile_default_select_index(&profiles, None), profiles.len());
+        assert_eq!(profile_default_select_index(&profiles, Some("")), profiles.len());
+    }
+
+    #[test]
+    fn empty_string_profile_selects_default_routing() {
+        let profiles = vec![ProfileChoice {
+            name: "codex".to_owned(),
+            kind: "command".to_owned(),
+            source: ProfileSource::Builtin,
+            enabled: true,
+            default_model: None,
+        }];
+        assert_eq!(
+            map_profile_selection(&profiles, profiles.len()).expect("default routing index"),
+            None
+        );
+        assert_eq!(profile_default_select_index(&profiles, Some("")), profiles.len());
+    }
+
+    #[test]
+    fn manual_profile_entry_classifies_disabled_and_unknown_profiles() {
+        let profiles = vec![
+            ProfileChoice {
+                name: "enabled".to_owned(),
+                kind: "command".to_owned(),
+                source: ProfileSource::Builtin,
+                enabled: true,
+                default_model: None,
+            },
+            ProfileChoice {
+                name: "disabled".to_owned(),
+                kind: "command".to_owned(),
+                source: ProfileSource::Builtin,
+                enabled: false,
+                default_model: None,
+            },
+        ];
+        assert_eq!(
+            classify_manual_profile_name("disabled", &profiles),
+            ManualProfileEntry::KnownDisabled
+        );
+        assert_eq!(
+            classify_manual_profile_name("external", &profiles),
+            ManualProfileEntry::Accepted("external".to_owned())
+        );
+        assert_eq!(
+            classify_manual_profile_name("enabled", &profiles),
+            ManualProfileEntry::Accepted("enabled".to_owned())
+        );
+    }
+
+    #[test]
+    fn optional_model_can_be_cleared() {
+        assert_eq!(
+            resolve_optional_model(OptionalModelAction::Clear, Some("gpt-5"), Some("other".to_owned())),
+            None
+        );
+        assert_eq!(
+            resolve_optional_model(OptionalModelAction::Keep, Some("gpt-5"), Some("other".to_owned())),
+            Some("gpt-5".to_owned())
+        );
+        assert_eq!(
+            resolve_optional_model(
+                OptionalModelAction::Change,
+                Some("gpt-5"),
+                Some("claude-sonnet".to_owned())
+            ),
+            Some("claude-sonnet".to_owned())
+        );
+    }
+
+    #[test]
+    fn failed_non_force_interactive_save_leaves_no_partial_destination_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let destination = dir.path().join("simulate-fail-graph.yml");
+
+        let mut state = EditorState::new("flow", "goal");
+        state.graph.spec.nodes = vec![super::agent_node("worker", "prompt", None, 1)];
+        let target = EditorPersistTarget::GraphFile {
+            path: destination.clone(),
+            force: false,
+        };
+        let error = try_persist_editor_graph(&state.graph, &target).expect_err("save must fail");
+        assert!(error.contains("simulated write failure"));
+        assert!(
+            !destination.exists(),
+            "failed non-force interactive save must not leave a partial destination file: {error}"
+        );
+    }
+
+    #[test]
+    fn profile_change_uses_new_profile_model_default() {
+        let profiles = vec![
+            ProfileChoice {
+                name: "codex".to_owned(),
+                kind: "openai".to_owned(),
+                source: ProfileSource::Builtin,
+                enabled: true,
+                default_model: Some("gpt-5".to_owned()),
+            },
+            ProfileChoice {
+                name: "claude".to_owned(),
+                kind: "anthropic".to_owned(),
+                source: ProfileSource::Builtin,
+                enabled: true,
+                default_model: Some("claude-sonnet".to_owned()),
+            },
+        ];
+        assert_eq!(
+            profile_model_default(Some("claude"), Some("codex"), Some("old-model"), &profiles),
+            "claude-sonnet"
+        );
+        assert_eq!(
+            profile_model_default(Some("codex"), Some("codex"), Some("old-model"), &profiles),
+            "old-model"
+        );
+    }
+
+    #[test]
+    fn disabled_profiles_are_filtered_from_selectable_choices() {
+        let profiles = vec![
+            ProfileChoice {
+                name: "enabled".to_owned(),
+                kind: "command".to_owned(),
+                source: ProfileSource::Builtin,
+                enabled: true,
+                default_model: None,
+            },
+            ProfileChoice {
+                name: "disabled".to_owned(),
+                kind: "command".to_owned(),
+                source: ProfileSource::Builtin,
+                enabled: false,
+                default_model: None,
+            },
+        ];
+        let enabled = enabled_profile_choices(&profiles);
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0].name, "enabled");
+        let items = profile_select_items(&enabled);
+        assert!(!items.iter().any(|item| item.starts_with("disabled")));
+    }
+
+    #[test]
+    fn optional_budget_can_be_cleared() {
+        assert_eq!(
+            resolve_optional_number(OptionalNumberAction::Clear, Some(42u32), Some(99)),
+            None
+        );
+        assert_eq!(
+            resolve_optional_number(OptionalNumberAction::Keep, Some(42u32), Some(99)),
+            Some(42)
+        );
+        assert_eq!(
+            resolve_optional_number(OptionalNumberAction::Change, Some(42u32), Some(99)),
+            Some(99)
+        );
+    }
+
+    #[test]
+    fn argv_shell_quoting_round_trips_token_boundaries() {
+        let argv = [
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "echo a".to_owned(),
+            "hello world".to_owned(),
+            "say \"hi\"".to_owned(),
+        ];
+        let rendered = format_argv_for_shell(&argv[1..]);
+        let reparsed = parse_argv(&rendered).expect("parse quoted argv");
+        assert_eq!(reparsed, argv[1..]);
+        assert_eq!(shell_quote_arg("plain"), "plain");
+        assert_eq!(shell_quote_arg("hello world"), "'hello world'");
+    }
+
+    #[tokio::test]
+    async fn write_graph_yaml_saves_inside_async_runtime() {
+        // Regression: the previous implementation built a nested Tokio runtime
+        // and panicked with "Cannot start a runtime from within a runtime"
+        // whenever the interactive editor saved from the CLI's own runtime.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let destination = dir.path().join("graph.yaml");
+        super::write_graph_yaml(&destination, "kind: Graph\n", false).expect("no-replace save");
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("read back"),
+            "kind: Graph\n"
+        );
+        super::write_graph_yaml(&destination, "kind: Graph2\n", true).expect("force save");
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("read back"),
+            "kind: Graph2\n"
+        );
+        let error = super::write_graph_yaml(&destination, "x\n", false).expect_err("exists");
+        assert!(error.contains("use --force"), "unexpected error: {error}");
     }
 }

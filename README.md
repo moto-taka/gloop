@@ -58,9 +58,10 @@ Create a graph interactively, in the style of TAKT's authoring flow:
 gloop graph new workflow.yaml --interactive
 ```
 
-Save a reusable project template from a built-in base or custom wizard output:
+Save a reusable project template interactively (the wizard builds graphs node-by-node and selects providers from your configured profiles) or non-interactively from a built-in base:
 
 ```bash
+gloop graph init
 gloop graph init --name my-review-flow --from review-fix-loop \
   --description "Bounded review and fix loop" \
   --request "Review the latest diff"
