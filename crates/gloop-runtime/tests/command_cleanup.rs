@@ -238,10 +238,22 @@ fn kill_logged_processes(pids: &[u32]) {
 }
 
 fn is_pid_alive(pid: u32) -> bool {
-    StdCommand::new("kill")
+    let kill_succeeded = StdCommand::new("kill")
         .arg("-0")
         .arg(pid.to_string())
         .status()
         .map(|status| status.success())
+        .unwrap_or(false);
+    if !kill_succeeded {
+        return false;
+    }
+
+    StdCommand::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .output()
+        .map(|output| {
+            let state = String::from_utf8_lossy(&output.stdout);
+            !state.trim_start().starts_with('Z')
+        })
         .unwrap_or(false)
 }
