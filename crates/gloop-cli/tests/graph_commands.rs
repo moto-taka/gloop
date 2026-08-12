@@ -444,6 +444,94 @@ fn graph_init_list_reports_builtin_and_project_templates() {
 }
 
 #[test]
+fn graph_list_shows_templates_and_saved_graph_files() {
+    let dir = tempdir().expect("create tempdir");
+    let repo = dir.path();
+    let workflow = repo.join("workflow.yaml");
+    write_graph(&workflow);
+    fs::write(repo.join("settings.yaml"), "name: not a graph\n").expect("write unrelated yaml");
+
+    let output = gloop_cmd()
+        .args([
+            "graph",
+            "list",
+            "--repo",
+            repo.to_str().expect("repo path"),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let value = parse_json_output(&output);
+    assert!(
+        value["templates"]
+            .as_array()
+            .expect("templates")
+            .iter()
+            .any(|entry| entry["name"] == "plan-implement-verify")
+    );
+    let graphs = value["graphs"].as_array().expect("graphs");
+    assert_eq!(graphs.len(), 1);
+    assert_eq!(graphs[0]["name"], "sample");
+    assert_eq!(graphs[0]["status"], "valid");
+    assert_eq!(graphs[0]["node_count"], 1);
+    assert_eq!(graphs[0]["edge_count"], 0);
+
+    gloop_cmd()
+        .args([
+            "graph",
+            "list",
+            "--repo",
+            repo.to_str().expect("repo path"),
+            "--lang",
+            "ja",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("計画 → 実装 → 検証"))
+        .stdout(predicate::str::contains("目的: validate test"));
+}
+
+#[test]
+fn graph_edit_explains_unknown_name_with_graph_list_hint() {
+    let dir = tempdir().expect("create tempdir");
+
+    gloop_cmd()
+        .args([
+            "graph",
+            "edit",
+            "does-not-exist",
+            "--repo",
+            dir.path().to_str().expect("repo path"),
+        ])
+        .assert()
+        .code(6)
+        .stdout(predicate::str::contains("gloop graph list"));
+}
+
+#[test]
+fn graph_update_explains_that_builtins_need_edit() {
+    let dir = tempdir().expect("create tempdir");
+
+    gloop_cmd()
+        .args([
+            "graph",
+            "update",
+            "plan-implement-verify",
+            "--repo",
+            dir.path().to_str().expect("repo path"),
+        ])
+        .assert()
+        .code(6)
+        .stdout(predicate::str::contains(
+            "use 'graph edit plan-implement-verify'",
+        ));
+}
+
+#[test]
 fn graph_new_resolves_saved_project_template() {
     let dir = tempdir().expect("create tempdir");
     let repo = dir.path();
@@ -494,11 +582,7 @@ fn graph_new_resolves_saved_project_template() {
     let graph = Graph::from_path(&workflow).expect("workflow written");
     assert_eq!(graph.metadata.name, "run-name");
     assert_eq!(graph.spec.goal, "run goal");
-    assert!(graph
-        .spec
-        .nodes
-        .iter()
-        .any(|node| node.id == "request"));
+    assert!(graph.spec.nodes.iter().any(|node| node.id == "request"));
 }
 
 #[test]
@@ -881,10 +965,7 @@ fn graph_new_rejects_provider_profiles_and_loop_cap_for_saved_templates() {
         .assert()
         .success();
 
-    for (flag, value) in [
-        ("--provider-profiles", "codex"),
-        ("--loop-cap", "2"),
-    ] {
+    for (flag, value) in [("--provider-profiles", "codex"), ("--loop-cap", "2")] {
         let output = gloop_cmd()
             .args([
                 "graph",

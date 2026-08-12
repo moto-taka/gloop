@@ -4,9 +4,9 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 use crate::commands::{
-    RenderFormat, graph_edit, graph_explain, graph_init, graph_new, graph_render, graph_schema,
-    graph_validate, inspect_run_at, present, provider_add, provider_doctor, provider_list,
-    provider_probe, replay_run, run_foreground, run_logs,
+    RenderFormat, graph_edit, graph_explain, graph_init, graph_list, graph_new, graph_render,
+    graph_schema, graph_validate, inspect_run_at, present, provider_add, provider_doctor,
+    provider_list, provider_probe, replay_run, run_foreground, run_logs,
 };
 use crate::gui::Language;
 
@@ -98,14 +98,41 @@ struct RunCommand {
 
 #[derive(Subcommand)]
 enum GraphCommand {
+    /// Show built-in templates, saved templates, and graph YAML files in this project.
+    List(GraphList),
+    /// Create a graph file from a template or interactively.
     New(GraphNew),
+    /// Create a reusable project template.
     Init(GraphInit),
+    /// Edit a graph file, saved template, or built-in template.
     Edit(GraphEdit),
+    /// Edit a saved project template by name.
     Update(GraphEdit),
+    /// Check one graph file.
     Validate(GraphFile),
+    /// Explain the execution order of one graph file.
     Explain(GraphFile),
+    /// Render one graph as Mermaid or DOT.
     Render(GraphRender),
+    /// Print the machine-readable graph schema.
     Schema(GraphSchema),
+}
+
+#[derive(Args)]
+struct GraphList {
+    #[arg(
+        long = "repo",
+        value_name = "PATH",
+        default_value = ".",
+        help = "Project directory to search"
+    )]
+    repo: PathBuf,
+
+    #[arg(long = "lang", alias = "language", value_enum, default_value = "en")]
+    language: Language,
+
+    #[arg(long, help = "Print one JSON object for scripts and assistants")]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -156,10 +183,13 @@ struct GraphNew {
 #[derive(Args)]
 #[allow(clippy::struct_excessive_bools)]
 struct GraphInit {
-    #[arg(long)]
+    #[arg(long, help = "Reusable name for the new project template")]
     name: Option<String>,
 
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Built-in template to start from, such as direct or plan-implement-verify"
+    )]
     from: Option<String>,
 
     #[arg(long)]
@@ -177,7 +207,11 @@ struct GraphInit {
     #[arg(long, conflicts_with_all = ["name", "from", "description", "request", "provider_profiles", "loop_cap"])]
     list: bool,
 
-    #[arg(long, conflicts_with = "list")]
+    #[arg(
+        long,
+        conflicts_with = "list",
+        help = "Open the browser editor instead of asking in the terminal"
+    )]
     gui: bool,
 
     #[arg(long = "lang", alias = "language", value_enum, default_value = "en")]
@@ -195,13 +229,16 @@ struct GraphInit {
 
 #[derive(Args)]
 struct GraphEdit {
-    #[arg(value_name = "PATH_OR_TEMPLATE")]
+    #[arg(
+        value_name = "PATH_OR_NAME",
+        help = "Graph YAML path or a name shown by 'gloop graph list'"
+    )]
     target: PathBuf,
 
     #[arg(long = "repo", value_name = "PATH", default_value = ".")]
     repo: PathBuf,
 
-    #[arg(long)]
+    #[arg(long, help = "Open the local browser editor")]
     gui: bool,
 
     #[arg(long = "lang", alias = "language", value_enum, default_value = "en")]
@@ -291,6 +328,7 @@ impl Command {
     fn json_mode(&self) -> bool {
         match self {
             Self::Run(c) => c.json,
+            Self::Graph(GraphCommand::List(c)) => c.json,
             Self::Graph(GraphCommand::New(c)) => c.json,
             Self::Graph(GraphCommand::Init(c)) => c.json,
             Self::Graph(GraphCommand::Edit(c) | GraphCommand::Update(c)) => c.json,
@@ -330,6 +368,7 @@ pub async fn run() -> Result<()> {
             .await
         }
         Command::Graph(cmd) => match cmd {
+            GraphCommand::List(c) => graph_list(c.repo, c.language, c.json).await,
             GraphCommand::New(c) => {
                 graph_new(
                     c.name,
