@@ -106,11 +106,13 @@ gloop graph init --name my-flow --from plan-implement-verify --gui --lang ja
 gloop graph update my-flow --gui
 ~~~
 
-Open the same graph authoring flow in a local browser. It asks three simple
-questions — name and wish, helpers, then save — and keeps technical details
-behind "More settings". It only binds to loopback, shows enabled AI/app
-choices and known model defaults, and writes through gloop's normal validation
-and atomic-save path:
+Open the graph in a local browser with an n8n-style visual editor. The screen
+has three simple areas: choose a step on the left, see the whole flow in the
+middle, and edit the selected step on the right. Click a palette card to add
+it, drag cards to move them, and click the right dot then the left dot to draw
+a connection. Technical fields stay behind "More settings". The editor only
+binds to loopback, shows enabled AI/app choices and known model defaults, and
+writes through gloop's normal validation and atomic-save path:
 
 ```bash
 gloop graph init --gui --lang en
@@ -129,7 +131,7 @@ If you do not know what to type, use this order:
 2. Pick one name or file from the output.
 3. For a visual editor, run: gloop graph edit NAME --gui
 4. Click a step, choose what it should do, leave the AI/app and model at their
-   defaults if unsure, and press Save this helper.
+   defaults if unsure, and press Save.
 5. Run gloop graph validate PATH and then gloop run --graph PATH --repo .
 
 The bundled skill at skills/gloop-graph-authoring/SKILL.md contains the same
