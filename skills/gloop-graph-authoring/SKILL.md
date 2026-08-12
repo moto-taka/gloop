@@ -18,7 +18,8 @@ checking the list.
 2. Pick one name or file from the output.
 3. For a visual editor, run:
    gloop graph edit NAME --gui
-4. In the browser, click a node, choose a Harness and Model, then press Save changes.
+4. In the browser, click a step and choose what it should do. If unsure, keep
+   the suggested AI/app and model, then press Save this helper.
 5. Validate the saved path shown by gloop:
    gloop graph validate PATH
 6. Run it only after validation succeeds:
@@ -67,6 +68,12 @@ Japanese, or press the language button in the editor:
 gloop graph edit NAME --gui --lang en
 gloop graph edit NAME --gui --lang ja
 ~~~
+
+The first screen is intentionally simple: name and wish, helpers, then save.
+Choose "Ask AI", "Run a command", "Check the answer", or "Ask a person".
+Node ids, edge kinds, fan-out, and other technical fields are under
+"More settings" / "くわしい設定（上級者向け）". Do not open those settings
+unless the person specifically asks for them.
 
 ## Important rules for an assistant
 

@@ -156,6 +156,35 @@ pub fn graph_path(repo: &Path, name: &str) -> PathBuf {
     graphs_dir(repo).join(format!("{name}.yaml"))
 }
 
+/// Reject symlinked parents for files managed by gloop.
+///
+/// Arbitrary graph files may live behind symlinked directories, but gloop's
+/// own `.gloop` data must never be redirected outside the project.
+pub fn ensure_managed_directory(repo: &Path, relative: &Path) -> std::io::Result<()> {
+    let mut current = repo.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("managed directory is a symlink: {}", current.display()),
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    format!("managed path is not a directory: {}", current.display()),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// Find graph-shaped YAML files without descending into generated or dependency directories.
 /// Symlinks are skipped so a project cannot make a read-only catalog walk outside its tree.
 pub fn list_graph_files(repo: &Path) -> Result<Vec<PathBuf>, String> {
@@ -213,7 +242,7 @@ fn collect_graph_files(
                 .extension()
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| matches!(extension, "yaml" | "yml"))
-            && looks_like_graph(&path)
+            && (looks_like_graph(&path) || is_managed_graph_file(relative))
         {
             files.push(path);
             if files.len() > 2_048 {
@@ -243,6 +272,21 @@ fn should_skip_graph_directory(relative: &Path) -> bool {
             .next()
             .and_then(|component| component.as_os_str().to_str()),
         Some("templates" | "runs" | "worktrees" | "provider-e2e" | "provider-e2e-final")
+    )
+}
+
+fn is_managed_graph_file(relative: &Path) -> bool {
+    let mut components = relative.components();
+    matches!(
+        (
+            components
+                .next()
+                .and_then(|component| component.as_os_str().to_str()),
+            components
+                .next()
+                .and_then(|component| component.as_os_str().to_str())
+        ),
+        (Some(".gloop"), Some("graphs"))
     )
 }
 
