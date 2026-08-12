@@ -1649,6 +1649,18 @@ pub async fn provider_doctor(json_mode: bool, trust_project_profiles: bool) -> C
         Err(error) => return provider_store_error(error),
     };
 
+    let project_names = if trust_project_profiles {
+        profile_names_in_file(Path::new(PROJECT_CONFIG_PATH))
+    } else {
+        HashSet::new()
+    };
+    let user_names = ProfileStore::user_config_path()
+        .as_deref()
+        .map(profile_names_in_file)
+        .unwrap_or_default();
+    let builtin_profiles = ProfileStore::builtins();
+    let builtin_names = builtin_profiles.names().collect::<HashSet<_>>();
+
     let mut checks = Vec::new();
     let mut all_ok = true;
     let token = CancellationToken::new();
@@ -1656,7 +1668,9 @@ pub async fn provider_doctor(json_mode: bool, trust_project_profiles: bool) -> C
     for (name, _) in registry.profiles().iter() {
         match registry.probe(name, token.clone()).await {
             Ok(result) => {
-                if !result.available {
+                let configured = project_names.contains(name) || user_names.contains(name);
+                let required = configured || !builtin_names.contains(name);
+                if !result.available && required {
                     all_ok = false;
                 }
                 checks
