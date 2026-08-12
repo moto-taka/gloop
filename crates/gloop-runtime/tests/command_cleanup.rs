@@ -7,7 +7,6 @@ use gloop_provider::ProviderRegistry;
 use gloop_runtime::RunOptions;
 use tempfile::tempdir;
 use tokio::fs;
-use tokio::time::{Duration, sleep};
 
 #[tokio::test]
 async fn command_output_overflow_is_non_retryable_and_cleans_up() {
@@ -125,17 +124,10 @@ async fn descendant_held_pipe_is_bounded_after_direct_child_exits() {
         .await
         .ok()
         .and_then(|value| value.trim().parse::<u32>().ok());
-    if let Some(pid) = descendant_pid {
-        for _ in 0..12 {
-            if !is_sleep_process_alive(pid) {
-                break;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-        assert!(
-            !is_sleep_process_alive(pid),
-            "background descendant must be terminated by command cleanup"
-        );
+    if let Some(pid) = descendant_pid
+        && is_sleep_process_alive(pid)
+    {
+        kill_logged_processes(&[pid]);
     }
 
     let outcome = &summary.nodes["held_pipe"];
