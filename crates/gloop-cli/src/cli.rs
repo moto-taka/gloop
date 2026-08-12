@@ -4,10 +4,11 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 use crate::commands::{
-    RenderFormat, graph_explain, graph_init, graph_new, graph_render, graph_schema,
+    RenderFormat, graph_edit, graph_explain, graph_init, graph_new, graph_render, graph_schema,
     graph_validate, inspect_run_at, present, provider_add, provider_doctor, provider_list,
     provider_probe, replay_run, run_foreground, run_logs,
 };
+use crate::gui::Language;
 
 #[derive(Parser)]
 #[command(name = "gloop", version = env!("CARGO_PKG_VERSION"), about = "Gloop CLI")]
@@ -99,6 +100,8 @@ struct RunCommand {
 enum GraphCommand {
     New(GraphNew),
     Init(GraphInit),
+    Edit(GraphEdit),
+    Update(GraphEdit),
     Validate(GraphFile),
     Explain(GraphFile),
     Render(GraphRender),
@@ -125,11 +128,7 @@ struct GraphNew {
     #[arg(long, default_value = "work")]
     goal: String,
 
-    #[arg(
-        long,
-        default_value = "direct",
-        conflicts_with = "interactive"
-    )]
+    #[arg(long, default_value = "direct", conflicts_with = "interactive")]
     template: String,
 
     #[arg(long = "repo", value_name = "PATH", default_value = ".")]
@@ -155,6 +154,7 @@ struct GraphNew {
 }
 
 #[derive(Args)]
+#[allow(clippy::struct_excessive_bools)]
 struct GraphInit {
     #[arg(long)]
     name: Option<String>,
@@ -177,11 +177,35 @@ struct GraphInit {
     #[arg(long, conflicts_with_all = ["name", "from", "description", "request", "provider_profiles", "loop_cap"])]
     list: bool,
 
+    #[arg(long, conflicts_with = "list")]
+    gui: bool,
+
+    #[arg(long = "lang", alias = "language", value_enum, default_value = "en")]
+    language: Language,
+
     #[arg(long)]
     force: bool,
 
     #[arg(long = "repo", value_name = "PATH", default_value = ".")]
     repo: PathBuf,
+
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct GraphEdit {
+    #[arg(value_name = "PATH_OR_TEMPLATE")]
+    target: PathBuf,
+
+    #[arg(long = "repo", value_name = "PATH", default_value = ".")]
+    repo: PathBuf,
+
+    #[arg(long)]
+    gui: bool,
+
+    #[arg(long = "lang", alias = "language", value_enum, default_value = "en")]
+    language: Language,
 
     #[arg(long)]
     json: bool,
@@ -269,6 +293,7 @@ impl Command {
             Self::Run(c) => c.json,
             Self::Graph(GraphCommand::New(c)) => c.json,
             Self::Graph(GraphCommand::Init(c)) => c.json,
+            Self::Graph(GraphCommand::Edit(c) | GraphCommand::Update(c)) => c.json,
             Self::Graph(GraphCommand::Validate(c) | GraphCommand::Explain(c)) => c.json,
             Self::Graph(GraphCommand::Render(c)) => c.json,
             Self::Graph(GraphCommand::Schema(c)) => c.json,
@@ -282,6 +307,7 @@ impl Command {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     let json_mode = cli.command.json_mode();
@@ -333,6 +359,32 @@ pub async fn run() -> Result<()> {
                     c.force,
                     c.repo,
                     c.json,
+                    cli.trust_project_profiles,
+                    c.gui,
+                    c.language,
+                )
+                .await
+            }
+            GraphCommand::Edit(c) => {
+                graph_edit(
+                    c.target,
+                    c.repo,
+                    c.gui,
+                    c.language,
+                    c.json,
+                    false,
+                    cli.trust_project_profiles,
+                )
+                .await
+            }
+            GraphCommand::Update(c) => {
+                graph_edit(
+                    c.target,
+                    c.repo,
+                    c.gui,
+                    c.language,
+                    c.json,
+                    true,
                     cli.trust_project_profiles,
                 )
                 .await

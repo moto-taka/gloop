@@ -20,6 +20,18 @@ On macOS or Linux with [Homebrew](https://brew.sh/):
 brew install moto-taka/tap/gloop
 ```
 
+### Automated publishing
+
+Pushes to `main` run [`.github/workflows/release.yml`](.github/workflows/release.yml).
+After `cargo test --workspace` succeeds, it creates a `vX.Y.Z` tag and GitHub Release
+when that workspace version has not been released yet, then updates
+`moto-taka/homebrew-tap/Formula/gloop.rb` automatically.
+
+To enable the cross-repository update, add a fine-grained GitHub token as the
+`HOMEBREW_TAP_TOKEN` Actions secret on this repository. The token only needs
+`Contents: Read and write` access to `moto-taka/homebrew-tap`. Update the workspace
+version and the internal path-dependency versions together before merging to `main`.
+
 The binary is named `gloop`. To install from a local checkout instead, run the command from the repository root:
 
 ```bash
@@ -69,6 +81,20 @@ gloop graph init --name my-review-flow --from review-fix-loop \
 gloop graph init --list
 gloop graph new workflow.yaml --template my-review-flow
 ```
+
+Open the same graph authoring flow in a local browser. The editor only binds to
+loopback, shows enabled provider profiles and known model defaults, and writes
+through gloop's normal validation and atomic-save path:
+
+```bash
+gloop graph init --gui --lang en
+gloop graph edit workflow.yaml --gui --lang ja
+gloop graph update my-review-flow --repo /path/to/project --gui
+```
+
+Without `--gui`, `graph edit` and `graph update` use the existing interactive
+TUI for selective node and edge edits. `update` addresses a saved project
+template by name; `edit` addresses a graph YAML path.
 
 Run a saved graph in the foreground:
 

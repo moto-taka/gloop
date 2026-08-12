@@ -1,0 +1,137 @@
+name: Release and publish Homebrew formula
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAP_REPOSITORY: moto-taka/homebrew-tap
+
+    steps:
+      - name: Check out gloop
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Read workspace version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "gloop-cli") | .version' \
+            | head -n 1)"
+          if [[ -z "$version" || "$version" == "null" ]]; then
+            echo "::error::Could not determine the gloop-cli workspace version."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing gloop $version"
+
+      - name: Run workspace tests
+        run: cargo test --workspace -- --test-threads=1
+
+      - name: Check Homebrew tap credential
+        shell: bash
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$TAP_TOKEN" ]]; then
+            echo "::error::Add HOMEBREW_TAP_TOKEN as a repository Actions secret."
+            exit 1
+          fi
+
+      - name: Create version tag when missing
+        shell: bash
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "$TAG already exists; reusing the immutable release tag."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag --annotate "$TAG" --message "gloop $TAG" "$GITHUB_SHA"
+          git push origin "$TAG"
+
+      - name: Create GitHub Release when missing
+        shell: bash
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "GitHub Release $TAG already exists."
+            exit 0
+          fi
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "gloop $VERSION" \
+            --generate-notes
+
+      - name: Check out Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TAP_REPOSITORY }}
+          ref: main
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update and publish Homebrew formula
+        working-directory: homebrew-tap
+        shell: bash
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          formula="Formula/gloop.rb"
+          archive_url="https://github.com/moto-taka/gloop/archive/refs/tags/$TAG.tar.gz"
+
+          if [[ ! -f "$formula" ]]; then
+            echo "::error::Missing $formula in $TAP_REPOSITORY."
+            exit 1
+          fi
+
+          sha256="$(curl --fail --silent --show-error --location "$archive_url" | sha256sum | cut -d ' ' -f 1)"
+          sed -i -E "s#^  url \".*\"#  url \"$archive_url\"#" "$formula"
+          sed -i -E "s#^  sha256 \".*\"#  sha256 \"$sha256\"#" "$formula"
+
+          grep -F "url \"$archive_url\"" "$formula"
+          grep -F "sha256 \"$sha256\"" "$formula"
+          git diff --check
+
+          if git diff --quiet -- "$formula"; then
+            echo "Homebrew formula already points to $TAG."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$formula"
+          git commit -m "gloop $VERSION"
+          git push origin HEAD:main

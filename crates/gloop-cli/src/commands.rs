@@ -1,4 +1,8 @@
-use std::{collections::HashSet, fmt, io, path::{Path, PathBuf}};
+use std::{
+    collections::HashSet,
+    fmt, io,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Result;
 use clap::ValueEnum;
@@ -17,14 +21,14 @@ use gloop_runtime::{
 use schemars::schema_for;
 use serde_json::{Value, json};
 use tokio::{
-    fs,
-    signal,
+    fs, signal,
     sync::{Semaphore, mpsc},
 };
 use tokio_util::sync::CancellationToken;
 use toml::{Value as TomlValue, map::Map as TomlMap};
 
 use crate::atomic_write::{write_text_atomic, write_text_no_replace};
+use crate::gui::{self, GuiTarget, Language};
 use crate::templates;
 use crate::wizard;
 
@@ -394,6 +398,18 @@ pub fn build_profile_choices(
     Ok(choices)
 }
 
+fn gui_profile_options(choices: &[wizard::ProfileChoice]) -> Vec<gui::ProfileOption> {
+    choices
+        .iter()
+        .map(|choice| gui::ProfileOption {
+            name: choice.name.clone(),
+            kind: choice.kind.clone(),
+            enabled: choice.enabled,
+            default_model: choice.default_model.clone(),
+        })
+        .collect()
+}
+
 fn run_error_code(error: &RunError) -> ExitCode {
     match error {
         RunError::InvalidParallelism
@@ -676,10 +692,7 @@ fn has_unsupported_interactive_seeds(
     provider_profiles: Option<&str>,
     loop_cap: Option<u32>,
 ) -> bool {
-    template != "direct"
-        || request.is_some()
-        || provider_profiles.is_some()
-        || loop_cap.is_some()
+    template != "direct" || request.is_some() || provider_profiles.is_some() || loop_cap.is_some()
 }
 
 fn parse_provider_profiles(provider_profiles: Option<String>) -> Option<Vec<String>> {
@@ -780,12 +793,14 @@ pub async fn graph_new(
             Ok(profiles) => profiles,
             Err(error) => return provider_store_error(error),
         };
-        let persist = path.as_ref().map_or(wizard::EditorPersistTarget::None, |output| {
-            wizard::EditorPersistTarget::GraphFile {
-                path: output.clone(),
-                force,
-            }
-        });
+        let persist = path
+            .as_ref()
+            .map_or(wizard::EditorPersistTarget::None, |output| {
+                wizard::EditorPersistTarget::GraphFile {
+                    path: output.clone(),
+                    force,
+                }
+            });
         match wizard::interactive_graph_with_seed(
             Some(name.as_str()),
             Some(goal.as_str()),
@@ -805,11 +820,7 @@ pub async fn graph_new(
         let resolved = match templates::resolve_template(&template, &repo) {
             Ok(resolved) => resolved,
             Err(error) => {
-                return CommandResult::failure_json(
-                    ExitCode::InvalidGraph,
-                    error.message(),
-                    None,
-                );
+                return CommandResult::failure_json(ExitCode::InvalidGraph, error.message(), None);
             }
         };
 
@@ -856,9 +867,7 @@ pub async fn graph_new(
             );
         }
 
-        if !interactive
-            && let Err(error) = write_text_atomic(path.as_path(), &yaml).await
-        {
+        if !interactive && let Err(error) = write_text_atomic(path.as_path(), &yaml).await {
             return CommandResult::failure_json(
                 ExitCode::Internal,
                 "failed to write graph",
@@ -894,7 +903,11 @@ pub async fn graph_new(
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::fn_params_excessive_bools)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::fn_params_excessive_bools
+)]
 pub async fn graph_init(
     name: Option<String>,
     from: Option<String>,
@@ -907,7 +920,59 @@ pub async fn graph_init(
     repo: PathBuf,
     json_mode: bool,
     trust_project_profiles: bool,
+    gui_mode: bool,
+    language: Language,
 ) -> CommandResult {
+    if gui_mode {
+        if name.is_some() != from.is_some() {
+            return CommandResult::failure_json(
+                ExitCode::InvalidGraph,
+                "--gui graph init requires both --name and --from, or neither",
+                None,
+            );
+        }
+        let profiles = match build_profile_choices(&repo, trust_project_profiles) {
+            Ok(profiles) => profiles,
+            Err(error) => return provider_store_error(error),
+        };
+        let initial_name = name.clone().unwrap_or_else(|| "new-graph".to_owned());
+        let initial_template = from
+            .as_deref()
+            .and_then(GraphTemplateArg::from_name)
+            .unwrap_or(GraphTemplateArg::Direct);
+        if from.is_some()
+            && GraphTemplateArg::from_name(from.as_deref().unwrap_or_default()).is_none()
+        {
+            return CommandResult::failure_json(
+                ExitCode::InvalidGraph,
+                format!(
+                    "unknown built-in template base '{}'",
+                    from.as_deref().unwrap_or_default()
+                ),
+                None,
+            );
+        }
+        let mut graph = wizard::template_graph(
+            initial_name,
+            templates::DEFAULT_TEMPLATE_GOAL,
+            initial_template.to_template(),
+            request,
+            parse_provider_profiles(provider_profiles),
+            loop_cap,
+        );
+        if let Some(description) = description {
+            graph.metadata.description = Some(description);
+        }
+        return graph_gui(
+            graph,
+            gui_profile_options(&profiles),
+            GuiTarget::ProjectTemplate { repo, force },
+            language,
+            json_mode,
+        )
+        .await;
+    }
+
     if list {
         let entries = match templates::list_all_templates(&repo) {
             Ok(entries) => entries,
@@ -970,7 +1035,7 @@ pub async fn graph_init(
 
     let interactive_authoring = name.is_none() && from.is_none();
 
-  let graph = if let (Some(template_name), Some(base)) = (name.as_ref(), from.as_ref()) {
+    let graph = if let (Some(template_name), Some(base)) = (name.as_ref(), from.as_ref()) {
         if let Err(error) = templates::validate_init_template_name(template_name) {
             return CommandResult::failure_json(ExitCode::InvalidGraph, error, None);
         }
@@ -1088,6 +1153,139 @@ pub async fn graph_init(
             destination.display(),
             usage
         ))
+    }
+}
+
+#[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
+pub async fn graph_edit(
+    target: PathBuf,
+    repo: PathBuf,
+    gui_mode: bool,
+    language: Language,
+    json_mode: bool,
+    update_mode: bool,
+    trust_project_profiles: bool,
+) -> CommandResult {
+    let path = if update_mode {
+        let Some(name) = target.to_str() else {
+            return CommandResult::failure_json(
+                ExitCode::InvalidGraph,
+                "template name must be valid UTF-8",
+                None,
+            );
+        };
+        if let Err(error) = templates::validate_template_lookup_name(name) {
+            return CommandResult::failure_json(ExitCode::InvalidGraph, error, None);
+        }
+        templates::template_path(&repo, name)
+    } else {
+        target
+    };
+    let graph = match Graph::from_path(&path) {
+        Ok(graph) => graph,
+        Err(error) => {
+            return CommandResult::failure_json(
+                ExitCode::InvalidGraph,
+                "failed to load graph for editing",
+                Some(json!({"path": path, "error": error.to_string()})),
+            );
+        }
+    };
+    let profiles = match build_profile_choices(&repo, trust_project_profiles) {
+        Ok(profiles) => profiles,
+        Err(error) => return provider_store_error(error),
+    };
+
+    if gui_mode {
+        let expected_sha256 = match gui::file_sha256(&path) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                return CommandResult::failure_json(
+                    ExitCode::InvalidGraph,
+                    "failed to fingerprint graph before GUI editing",
+                    Some(json!({"path": path, "error": error.to_string()})),
+                );
+            }
+        };
+        return graph_gui(
+            graph,
+            gui_profile_options(&profiles),
+            GuiTarget::GraphFile {
+                path,
+                expected_sha256,
+            },
+            language,
+            json_mode,
+        )
+        .await;
+    }
+
+    let persist = wizard::EditorPersistTarget::GraphFile {
+        path: path.clone(),
+        force: true,
+    };
+    let edited = match wizard::interactive_edit_graph(graph, &profiles, &persist) {
+        Ok(graph) => graph,
+        Err(error) => {
+            return CommandResult::failure_json(
+                ExitCode::BlockedOrHumanGate,
+                "interactive graph editing did not save",
+                Some(json!({"error": error.to_string()})),
+            );
+        }
+    };
+    let issues = edited.validate();
+    let (_, warnings) = split_validation(&issues);
+    if json_mode {
+        CommandResult::success_json(json!({
+            "success": true,
+            "written": path,
+            "warnings": warnings,
+            "validation": issues,
+        }))
+    } else {
+        CommandResult::success_text(format!("saved graph to {}", path.display()))
+    }
+}
+
+async fn graph_gui(
+    graph: Graph,
+    profiles: Vec<gui::ProfileOption>,
+    target: GuiTarget,
+    language: Language,
+    json_mode: bool,
+) -> CommandResult {
+    let result =
+        match tokio::task::spawn_blocking(move || gui::launch(graph, &profiles, target, language))
+            .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                return CommandResult::failure_json(
+                    ExitCode::Internal,
+                    "graph GUI session failed",
+                    Some(json!({"error": error.to_string()})),
+                );
+            }
+            Err(error) => {
+                return CommandResult::failure_json(
+                    ExitCode::Internal,
+                    "graph GUI session stopped unexpectedly",
+                    Some(json!({"error": error.to_string()})),
+                );
+            }
+        };
+    let issues = result.graph.validate();
+    let (_, warnings) = split_validation(&issues);
+    if json_mode {
+        CommandResult::success_json(json!({
+            "success": true,
+            "written": result.written,
+            "warnings": warnings,
+            "validation": issues,
+        }))
+    } else {
+        CommandResult::success_text(format!("saved graph to {}", result.written.display()))
     }
 }
 
