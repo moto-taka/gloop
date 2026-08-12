@@ -49,15 +49,18 @@ jobs:
         run: cargo test --workspace -- --test-threads=1
 
       - name: Check Homebrew tap credential
+        id: tap-credential
         shell: bash
         env:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           set -euo pipefail
           if [[ -z "$TAP_TOKEN" ]]; then
-            echo "::error::Add HOMEBREW_TAP_TOKEN as a repository Actions secret."
-            exit 1
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::HOMEBREW_TAP_TOKEN is not configured; skipping Homebrew tap publication."
+            exit 0
           fi
+          echo "available=true" >> "$GITHUB_OUTPUT"
 
       - name: Create version tag when missing
         shell: bash
@@ -94,6 +97,7 @@ jobs:
             --generate-notes
 
       - name: Check out Homebrew tap
+        if: steps.tap-credential.outputs.available == 'true'
         uses: actions/checkout@v4
         with:
           repository: ${{ env.TAP_REPOSITORY }}
@@ -102,6 +106,7 @@ jobs:
           path: homebrew-tap
 
       - name: Update and publish Homebrew formula
+        if: steps.tap-credential.outputs.available == 'true'
         working-directory: homebrew-tap
         shell: bash
         env:
