@@ -16,7 +16,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
-use crate::{atomic_write::write_text_atomic_sync, templates};
+use crate::{
+    atomic_write::{write_text_atomic_if_unchanged_sync, write_text_atomic_sync},
+    templates,
+};
 
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -45,6 +48,7 @@ pub enum GuiTarget {
     ProjectTemplate {
         repo: PathBuf,
         force: bool,
+        saved_name: Option<String>,
     },
 }
 
@@ -258,21 +262,37 @@ fn save_graph(body: &[u8], target: &mut GuiTarget) -> Result<(Graph, PathBuf)> {
             }
             path.clone()
         }
-        GuiTarget::ProjectTemplate { repo, force } => {
+        GuiTarget::ProjectTemplate {
+            repo,
+            force,
+            saved_name,
+        } => {
             templates::validate_init_template_name(&graph.metadata.name)
                 .map_err(|error| anyhow!(error))?;
             let path = templates::template_path(repo, &graph.metadata.name);
-            if *force {
+            let same_saved_name = saved_name
+                .as_deref()
+                .is_none_or(|saved| saved == graph.metadata.name);
+            if *force && same_saved_name {
                 write_text_atomic_sync(&path, &yaml).context("write graph template")?;
             } else {
                 crate::atomic_write::write_text_no_replace_sync(&path, &yaml)
                     .context("write graph template")?;
-                *force = true;
             }
+            *saved_name = Some(graph.metadata.name.clone());
             return Ok((graph, path));
         }
     };
-    write_text_atomic_sync(&path, &yaml).context("write graph file")?;
+    if let GuiTarget::GraphFile {
+        expected_sha256: Some(expected),
+        ..
+    } = target
+    {
+        write_text_atomic_if_unchanged_sync(&path, expected, &yaml)
+            .context("write graph file")?;
+    } else {
+        write_text_atomic_sync(&path, &yaml).context("write graph file")?;
+    }
     if let GuiTarget::GraphFile {
         expected_sha256, ..
     } = target

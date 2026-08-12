@@ -8,6 +8,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use sha2::{Digest, Sha256};
+
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
@@ -39,6 +41,22 @@ pub(crate) async fn write_text_atomic(path: &Path, content: &str) -> io::Result<
 }
 
 pub(crate) fn write_text_atomic_sync(path: &Path, content: &str) -> io::Result<()> {
+    write_text_atomic_sync_checked(path, content, None)
+}
+
+pub(crate) fn write_text_atomic_if_unchanged_sync(
+    path: &Path,
+    expected_sha256: &str,
+    content: &str,
+) -> io::Result<()> {
+    write_text_atomic_sync_checked(path, content, Some(expected_sha256))
+}
+
+fn write_text_atomic_sync_checked(
+    path: &Path,
+    content: &str,
+    expected_sha256: Option<&str>,
+) -> io::Result<()> {
     let path = canonical_write_path(path)?;
 
     let nanos = SystemTime::now()
@@ -65,6 +83,23 @@ pub(crate) fn write_text_atomic_sync(path: &Path, content: &str) -> io::Result<(
             Err(error) => return Err(error),
         }
     };
+    if let Some(expected_sha256) = expected_sha256 {
+        let current = fs::read(&path)
+            .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("failed to verify output before replace: {error}"),
+                )
+            })?;
+        if current != expected_sha256 {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "output changed while it was being edited",
+            ));
+        }
+    }
     match fs::rename(&tmp_path, &path) {
         Ok(()) => Ok(()),
         Err(error) => {

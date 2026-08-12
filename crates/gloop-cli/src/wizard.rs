@@ -1225,6 +1225,7 @@ fn prompt_edit_node(
         .clone();
 
     let mut node = edit_node_for_kind(theme, &existing, state.depth, profiles)?;
+    preserve_unprompted_node_fields(&existing, &mut node);
     let prior_nodes: Vec<Node> = state
         .graph
         .spec
@@ -1255,6 +1256,23 @@ fn prompt_edit_node(
             eprintln!("{error}");
             Ok(state.clone())
         }
+    }
+}
+
+fn preserve_unprompted_node_fields(existing: &Node, edited: &mut Node) {
+    edited.label.clone_from(&existing.label);
+    edited.requires.clone_from(&existing.requires);
+    edited.continue_on_failure = existing.continue_on_failure;
+
+    match (&existing.kind, &mut edited.kind) {
+        (NodeKind::Command { env, .. }, NodeKind::Command { env: edited_env, .. })
+        | (NodeKind::Verify { env, .. }, NodeKind::Verify { env: edited_env, .. }) => {
+            edited_env.clone_from(env);
+        }
+        (NodeKind::Gate { default, .. }, NodeKind::Gate { default: edited_default, .. }) => {
+            *edited_default = *default;
+        }
+        _ => {}
     }
 }
 

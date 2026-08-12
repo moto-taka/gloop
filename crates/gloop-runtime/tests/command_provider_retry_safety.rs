@@ -140,7 +140,7 @@ fn build_profile(name: &str, version: &str, marker: &str, timeout: bool) -> Prof
     );
     script.push('\n');
     if timeout {
-        script.push_str("sleep 10\n");
+        script.push_str("while :; do :; done\n");
     } else {
         script.push_str("printf \'ok\\n\'\n");
     }

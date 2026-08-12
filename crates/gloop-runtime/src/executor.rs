@@ -89,11 +89,19 @@ async fn terminate_process_group(process_group: u32) {
         .status()
         .await;
     time::sleep(Duration::from_millis(100)).await;
-    let _ = tokio::process::Command::new("/bin/kill")
-        .arg("-KILL")
+    let running = tokio::process::Command::new("/bin/kill")
+        .arg("-0")
         .arg(&process_group)
         .status()
-        .await;
+        .await
+        .is_ok_and(|status| status.success());
+    if running {
+        let _ = tokio::process::Command::new("/bin/kill")
+            .arg("-KILL")
+            .arg(&process_group)
+            .status()
+            .await;
+    }
 }
 
 #[cfg(not(unix))]

@@ -966,7 +966,11 @@ pub async fn graph_init(
         return graph_gui(
             graph,
             gui_profile_options(&profiles),
-            GuiTarget::ProjectTemplate { repo, force },
+            GuiTarget::ProjectTemplate {
+                repo,
+                force,
+                saved_name: None,
+            },
             language,
             json_mode,
         )

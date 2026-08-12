@@ -40,7 +40,7 @@ main{display:grid;grid-template-columns:minmax(280px,1fr) minmax(360px,1.25fr);g
 <div id="diagram" class="diagram"></div>
 <div class="editor">
 <div class="field"><label id="idLabel"></label><input id="nodeId" disabled></div>
-<div class="field"><label id="kindLabel"></label><select id="kind"><option>agent</option><option>command</option><option>verify</option><option>gate</option><option>reduce</option><option>synthesize</option></select></div>
+<div class="field"><label id="kindLabel"></label><select id="kind"><option>agent</option><option>command</option><option>verify</option><option>gate</option><option>reduce</option><option>synthesize</option><option>loop</option><option>subgraph</option></select></div>
 <div class="field"><label id="promptLabel"></label><textarea id="prompt"></textarea></div>
 <div class="field"><label id="argvLabel"></label><textarea id="argv"></textarea></div>
 <div class="field"><label id="profileLabel"></label><select id="profile"></select></div>
@@ -89,7 +89,9 @@ function render(){
 }
 function renderNode(){
  const node=selectedNode();if(!node){$('nodeId').value='';return}
- $('nodeId').value=node.id;$('kind').value=kind(node);$('prompt').value=text(node)||node.message||'';$('argv').value=(node.argv||[]).join('\n');$('profile').value=node.profile||'';$('model').value=node.model||'';$('fanout').value=node.fan_out||1;
+ $('nodeId').value=node.id;$('kind').value=kind(node);$('prompt').value=text(node)||node.message||'';$('argv').value=(node.argv||[]).join('\n');
+ if(node.profile&&!Array.from($('profile').options).some(option=>option.value===node.profile)){const option=document.createElement('option');option.value=node.profile;option.textContent=node.profile+' (unavailable)';option.disabled=true;$('profile').append(option)}
+ $('profile').value=node.profile||'';$('model').value=node.model||'';$('fanout').value=node.fan_out||1;
  const agent=['agent','reduce','synthesize'].includes(kind(node));$('profile').disabled=!agent;$('model').disabled=!agent;$('fanout').disabled=kind(node)!=='agent';
  $('prompt').style.display=['command','verify'].includes(kind(node))?'none':'block';$('argv').style.display=['command','verify'].includes(kind(node))?'block':'none';
 }
@@ -100,7 +102,9 @@ function renderEdges(){
 }
 function applyNode(){
  const node=selectedNode();if(!node){notice(tr('select'),true);return}
- const type=$('kind').value;if(kind(node)!==type){Object.assign(node,fresh(node.id,type))}
+ const type=$('kind').value;
+ if(['loop','subgraph'].includes(type)&&kind(node)!==type){notice('Loop and subgraph nodes can only be edited without changing their kind.',true);renderNode();return}
+ if(kind(node)!==type){const common={label:node.label,requires:node.requires,resources:node.resources,retry:node.retry,timeout_seconds:node.timeout_seconds,workspace:node.workspace,context:node.context,continue_on_failure:node.continue_on_failure};Object.assign(node,fresh(node.id,type),common)}
  node.kind=type;
  if(['agent','reduce','synthesize'].includes(type)){node.prompt=$('prompt').value;node.profile=$('profile').value||undefined;node.model=$('model').value.trim()||undefined;if(type==='agent')node.fan_out=Math.max(1,Number($('fanout').value)||1);delete node.message;delete node.argv;delete node.env}
  else if(['command','verify'].includes(type)){node.argv=$('argv').value.split('\n').map(value=>value.trim()).filter(Boolean);delete node.prompt;delete node.profile;delete node.model;delete node.fan_out}
