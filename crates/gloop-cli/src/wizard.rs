@@ -759,6 +759,15 @@ pub fn interactive_graph(profiles: &[ProfileChoice]) -> Result<Graph> {
     interactive_graph_with_seed(None, None, profiles, &EditorPersistTarget::None)
 }
 
+pub fn interactive_edit_graph(
+    graph: Graph,
+    profiles: &[ProfileChoice],
+    persist: &EditorPersistTarget,
+) -> Result<Graph> {
+    let state = EditorState::from_graph(graph, 0);
+    interactive_graph_inner(&ColorfulTheme::default(), state, profiles, persist)
+}
+
 pub fn interactive_graph_with_seed(
     name: Option<&str>,
     goal: Option<&str>,

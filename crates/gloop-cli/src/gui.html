@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>gloop graph editor</title>
+<style>
+:root{color-scheme:dark;--bg:#0e1116;--panel:#171c24;--line:#2a3442;--text:#e7edf5;--muted:#9aa8ba;--accent:#63b3ed;--danger:#f87171}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 system-ui,-apple-system,sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--line)}
+header h1{font-size:17px;margin:0;flex:1}button,select,input,textarea{font:inherit;color:inherit;background:#10151c;border:1px solid var(--line);border-radius:6px;padding:7px 9px}
+button{cursor:pointer;background:#223248}button:hover{border-color:var(--accent)}button.danger{background:#3b2025;border-color:#71333c}
+main{display:grid;grid-template-columns:minmax(280px,1fr) minmax(360px,1.25fr);gap:16px;padding:16px;max-width:1500px;margin:auto}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}.toolbar{display:flex;gap:8px;flex-wrap:wrap}
+.meta{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-bottom:12px}.field{display:flex;flex-direction:column;gap:4px}.field.full{grid-column:1/-1}
+.field label{color:var(--muted);font-size:12px}.field textarea{min-height:72px;resize:vertical}
+.nodes{display:flex;flex-direction:column;gap:7px;margin-top:12px}.node{display:flex;align-items:center;gap:8px;padding:8px;border:1px solid var(--line);border-radius:7px;background:#111720}
+.node.selected{border-color:var(--accent);background:#17283a}.node span{flex:1}.kind{color:var(--muted);font-size:12px}
+.editor{display:grid;gap:10px}.edges{display:flex;flex-direction:column;gap:5px;margin-top:8px}.edge{display:flex;gap:7px;align-items:center;color:var(--muted);font-size:12px}.edge button{padding:3px 7px}
+.diagram{position:relative;min-height:165px;border:1px dashed var(--line);border-radius:8px;padding:12px;display:flex;align-items:center;gap:9px;flex-wrap:wrap;overflow:auto}
+.diagram .box{border:1px solid #3d79a5;border-radius:7px;background:#15283a;padding:9px 11px;cursor:pointer}
+.notice{min-height:22px;color:var(--muted)}.notice.error{color:var(--danger)}
+@media(max-width:900px){main{grid-template-columns:1fr}.meta{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header><h1>gloop graph editor</h1><button id="lang">日本語</button><button id="save"></button><button id="close"></button></header>
+<main>
+<section class="panel">
+<div class="meta">
+<div class="field"><label id="nameLabel"></label><input id="name"></div>
+<div class="field"><label id="goalLabel"></label><input id="goal"></div>
+<div class="field full"><label id="descriptionLabel"></label><input id="description"></div>
+<div class="field"><label id="parallelLabel"></label><input id="parallel" type="number" min="1"></div>
+</div>
+<div class="toolbar"><button id="add"></button><button id="remove" class="danger"></button></div>
+<div id="nodes" class="nodes"></div>
+</section>
+<section class="panel">
+<div id="diagram" class="diagram"></div>
+<div class="editor">
+<div class="field"><label id="idLabel"></label><input id="nodeId" disabled></div>
+<div class="field"><label id="kindLabel"></label><select id="kind"><option>agent</option><option>command</option><option>verify</option><option>gate</option><option>reduce</option><option>synthesize</option></select></div>
+<div class="field"><label id="promptLabel"></label><textarea id="prompt"></textarea></div>
+<div class="field"><label id="argvLabel"></label><textarea id="argv"></textarea></div>
+<div class="field"><label id="profileLabel"></label><select id="profile"></select></div>
+<div class="field"><label id="modelLabel"></label><input id="model" list="models"><datalist id="models"></datalist></div>
+<div class="field"><label id="fanoutLabel"></label><input id="fanout" type="number" min="1"></div>
+<div class="toolbar"><button id="apply"></button></div>
+<div><label id="edgesLabel"></label><div id="edges" class="edges"></div>
+<div class="toolbar" style="margin-top:8px"><select id="edgeFrom"></select><select id="edgeTo"></select><select id="edgeKind"><option>data</option><option>control</option><option>resource</option><option>failure</option></select><button id="addEdge"></button></div></div>
+</div>
+<div id="notice" class="notice"></div>
+</section>
+</main>
+<script>
+const token=location.hash.slice(1);
+let state,graph,selected=0,lang='en';
+const T={
+en:{save:'Save',close:'Close',add:'Add node',remove:'Remove selected',apply:'Apply node',name:'Graph name',goal:'Goal',description:'Description',parallel:'Max parallel',id:'Node id',kind:'Kind',prompt:'Prompt / message',argv:'Command arguments (one per line)',profile:'Harness',model:'Model',fanout:'Fan out',edges:'Edges',none:'(default routing)',select:'Select a node first.',deleted:'Node removed.',edge:'Add edge',saved:'Saved.',closed:'Editor closed.'},
+ja:{save:'保存',close:'閉じる',add:'ノード追加',remove:'選択ノードを削除',apply:'ノードを反映',name:'グラフ名',goal:'目的',description:'説明',parallel:'最大並列数',id:'ノードID',kind:'種類',prompt:'プロンプト / メッセージ',argv:'コマンド引数（1行1つ）',profile:'ハーネス',model:'モデル',fanout:'ファンアウト',edges:'エッジ',none:'（デフォルトルーティング）',select:'先にノードを選択してください。',deleted:'ノードを削除しました。',edge:'エッジ追加',saved:'保存しました。',closed:'エディタを閉じました。'}
+};
+const $=id=>document.getElementById(id),tr=k=>T[lang][k]||k;
+function setText(){
+ [['save','save'],['close','close'],['add','add'],['remove','remove'],['apply','apply'],['nameLabel','name'],['goalLabel','goal'],['descriptionLabel','description'],['parallelLabel','parallel'],['idLabel','id'],['kindLabel','kind'],['promptLabel','prompt'],['argvLabel','argv'],['profileLabel','profile'],['modelLabel','model'],['fanoutLabel','fanout'],['edgesLabel','edges']].forEach(([id,k])=>$(id).textContent=tr(k));
+ $('addEdge').textContent=tr('edge');
+ document.documentElement.lang=lang;$('lang').textContent=lang==='en'?'日本語':'English';
+}
+async function api(path,options={}){
+ const response=await fetch(path,{...options,headers:{'Content-Type':'application/json','X-Gloop-Token':token,...(options.headers||{})}});
+ const value=await response.json();if(!response.ok)throw Error(value.error||response.statusText);return value;
+}
+function kind(node){return node.kind||'agent'}function text(node){return typeof node.prompt==='string'?node.prompt:''}
+function fresh(id,type){
+ const node={id,kind:type,retry:{max_attempts:1,backoff_seconds:0,rebind_profiles:[]},workspace:{mode:'current'},context:{include_dependencies:true,files:[],max_bytes:262144},requires:[],resources:[],continue_on_failure:false};
+ if(['agent','reduce','synthesize'].includes(type)){node.prompt='';node.output={format:'text',max_bytes:1048576};if(type==='agent')node.fan_out=1}
+ else if(['command','verify'].includes(type)){node.argv=['true'];node.env={};node.output={format:'text',max_bytes:1048576}}
+ else if(type==='gate'){node.message='Approval required';node.default='reject'}
+ return node;
+}
+function selectedNode(){return graph&&graph.spec&&graph.spec.nodes[selected]}
+function render(){
+ if(!graph)return;
+ $('name').value=graph.metadata.name||'';$('goal').value=graph.spec.goal||'';$('description').value=graph.metadata.description||'';$('parallel').value=graph.spec.policies.max_parallel||1;
+ const list=$('nodes');list.innerHTML='';
+ graph.spec.nodes.forEach((node,index)=>{const button=document.createElement('button');button.className='node'+(index===selected?' selected':'');const id=document.createElement('span');id.textContent=node.id;const type=document.createElement('span');type.className='kind';type.textContent=kind(node);button.append(id,type);button.onclick=()=>{selected=index;render()};list.append(button)});
+ const diagram=$('diagram');diagram.innerHTML='';graph.spec.nodes.forEach((node,index)=>{if(index){const arrow=document.createElement('span');arrow.className='arrow';arrow.textContent='→';diagram.append(arrow)}const box=document.createElement('div');box.className='box';box.textContent=node.id;box.onclick=()=>{selected=index;render()};diagram.append(box)});
+ renderNode();renderEdges();
+}
+function renderNode(){
+ const node=selectedNode();if(!node){$('nodeId').value='';return}
+ $('nodeId').value=node.id;$('kind').value=kind(node);$('prompt').value=text(node)||node.message||'';$('argv').value=(node.argv||[]).join('\n');$('profile').value=node.profile||'';$('model').value=node.model||'';$('fanout').value=node.fan_out||1;
+ const agent=['agent','reduce','synthesize'].includes(kind(node));$('profile').disabled=!agent;$('model').disabled=!agent;$('fanout').disabled=kind(node)!=='agent';
+ $('prompt').style.display=['command','verify'].includes(kind(node))?'none':'block';$('argv').style.display=['command','verify'].includes(kind(node))?'block':'none';
+}
+function renderEdges(){
+ const list=$('edges');list.innerHTML='';
+ (graph.spec.edges||[]).forEach((edge,index)=>{const row=document.createElement('div');row.className='edge';const label=document.createElement('span');label.textContent=edge.from+' → '+edge.to+' ('+edge.kind+')';const button=document.createElement('button');button.textContent='×';button.onclick=()=>{graph.spec.edges.splice(index,1);render()};row.append(label,button);list.append(row)});
+ ['edgeFrom','edgeTo'].forEach(id=>{const select=$(id);select.innerHTML='';graph.spec.nodes.forEach(node=>{const option=document.createElement('option');option.value=node.id;option.textContent=node.id;select.append(option)})});
+}
+function applyNode(){
+ const node=selectedNode();if(!node){notice(tr('select'),true);return}
+ const type=$('kind').value;if(kind(node)!==type){Object.assign(node,fresh(node.id,type))}
+ node.kind=type;
+ if(['agent','reduce','synthesize'].includes(type)){node.prompt=$('prompt').value;node.profile=$('profile').value||undefined;node.model=$('model').value.trim()||undefined;if(type==='agent')node.fan_out=Math.max(1,Number($('fanout').value)||1);delete node.message;delete node.argv;delete node.env}
+ else if(['command','verify'].includes(type)){node.argv=$('argv').value.split('\n').map(value=>value.trim()).filter(Boolean);delete node.prompt;delete node.profile;delete node.model;delete node.fan_out}
+ else if(type==='gate'){node.message=$('prompt').value;delete node.prompt;delete node.argv;delete node.profile;delete node.model;delete node.fan_out}
+ render();notice(tr('saved'));
+}
+function addNode(){
+ const base='node-'+(graph.spec.nodes.length+1);let id=base,index=1;while(graph.spec.nodes.some(node=>node.id===id))id=base+'-'+index++;
+ graph.spec.nodes.push(fresh(id,'agent'));selected=graph.spec.nodes.length-1;render();
+}
+function removeNode(){
+ if(!selectedNode()){notice(tr('select'),true);return}
+ const id=selectedNode().id;graph.spec.nodes.splice(selected,1);graph.spec.edges=(graph.spec.edges||[]).filter(edge=>edge.from!==id&&edge.to!==id);selected=Math.max(0,selected-1);render();notice(tr('deleted'));
+}
+function addEdge(){
+ const from=$('edgeFrom').value,to=$('edgeTo').value;if(!from||!to||from===to){notice('Choose two different nodes.',true);return}
+ graph.spec.edges=graph.spec.edges||[];const type=$('edgeKind').value;if(graph.spec.edges.some(edge=>edge.from===from&&edge.to===to&&edge.kind===type)){notice('That edge already exists.',true);return}
+ graph.spec.edges.push({from,to,kind:type});render();
+}
+async function save(){
+ try{graph.metadata.name=$('name').value.trim();graph.metadata.description=$('description').value.trim()||undefined;graph.spec.goal=$('goal').value.trim();graph.spec.policies.max_parallel=Math.max(1,Number($('parallel').value)||1);const value=await api('/api/save',{method:'POST',body:JSON.stringify({graph})});notice(value.message||tr('saved'))}catch(error){notice(error.message,true)}
+}
+function notice(value,error=false){$('notice').textContent=value;$('notice').className='notice'+(error?' error':'')}
+async function closeEditor(){try{await api('/api/close',{method:'POST'});notice(tr('closed'))}catch(error){notice(error.message,true)}}
+async function init(){
+ try{state=await api('/api/state');graph=state.graph;lang=state.language==='ja'?'ja':'en';
+  const profiles=state.profiles||[];const profileSelect=$('profile');profileSelect.replaceChildren();const defaultProfile=document.createElement('option');defaultProfile.value='';defaultProfile.textContent=tr('none');profileSelect.append(defaultProfile);
+  profiles.filter(profile=>profile.enabled).forEach(profile=>{const option=document.createElement('option');option.value=profile.name;option.textContent=profile.name+' ('+profile.kind+')';profileSelect.append(option)});
+  const models=$('models');models.replaceChildren();(state.models||[]).forEach(model=>{const option=document.createElement('option');option.value=model;models.append(option)});setText();render();
+ }catch(error){notice(error.message,true)}
+}
+$('lang').onclick=()=>{lang=lang==='en'?'ja':'en';setText();render()};$('add').onclick=addNode;$('remove').onclick=removeNode;$('apply').onclick=applyNode;$('addEdge').onclick=addEdge;$('save').onclick=save;$('close').onclick=closeEditor;init();
+</script>
+</body>
+</html>

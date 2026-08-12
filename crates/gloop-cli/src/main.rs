@@ -1,6 +1,7 @@
 mod atomic_write;
 mod cli;
 mod commands;
+mod gui;
 mod templates;
 mod wizard;
 
