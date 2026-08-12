@@ -127,13 +127,13 @@ async fn descendant_held_pipe_is_bounded_after_direct_child_exits() {
         .and_then(|value| value.trim().parse::<u32>().ok());
     if let Some(pid) = descendant_pid {
         for _ in 0..12 {
-            if !is_pid_alive(pid) {
+            if !is_sleep_process_alive(pid) {
                 break;
             }
             sleep(Duration::from_millis(50)).await;
         }
         assert!(
-            !is_pid_alive(pid),
+            !is_sleep_process_alive(pid),
             "background descendant must be terminated by command cleanup"
         );
     }
@@ -254,6 +254,21 @@ fn is_pid_alive(pid: u32) -> bool {
         .map(|output| {
             let state = String::from_utf8_lossy(&output.stdout);
             !state.trim_start().starts_with('Z')
+        })
+        .unwrap_or(false)
+}
+
+fn is_sleep_process_alive(pid: u32) -> bool {
+    if !is_pid_alive(pid) {
+        return false;
+    }
+
+    StdCommand::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .map(|output| {
+            let command = String::from_utf8_lossy(&output.stdout);
+            command.contains("sleep 30")
         })
         .unwrap_or(false)
 }
