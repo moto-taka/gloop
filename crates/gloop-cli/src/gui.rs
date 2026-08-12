@@ -52,6 +52,7 @@ pub enum GuiTarget {
         repo: PathBuf,
         force: bool,
         saved_name: Option<String>,
+        expected_sha256: Option<String>,
     },
 }
 
@@ -280,20 +281,33 @@ fn save_graph(body: &[u8], target: &mut GuiTarget) -> Result<(Graph, PathBuf)> {
             repo,
             force,
             saved_name,
+            expected_sha256,
         } => {
             templates::validate_init_template_name(&graph.metadata.name)
                 .map_err(|error| anyhow!(error))?;
+            templates::ensure_managed_directory(
+                repo,
+                std::path::Path::new(templates::TEMPLATES_DIR),
+            )
+            .context("unsafe project template directory")?;
+            if let Some(saved) = saved_name.as_deref()
+                && saved != graph.metadata.name
+            {
+                return Err(anyhow!(
+                    "template name cannot change after the first save; close and reopen the editor"
+                ));
+            }
             let path = templates::template_path(repo, &graph.metadata.name);
-            let same_saved_name = saved_name
-                .as_deref()
-                .is_none_or(|saved| saved == graph.metadata.name);
-            if *force && same_saved_name {
+            if let Some(expected) = expected_sha256.as_deref() {
+                write_text_atomic_if_unchanged_sync(&path, expected, &yaml)
+                    .context("write graph template")?;
+            } else if *force {
                 write_text_atomic_sync(&path, &yaml).context("write graph template")?;
             } else {
-                crate::atomic_write::write_text_no_replace_sync(&path, &yaml)
-                    .context("write graph template")?;
+                write_text_no_replace_sync(&path, &yaml).context("write graph template")?;
             }
             *saved_name = Some(graph.metadata.name.clone());
+            *expected_sha256 = Some(file_sha256(&path)?);
             return Ok((graph, path));
         }
     };

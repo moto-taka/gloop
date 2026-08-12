@@ -899,12 +899,26 @@ pub async fn graph_new(
             );
         }
 
-        if !interactive && let Err(error) = write_text_atomic(path.as_path(), &yaml).await {
-            return CommandResult::failure_json(
-                ExitCode::Internal,
-                "failed to write graph",
-                Some(json!({"path": path, "error": error.to_string()})),
-            );
+        if !interactive {
+            let write_result = if force {
+                write_text_atomic(path.as_path(), &yaml).await
+            } else {
+                write_text_no_replace(path.as_path(), &yaml).await
+            };
+            if let Err(error) = write_result {
+                if !force && error.kind() == io::ErrorKind::AlreadyExists {
+                    return CommandResult::failure_json(
+                        ExitCode::InvalidGraph,
+                        "output path exists. use --force to overwrite",
+                        Some(json!({"path": path})),
+                    );
+                }
+                return CommandResult::failure_json(
+                    ExitCode::Internal,
+                    "failed to write graph",
+                    Some(json!({"path": path, "error": error.to_string()})),
+                );
+            }
         }
 
         if json_mode {
@@ -1002,6 +1016,7 @@ pub async fn graph_init(
                 repo,
                 force,
                 saved_name: None,
+                expected_sha256: None,
             },
             language,
             json_mode,
@@ -1132,6 +1147,15 @@ pub async fn graph_init(
         graph.metadata.name.clone()
     };
 
+    if let Err(error) =
+        templates::ensure_managed_directory(&repo, Path::new(templates::TEMPLATES_DIR))
+    {
+        return CommandResult::failure_json(
+            ExitCode::InvalidGraph,
+            "project template directory is not safe",
+            Some(json!({"error": error.to_string()})),
+        );
+    }
     let destination = templates::template_path(&repo, &template_name);
 
     let issues = graph.validate();
@@ -1202,6 +1226,7 @@ pub async fn graph_init(
 #[derive(Debug, Serialize)]
 struct GraphCatalogEntry {
     name: String,
+    graph_name: Option<String>,
     source: String,
     path: Option<String>,
     description: Option<String>,
@@ -1347,6 +1372,7 @@ fn catalog_entry_from_path(
         Ok(graph) => catalog_entry_from_graph(Some(graph), name, source, display_path, description),
         Err(error) => GraphCatalogEntry {
             name,
+            graph_name: None,
             source,
             path: display_path,
             description,
@@ -1370,6 +1396,7 @@ fn catalog_entry_from_graph(
     let Some(graph) = graph else {
         return GraphCatalogEntry {
             name: fallback_name,
+            graph_name: None,
             source,
             path,
             description,
@@ -1392,8 +1419,10 @@ fn catalog_entry_from_graph(
         .filter(|issue| issue.severity == IssueSeverity::Warning)
         .map(|issue| format!("[{}] {}", issue.code, issue.message))
         .collect::<Vec<_>>();
+    let graph_name = graph.metadata.name;
     GraphCatalogEntry {
-        name: graph.metadata.name,
+        name: graph_name.clone(),
+        graph_name: Some(graph_name.clone()),
         source,
         path,
         description: description.or(graph.metadata.description),
@@ -1459,9 +1488,17 @@ fn format_catalog_entry(entry: &GraphCatalogEntry, language: Language) -> String
         .errors
         .first()
         .map_or_else(String::new, |error| format!(" — {error}"));
+    let metadata_name = entry
+        .graph_name
+        .as_deref()
+        .filter(|name| *name != entry.name)
+        .map_or_else(String::new, |name| match language {
+            Language::En => format!(" — saved name: {name}"),
+            Language::Ja => format!(" — 保存名: {name}"),
+        });
     format!(
-        "  [{status}] {source} {name}{location}{description}{goal}{shape}{detail}",
-        name = entry.name
+        "  [{status}] {source} {name}{location}{metadata_name}{description}{goal}{shape}{detail}",
+        name = entry.name,
     )
 }
 
@@ -1512,6 +1549,31 @@ fn resolve_graph_edit_source(
     templates::validate_template_lookup_name(name)
         .map_err(|error| format!("'{name}' is not a graph file or template name: {error}"))?;
 
+    if !templates::is_builtin_template_name(name) {
+        let matches = templates::list_graph_files(repo)?
+            .into_iter()
+            .filter_map(|path| {
+                Graph::from_path(&path)
+                    .ok()
+                    .filter(|graph| graph.metadata.name == name)
+                    .map(|graph| (path, graph))
+            })
+            .collect::<Vec<_>>();
+        if matches.len() > 1 {
+            return Err(format!(
+                "more than one saved graph has the name '{name}'; edit the file path shown by 'graph list'"
+            ));
+        }
+        if let Some((path, graph)) = matches.into_iter().next() {
+            return Ok(GraphEditSource {
+                graph,
+                expected_sha256: Some(gui::file_sha256(&path).map_err(|error| error.to_string())?),
+                path,
+                create_only: false,
+            });
+        }
+    }
+
     let resolved = templates::resolve_template(name, repo).map_err(|error| error.message())?;
     match resolved {
         templates::ResolvedTemplate::Project(graph) => {
@@ -1531,6 +1593,8 @@ fn resolve_graph_edit_source(
                     "built-in template '{builtin_name}' is not a saved template; use 'graph edit {builtin_name}' to create an editable graph, or 'graph init --name NAME --from {builtin_name}' for a reusable template"
                 ));
             }
+            templates::ensure_managed_directory(repo, Path::new(templates::GRAPHS_DIR))
+                .map_err(|error| error.to_string())?;
             let path = templates::graph_path(repo, builtin_name);
             if path.is_file() {
                 return Ok(GraphEditSource {
@@ -2529,6 +2593,25 @@ mod tests {
         assert!(!source.create_only);
         assert!(source.expected_sha256.is_some());
         assert_eq!(source.graph.spec.goal, "saved goal");
+    }
+
+    #[test]
+    fn edit_resolves_saved_graph_by_metadata_name() {
+        let repo = tempdir().expect("temp repo");
+        let path = repo.path().join("workflow.yaml");
+        let graph = Graph::new("friendly-name", "saved goal", vec![]);
+        std::fs::write(&path, graph.to_yaml().expect("serialize graph")).expect("write graph");
+
+        let source = resolve_graph_edit_source(
+            PathBuf::from("friendly-name").as_path(),
+            repo.path(),
+            false,
+        )
+        .expect("metadata name should resolve");
+
+        assert_eq!(source.path, path);
+        assert_eq!(source.graph.metadata.name, "friendly-name");
+        assert!(source.expected_sha256.is_some());
     }
 
     #[test]

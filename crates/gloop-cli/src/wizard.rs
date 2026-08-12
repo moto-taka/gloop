@@ -16,7 +16,7 @@ use gloop_core::{
 use serde_json::Value;
 
 use crate::atomic_write::{write_text_atomic_sync, write_text_no_replace_sync};
-use crate::templates::{template_path, validate_init_template_name, DEFAULT_TEMPLATE_GOAL};
+use crate::templates::{DEFAULT_TEMPLATE_GOAL, template_path, validate_init_template_name};
 
 const INTERACTIVE_NESTING_LIMIT: usize = 8;
 
@@ -87,14 +87,8 @@ pub enum NestedEditorOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorPersistTarget {
     None,
-    ProjectTemplate {
-        repo: PathBuf,
-        force: bool,
-    },
-    GraphFile {
-        path: PathBuf,
-        force: bool,
-    },
+    ProjectTemplate { repo: PathBuf, force: bool },
+    GraphFile { path: PathBuf, force: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,9 +140,10 @@ pub fn format_node_summary(node: &Node) -> String {
         NodeKind::Reduce { profile, .. } => profile
             .as_deref()
             .map_or_else(|| "reduce".to_owned(), |value| format!("reduce:{value}")),
-        NodeKind::Synthesize { profile, .. } => profile
-            .as_deref()
-            .map_or_else(|| "synthesize".to_owned(), |value| format!("synthesize:{value}")),
+        NodeKind::Synthesize { profile, .. } => profile.as_deref().map_or_else(
+            || "synthesize".to_owned(),
+            |value| format!("synthesize:{value}"),
+        ),
         NodeKind::Command { .. } => "command".to_owned(),
         NodeKind::Verify { .. } => "verify".to_owned(),
         NodeKind::Gate { .. } => "gate".to_owned(),
@@ -205,17 +200,10 @@ fn workspace_inherit_source(node: &Node) -> Option<&str> {
 }
 
 fn is_auto_workspace_inheritance_edge(edge: &Edge, source: &str, target: &str) -> bool {
-    edge.from == source
-        && edge.to == target
-        && edge.kind == EdgeKind::Data
-        && edge.when.is_none()
+    edge.from == source && edge.to == target && edge.kind == EdgeKind::Data && edge.when.is_none()
 }
 
-pub fn remove_auto_workspace_inheritance_edge(
-    edges: &mut Vec<Edge>,
-    source: &str,
-    target: &str,
-) {
+pub fn remove_auto_workspace_inheritance_edge(edges: &mut Vec<Edge>, source: &str, target: &str) {
     edges.retain(|edge| !is_auto_workspace_inheritance_edge(edge, source, target));
 }
 
@@ -291,12 +279,9 @@ pub fn replace_node_in_editor(
 
 pub fn add_edge_to_editor(state: &EditorState, edge: Edge) -> Result<EditorState> {
     let mut graph = state.graph.clone();
-    if graph
-        .spec
-        .edges
-        .iter()
-        .any(|existing| existing.from == edge.from && existing.to == edge.to && existing.kind == edge.kind)
-    {
+    if graph.spec.edges.iter().any(|existing| {
+        existing.from == edge.from && existing.to == edge.to && existing.kind == edge.kind
+    }) {
         return Err(anyhow!(
             "edge from '{}' to '{}' with kind {:?} already exists",
             edge.from,
@@ -320,9 +305,10 @@ pub fn remove_edge_from_editor(
 ) -> Result<EditorState> {
     let mut graph = state.graph.clone();
     let before = graph.spec.edges.len();
-    graph.spec.edges.retain(|edge| {
-        !(edge.from == from && edge.to == to && edge.kind == kind)
-    });
+    graph
+        .spec
+        .edges
+        .retain(|edge| !(edge.from == from && edge.to == to && edge.kind == kind));
     if graph.spec.edges.len() == before {
         return Err(anyhow!("matching edge was not found"));
     }
@@ -789,8 +775,7 @@ pub fn interactive_template_init(
 ) -> Result<Graph> {
     let theme = ColorfulTheme::default();
     let template_name = prompt_template_name(&theme, None)?;
-    preflight_template_destination(repo, &template_name, force)
-        .map_err(|error| anyhow!(error))?;
+    preflight_template_destination(repo, &template_name, force).map_err(|error| anyhow!(error))?;
     let description = prompt_optional_description(&theme)?;
     let start = prompt_start_from(&theme)?;
     let mut state = seed_editor_state(
@@ -827,11 +812,10 @@ fn interactive_graph_inner(
     }
 }
 
-
 fn prompt_template_name(theme: &ColorfulTheme, default: Option<&str>) -> Result<String> {
     loop {
-        let mut input = Input::with_theme(theme)
-            .with_prompt("Template name (kebab-case, max 64 characters)");
+        let mut input =
+            Input::with_theme(theme).with_prompt("Template name (kebab-case, max 64 characters)");
         if let Some(default) = default {
             input = input.default(default.to_owned());
         }
@@ -1265,11 +1249,27 @@ fn preserve_unprompted_node_fields(existing: &Node, edited: &mut Node) {
     edited.continue_on_failure = existing.continue_on_failure;
 
     match (&existing.kind, &mut edited.kind) {
-        (NodeKind::Command { env, .. }, NodeKind::Command { env: edited_env, .. })
-        | (NodeKind::Verify { env, .. }, NodeKind::Verify { env: edited_env, .. }) => {
+        (
+            NodeKind::Command { env, .. },
+            NodeKind::Command {
+                env: edited_env, ..
+            },
+        )
+        | (
+            NodeKind::Verify { env, .. },
+            NodeKind::Verify {
+                env: edited_env, ..
+            },
+        ) => {
             edited_env.clone_from(env);
         }
-        (NodeKind::Gate { default, .. }, NodeKind::Gate { default: edited_default, .. }) => {
+        (
+            NodeKind::Gate { default, .. },
+            NodeKind::Gate {
+                default: edited_default,
+                ..
+            },
+        ) => {
             *edited_default = *default;
         }
         _ => {}
@@ -1573,6 +1573,7 @@ fn build_node_for_action(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn edit_node_for_kind(
     theme: &ColorfulTheme,
     existing: &Node,
@@ -1593,15 +1594,15 @@ fn edit_node_for_kind(
                 &format!("Prompt for agent node '{}'", existing.id),
                 Some(&prompt_text),
             )?;
-            let fan_out = prompt_bounded_number(
+            let fan_out = prompt_bounded_number(theme, "Fan out", *fan_out, 1, MAX_FAN_OUT)?;
+            let (profile, model) = prompt_profile_model(
                 theme,
-                "Fan out",
-                *fan_out,
-                1,
-                MAX_FAN_OUT,
+                &existing.id,
+                "agent",
+                profile.as_deref(),
+                model.as_deref(),
+                profiles,
             )?;
-            let (profile, model) =
-                prompt_profile_model(theme, &existing.id, "agent", profile.as_deref(), model.as_deref(), profiles)?;
             let mut node = agent_node(&existing.id, &prompt_text, profile, fan_out);
             if let NodeKind::Agent {
                 model: node_model, ..
@@ -1612,7 +1613,10 @@ fn edit_node_for_kind(
             Ok(node)
         }
         NodeKind::Reduce {
-            prompt, profile, model, ..
+            prompt,
+            profile,
+            model,
+            ..
         } => {
             let prompt_text = prompt_inline_text(prompt)?;
             let prompt_text = prompt_prompt_text(
@@ -1620,8 +1624,14 @@ fn edit_node_for_kind(
                 &format!("Prompt for reduce node '{}'", existing.id),
                 Some(&prompt_text),
             )?;
-            let (profile, model) =
-                prompt_profile_model(theme, &existing.id, "reduce", profile.as_deref(), model.as_deref(), profiles)?;
+            let (profile, model) = prompt_profile_model(
+                theme,
+                &existing.id,
+                "reduce",
+                profile.as_deref(),
+                model.as_deref(),
+                profiles,
+            )?;
             let mut node = reduce_node(&existing.id, &prompt_text, profile);
             if let NodeKind::Reduce {
                 model: node_model, ..
@@ -1632,7 +1642,10 @@ fn edit_node_for_kind(
             Ok(node)
         }
         NodeKind::Synthesize {
-            prompt, profile, model, ..
+            prompt,
+            profile,
+            model,
+            ..
         } => {
             let prompt_text = prompt_inline_text(prompt)?;
             let prompt_text = prompt_prompt_text(
@@ -1657,8 +1670,14 @@ fn edit_node_for_kind(
             }
             Ok(node)
         }
-        NodeKind::Command { argv, .. } => Ok(command_node(&existing.id, prompt_command_argv_with_default(theme, &existing.id, argv)?)),
-        NodeKind::Verify { argv, .. } => Ok(verify_node(&existing.id, prompt_command_argv_with_default(theme, &existing.id, argv)?)),
+        NodeKind::Command { argv, .. } => Ok(command_node(
+            &existing.id,
+            prompt_command_argv_with_default(theme, &existing.id, argv)?,
+        )),
+        NodeKind::Verify { argv, .. } => Ok(verify_node(
+            &existing.id,
+            prompt_command_argv_with_default(theme, &existing.id, argv)?,
+        )),
         NodeKind::Gate { message, .. } => Ok(gate_node(
             &existing.id,
             &prompt_prompt_text(
@@ -1668,7 +1687,9 @@ fn edit_node_for_kind(
             )?,
         )),
         NodeKind::Loop { .. } | NodeKind::Subgraph { .. } => {
-            eprintln!("Loop and subgraph nodes cannot be edited here; remove and re-add to change them.");
+            eprintln!(
+                "Loop and subgraph nodes cannot be edited here; remove and re-add to change them."
+            );
             Ok(existing.clone())
         }
     }
@@ -1728,7 +1749,6 @@ pub(crate) struct GraphSettings {
     budgets: RunBudgets,
     goal: Option<String>,
 }
-
 
 fn apply_graph_settings(graph: &mut Graph, settings: GraphSettings) {
     graph.spec.policies.max_parallel = settings.max_parallel;
@@ -2162,7 +2182,11 @@ fn join_csv_paths(values: &[PathBuf]) -> String {
         .join(", ")
 }
 
-fn prompt_csv_with_default(theme: &ColorfulTheme, prompt: &str, default: &str) -> Result<Vec<String>> {
+fn prompt_csv_with_default(
+    theme: &ColorfulTheme,
+    prompt: &str,
+    default: &str,
+) -> Result<Vec<String>> {
     let value: String = Input::with_theme(theme)
         .with_prompt(prompt)
         .default(default.to_owned())
@@ -2194,7 +2218,9 @@ where
             _ => OptionalNumberAction::Clear,
         };
         let changed = if selected_action == OptionalNumberAction::Change {
-            Some(prompt_bounded_number(theme, prompt, current, minimum, maximum)?)
+            Some(prompt_bounded_number(
+                theme, prompt, current, minimum, maximum,
+            )?)
         } else {
             None
         };
@@ -2258,7 +2284,6 @@ pub fn resolve_optional_model(
         OptionalModelAction::Clear => None,
     }
 }
-
 
 fn parse_csv(value: &str) -> Vec<String> {
     let mut values = Vec::new();
@@ -2505,9 +2530,7 @@ fn prompt_prompt_text(
     default: Option<&str>,
 ) -> Result<String> {
     let editor_env = std::env::var("EDITOR").ok();
-    let editor_label = editor_env
-        .as_deref()
-        .unwrap_or("$EDITOR");
+    let editor_label = editor_env.as_deref().unwrap_or("$EDITOR");
     let open_editor = format!("Open {editor_label}");
     let labels = ["Write inline", open_editor.as_str()];
     let selected = Select::with_theme(theme)
@@ -2601,7 +2624,9 @@ fn prompt_optional_model(
 ) -> Result<Option<String>> {
     if let Some(current) = default_model {
         let action = Select::with_theme(theme)
-            .with_prompt(format!("Optional {kind} model id for '{id}' (current: {current})"))
+            .with_prompt(format!(
+                "Optional {kind} model id for '{id}' (current: {current})"
+            ))
             .items(["Keep current value", "Change value", "Clear value"])
             .default(0)
             .interact()?;
@@ -2611,12 +2636,8 @@ fn prompt_optional_model(
             _ => OptionalModelAction::Clear,
         };
         let changed = if action == OptionalModelAction::Change {
-            let model_default = profile_model_default(
-                selected_profile,
-                previous_profile,
-                Some(current),
-                profiles,
-            );
+            let model_default =
+                profile_model_default(selected_profile, previous_profile, Some(current), profiles);
             let model: String = Input::with_theme(theme)
                 .with_prompt(format!(
                     "Optional {kind} model id for '{id}' (blank keeps provider default)"
@@ -2635,12 +2656,8 @@ fn prompt_optional_model(
         return Ok(resolve_optional_model(action, Some(current), changed));
     }
 
-    let model_default = profile_model_default(
-        selected_profile,
-        previous_profile,
-        default_model,
-        profiles,
-    );
+    let model_default =
+        profile_model_default(selected_profile, previous_profile, default_model, profiles);
     let model: String = Input::with_theme(theme)
         .with_prompt(format!(
             "Optional {kind} model id for '{id}' (blank keeps provider default)"
@@ -2811,15 +2828,11 @@ fn build_loop_node(
     let nested_goal = format!("Bounded iteration body for {id}");
     let mut nested_state = EditorState::new(&nested_name, &nested_goal);
     nested_state.depth = depth + 1;
-    let nested = match interactive_editor_loop(
-        theme,
-        nested_state,
-        profiles,
-        &EditorPersistTarget::None,
-    )? {
-        NestedEditorOutcome::Saved(graph) => *graph,
-        NestedEditorOutcome::Cancelled => return Ok(None),
-    };
+    let nested =
+        match interactive_editor_loop(theme, nested_state, profiles, &EditorPersistTarget::None)? {
+            NestedEditorOutcome::Saved(graph) => *graph,
+            NestedEditorOutcome::Cancelled => return Ok(None),
+        };
     let nested_ids: Vec<&str> = nested
         .spec
         .nodes
@@ -2874,15 +2887,11 @@ fn build_subgraph_node(
     let nested_goal = format!("Nested workflow for {id}");
     let mut nested_state = EditorState::new(&nested_name, &nested_goal);
     nested_state.depth = depth + 1;
-    let nested = match interactive_editor_loop(
-        theme,
-        nested_state,
-        profiles,
-        &EditorPersistTarget::None,
-    )? {
-        NestedEditorOutcome::Saved(graph) => *graph,
-        NestedEditorOutcome::Cancelled => return Ok(None),
-    };
+    let nested =
+        match interactive_editor_loop(theme, nested_state, profiles, &EditorPersistTarget::None)? {
+            NestedEditorOutcome::Saved(graph) => *graph,
+            NestedEditorOutcome::Cancelled => return Ok(None),
+        };
     Ok(Some(subgraph_node(id, nested)))
 }
 
@@ -3122,20 +3131,20 @@ fn is_valid_identifier(value: &str) -> bool {
 mod tests {
     use super::{
         CommonNodeSettings, DependencyDraft, Edge, EdgeCondition, EdgeKind, EditorPersistTarget,
-        EditorState, Graph, GraphSettings, GraphTemplate, ManualProfileEntry,
-        NestedEditorOutcome, NodeKind, NodeStatus, OptionalModelAction, OptionalNumberAction,
-        ProfileChoice, ProfileSource, WizardAction, add_edge_to_editor, add_node_to_editor,
+        EditorState, Graph, GraphSettings, GraphTemplate, ManualProfileEntry, NestedEditorOutcome,
+        NodeKind, NodeStatus, OptionalModelAction, OptionalNumberAction, ProfileChoice,
+        ProfileSource, WizardAction, add_edge_to_editor, add_node_to_editor,
         apply_common_node_settings, apply_graph_settings, build_dependency_edges,
         classify_manual_profile_name, editor_summary_header, enabled_profile_choices,
         ensure_workspace_inheritance_edge, format_argv_for_shell, format_node_summary,
         graph_from_yaml_bytes, is_valid_json_pointer, loop_node, map_profile_selection,
         merge_output_spec_edits, node_output_mut, parse_csv, parse_json_literal,
         preflight_template_destination, profile_choice_label, profile_default_select_index,
-        profile_model_default, profile_select_items, remove_edge_from_editor, remove_node_from_editor,
-        replace_node_in_editor, resolve_optional_model, resolve_optional_number,
-        seed_editor_from_template, shell_quote_arg,
-        subgraph_node, template_graph, try_persist_editor_graph, validate_for_save,
-        wizard_actions, workspace_inheritance_dependents,
+        profile_model_default, profile_select_items, remove_edge_from_editor,
+        remove_node_from_editor, replace_node_in_editor, resolve_optional_model,
+        resolve_optional_number, seed_editor_from_template, shell_quote_arg, subgraph_node,
+        template_graph, try_persist_editor_graph, validate_for_save, wizard_actions,
+        workspace_inheritance_dependents,
     };
     use super::{parse_argv, synthesize_node};
     use gloop_core::{
@@ -3713,14 +3722,20 @@ spec:
             enabled: true,
             default_model: None,
         }];
-        assert_eq!(profile_choice_label(&profiles[0]), "codex  (command, builtin)");
+        assert_eq!(
+            profile_choice_label(&profiles[0]),
+            "codex  (command, builtin)"
+        );
         let items = profile_select_items(&profiles);
         assert_eq!(items.len(), 3);
         assert_eq!(
             map_profile_selection(&profiles, 0).expect("profile"),
             Some("codex".to_owned())
         );
-        assert_eq!(map_profile_selection(&profiles, 1).expect("default routing"), None);
+        assert_eq!(
+            map_profile_selection(&profiles, 1).expect("default routing"),
+            None
+        );
     }
 
     #[test]
@@ -3744,8 +3759,13 @@ spec:
         let updated = super::agent_node("worker", "updated prompt", Some("claude".to_owned()), 1);
         state = replace_node_in_editor(&state, "worker", updated).expect("edit node");
         match &state.graph.spec.nodes[0].kind {
-            NodeKind::Agent { prompt, profile, .. } => {
-                assert_eq!(prompt, &gloop_core::PromptSpec::Inline("updated prompt".to_owned()));
+            NodeKind::Agent {
+                prompt, profile, ..
+            } => {
+                assert_eq!(
+                    prompt,
+                    &gloop_core::PromptSpec::Inline("updated prompt".to_owned())
+                );
                 assert_eq!(profile.as_deref(), Some("claude"));
             }
             _ => panic!("expected agent node"),
@@ -3758,7 +3778,11 @@ spec:
     fn save_blocked_by_validation_returns_errors() {
         let state = EditorState::new("empty", "no nodes yet");
         let errors = validate_for_save(&state).expect_err("empty graph cannot save");
-        assert!(errors.iter().any(|error| error.contains("at least one node")));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("at least one node"))
+        );
     }
 
     #[test]
@@ -3773,7 +3797,10 @@ spec:
         assert!(header.contains("2 nodes, 1 edges"));
         assert!(node_line.contains("implement(agent:codex)"));
         assert!(node_line.contains("test(verify)"));
-        assert_eq!(format_node_summary(&state.graph.spec.nodes[0]), "implement(agent:codex)");
+        assert_eq!(
+            format_node_summary(&state.graph.spec.nodes[0]),
+            "implement(agent:codex)"
+        );
     }
 
     #[test]
@@ -3834,10 +3861,8 @@ spec:
         follower.workspace = WorkspaceSpec::Inherit {
             node: "owner".to_owned(),
         };
-        let state = EditorState::from_graph(
-            Graph::new("inherit", "goal", vec![owner, follower]),
-            0,
-        );
+        let state =
+            EditorState::from_graph(Graph::new("inherit", "goal", vec![owner, follower]), 0);
         assert_eq!(
             workspace_inheritance_dependents(&state, "owner"),
             vec!["follower".to_owned()]
@@ -3918,8 +3943,14 @@ spec:
                 default_model: None,
             },
         ];
-        assert_eq!(profile_default_select_index(&profiles, None), profiles.len());
-        assert_eq!(profile_default_select_index(&profiles, Some("")), profiles.len());
+        assert_eq!(
+            profile_default_select_index(&profiles, None),
+            profiles.len()
+        );
+        assert_eq!(
+            profile_default_select_index(&profiles, Some("")),
+            profiles.len()
+        );
     }
 
     #[test]
@@ -3935,7 +3966,10 @@ spec:
             map_profile_selection(&profiles, profiles.len()).expect("default routing index"),
             None
         );
-        assert_eq!(profile_default_select_index(&profiles, Some("")), profiles.len());
+        assert_eq!(
+            profile_default_select_index(&profiles, Some("")),
+            profiles.len()
+        );
     }
 
     #[test]
@@ -3973,11 +4007,19 @@ spec:
     #[test]
     fn optional_model_can_be_cleared() {
         assert_eq!(
-            resolve_optional_model(OptionalModelAction::Clear, Some("gpt-5"), Some("other".to_owned())),
+            resolve_optional_model(
+                OptionalModelAction::Clear,
+                Some("gpt-5"),
+                Some("other".to_owned())
+            ),
             None
         );
         assert_eq!(
-            resolve_optional_model(OptionalModelAction::Keep, Some("gpt-5"), Some("other".to_owned())),
+            resolve_optional_model(
+                OptionalModelAction::Keep,
+                Some("gpt-5"),
+                Some("other".to_owned())
+            ),
             Some("gpt-5".to_owned())
         );
         assert_eq!(
