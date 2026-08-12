@@ -19,14 +19,16 @@ main{display:grid;grid-template-columns:minmax(280px,1fr) minmax(360px,1.25fr);g
 .editor{display:grid;gap:10px}.edges{display:flex;flex-direction:column;gap:5px;margin-top:8px}.edge{display:flex;gap:7px;align-items:center;color:var(--muted);font-size:12px}.edge button{padding:3px 7px}
 .diagram{position:relative;min-height:165px;border:1px dashed var(--line);border-radius:8px;padding:12px;display:flex;align-items:center;gap:9px;flex-wrap:wrap;overflow:auto}
 .diagram .box{border:1px solid #3d79a5;border-radius:7px;background:#15283a;padding:9px 11px;cursor:pointer}
-.notice{min-height:22px;color:var(--muted)}.notice.error{color:var(--danger)}
+.diagram .edge-chip{color:var(--muted);font-size:12px;padding:7px 9px;border:1px solid var(--line);border-radius:999px}
+.hint{color:var(--muted);font-size:12px;margin:0 0 12px}.notice{min-height:22px;color:var(--muted)}.notice.error{color:var(--danger)}
 @media(max-width:900px){main{grid-template-columns:1fr}.meta{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
-<header><h1>gloop graph editor</h1><button id="lang">日本語</button><button id="save"></button><button id="close"></button></header>
+<header><h1 id="title">gloop graph editor</h1><button id="lang">日本語</button><button id="save"></button><button id="close"></button></header>
 <main>
 <section class="panel">
+<p id="intro" class="hint"></p>
 <div class="meta">
 <div class="field"><label id="nameLabel"></label><input id="name"></div>
 <div class="field"><label id="goalLabel"></label><input id="goal"></div>
@@ -38,6 +40,7 @@ main{display:grid;grid-template-columns:minmax(280px,1fr) minmax(360px,1.25fr);g
 </section>
 <section class="panel">
 <div id="diagram" class="diagram"></div>
+<p id="diagramHint" class="hint"></p>
 <div class="editor">
 <div class="field"><label id="idLabel"></label><input id="nodeId" disabled></div>
 <div class="field"><label id="kindLabel"></label><select id="kind"><option>agent</option><option>command</option><option>verify</option><option>gate</option><option>reduce</option><option>synthesize</option><option>loop</option><option>subgraph</option></select></div>
@@ -46,6 +49,7 @@ main{display:grid;grid-template-columns:minmax(280px,1fr) minmax(360px,1.25fr);g
 <div class="field"><label id="profileLabel"></label><select id="profile"></select></div>
 <div class="field"><label id="modelLabel"></label><input id="model" list="models"><datalist id="models"></datalist></div>
 <div class="field"><label id="fanoutLabel"></label><input id="fanout" type="number" min="1"></div>
+<p id="nodeHint" class="hint"></p>
 <div class="toolbar"><button id="apply"></button></div>
 <div><label id="edgesLabel"></label><div id="edges" class="edges"></div>
 <div class="toolbar" style="margin-top:8px"><select id="edgeFrom"></select><select id="edgeTo"></select><select id="edgeKind"><option>data</option><option>control</option><option>resource</option><option>failure</option></select><button id="addEdge"></button></div></div>
@@ -57,12 +61,12 @@ main{display:grid;grid-template-columns:minmax(280px,1fr) minmax(360px,1.25fr);g
 const token=location.hash.slice(1);
 let state,graph,selected=0,lang='en';
 const T={
-en:{save:'Save',close:'Close',add:'Add node',remove:'Remove selected',apply:'Apply node',name:'Graph name',goal:'Goal',description:'Description',parallel:'Max parallel',id:'Node id',kind:'Kind',prompt:'Prompt / message',argv:'Command arguments (one per line)',profile:'Harness',model:'Model',fanout:'Fan out',edges:'Edges',none:'(default routing)',select:'Select a node first.',deleted:'Node removed.',edge:'Add edge',saved:'Saved.',closed:'Editor closed.'},
-ja:{save:'保存',close:'閉じる',add:'ノード追加',remove:'選択ノードを削除',apply:'ノードを反映',name:'グラフ名',goal:'目的',description:'説明',parallel:'最大並列数',id:'ノードID',kind:'種類',prompt:'プロンプト / メッセージ',argv:'コマンド引数（1行1つ）',profile:'ハーネス',model:'モデル',fanout:'ファンアウト',edges:'エッジ',none:'（デフォルトルーティング）',select:'先にノードを選択してください。',deleted:'ノードを削除しました。',edge:'エッジ追加',saved:'保存しました。',closed:'エディタを閉じました。'}
+en:{title:'gloop graph editor',intro:'Click a node, change the simple fields, then choose Save. Saving checks the graph before writing it.',diagramHint:'The chips below show the real connections between nodes.',save:'Save changes',close:'Close',add:'Add node',remove:'Remove selected',apply:'Update node',name:'Graph name',goal:'Goal',description:'Description',parallel:'Max parallel',id:'Node id',kind:'Kind',prompt:'Prompt / message',argv:'Command arguments (one per line)',profile:'Harness',model:'Model',fanout:'Fan out',edges:'Edges',none:'(default routing)',select:'Select a node first.',deleted:'Node removed.',edge:'Add edge',saved:'Updated in the editor.',closed:'Editor closed.',different:'Choose two different nodes.',duplicate:'That edge already exists.',structural:'Loop and subgraph details stay unchanged here. Use the TUI for nested graph editing.'},
+ja:{title:'gloop グラフエディタ',intro:'ノードをクリックして編集し、最後に「保存」を押してください。保存前にグラフをチェックします。',diagramHint:'下のチップがノード間の実際のつながりです。',save:'変更を保存',close:'閉じる',add:'ノード追加',remove:'選択ノードを削除',apply:'ノードを反映',name:'グラフ名',goal:'目的',description:'説明',parallel:'最大並列数',id:'ノードID',kind:'種類',prompt:'プロンプト / メッセージ',argv:'コマンド引数（1行1つ）',profile:'ハーネス',model:'モデル',fanout:'ファンアウト',edges:'エッジ',none:'（デフォルトルーティング）',select:'先にノードを選択してください。',deleted:'ノードを削除しました。',edge:'エッジ追加',saved:'エディタ内に反映しました。',closed:'エディタを閉じました。',different:'異なる2つのノードを選んでください。',duplicate:'そのエッジはすでにあります。',structural:'loop と subgraph の中身はここでは変更しません。入れ子の編集はTUIを使ってください。'}
 };
 const $=id=>document.getElementById(id),tr=k=>T[lang][k]||k;
 function setText(){
- [['save','save'],['close','close'],['add','add'],['remove','remove'],['apply','apply'],['nameLabel','name'],['goalLabel','goal'],['descriptionLabel','description'],['parallelLabel','parallel'],['idLabel','id'],['kindLabel','kind'],['promptLabel','prompt'],['argvLabel','argv'],['profileLabel','profile'],['modelLabel','model'],['fanoutLabel','fanout'],['edgesLabel','edges']].forEach(([id,k])=>$(id).textContent=tr(k));
+ [['title','title'],['intro','intro'],['diagramHint','diagramHint'],['save','save'],['close','close'],['add','add'],['remove','remove'],['apply','apply'],['nameLabel','name'],['goalLabel','goal'],['descriptionLabel','description'],['parallelLabel','parallel'],['idLabel','id'],['kindLabel','kind'],['promptLabel','prompt'],['argvLabel','argv'],['profileLabel','profile'],['modelLabel','model'],['fanoutLabel','fanout'],['edgesLabel','edges']].forEach(([id,k])=>$(id).textContent=tr(k));
  $('addEdge').textContent=tr('edge');
  document.documentElement.lang=lang;$('lang').textContent=lang==='en'?'日本語':'English';
 }
@@ -84,16 +88,17 @@ function render(){
  $('name').value=graph.metadata.name||'';$('goal').value=graph.spec.goal||'';$('description').value=graph.metadata.description||'';$('parallel').value=graph.spec.policies.max_parallel||1;
  const list=$('nodes');list.innerHTML='';
  graph.spec.nodes.forEach((node,index)=>{const button=document.createElement('button');button.className='node'+(index===selected?' selected':'');const id=document.createElement('span');id.textContent=node.id;const type=document.createElement('span');type.className='kind';type.textContent=kind(node);button.append(id,type);button.onclick=()=>{selected=index;render()};list.append(button)});
- const diagram=$('diagram');diagram.innerHTML='';graph.spec.nodes.forEach((node,index)=>{if(index){const arrow=document.createElement('span');arrow.className='arrow';arrow.textContent='→';diagram.append(arrow)}const box=document.createElement('div');box.className='box';box.textContent=node.id;box.onclick=()=>{selected=index;render()};diagram.append(box)});
+ const diagram=$('diagram');diagram.innerHTML='';graph.spec.nodes.forEach((node,index)=>{const box=document.createElement('div');box.className='box';box.textContent=node.id;box.title=kind(node);box.onclick=()=>{selected=index;render()};diagram.append(box)});(graph.spec.edges||[]).forEach(edge=>{const chip=document.createElement('span');chip.className='edge-chip';chip.textContent=edge.from+' → '+edge.to+' ('+edge.kind+')';diagram.append(chip)});
  renderNode();renderEdges();
 }
 function renderNode(){
- const node=selectedNode();if(!node){$('nodeId').value='';return}
+ const node=selectedNode();if(!node){$('nodeId').value='';$('nodeHint').textContent='';return}
  $('nodeId').value=node.id;$('kind').value=kind(node);$('prompt').value=text(node)||node.message||'';$('argv').value=(node.argv||[]).join('\n');
  if(node.profile&&!Array.from($('profile').options).some(option=>option.value===node.profile)){const option=document.createElement('option');option.value=node.profile;option.textContent=node.profile+' (unavailable)';option.disabled=true;$('profile').append(option)}
  $('profile').value=node.profile||'';$('model').value=node.model||'';$('fanout').value=node.fan_out||1;
  const agent=['agent','reduce','synthesize'].includes(kind(node));$('profile').disabled=!agent;$('model').disabled=!agent;$('fanout').disabled=kind(node)!=='agent';
  $('prompt').style.display=['command','verify'].includes(kind(node))?'none':'block';$('argv').style.display=['command','verify'].includes(kind(node))?'block':'none';
+ $('nodeHint').textContent=['loop','subgraph'].includes(kind(node))?tr('structural'):'';
 }
 function renderEdges(){
  const list=$('edges');list.innerHTML='';
@@ -120,8 +125,8 @@ function removeNode(){
  const id=selectedNode().id;graph.spec.nodes.splice(selected,1);graph.spec.edges=(graph.spec.edges||[]).filter(edge=>edge.from!==id&&edge.to!==id);selected=Math.max(0,selected-1);render();notice(tr('deleted'));
 }
 function addEdge(){
- const from=$('edgeFrom').value,to=$('edgeTo').value;if(!from||!to||from===to){notice('Choose two different nodes.',true);return}
- graph.spec.edges=graph.spec.edges||[];const type=$('edgeKind').value;if(graph.spec.edges.some(edge=>edge.from===from&&edge.to===to&&edge.kind===type)){notice('That edge already exists.',true);return}
+ const from=$('edgeFrom').value,to=$('edgeTo').value;if(!from||!to||from===to){notice(tr('different'),true);return}
+ graph.spec.edges=graph.spec.edges||[];const type=$('edgeKind').value;if(graph.spec.edges.some(edge=>edge.from===from&&edge.to===to&&edge.kind===type)){notice(tr('duplicate'),true);return}
  graph.spec.edges.push({from,to,kind:type});render();
 }
 async function save(){
@@ -133,6 +138,7 @@ async function init(){
  try{state=await api('/api/state');graph=state.graph;lang=state.language==='ja'?'ja':'en';
   const profiles=state.profiles||[];const profileSelect=$('profile');profileSelect.replaceChildren();const defaultProfile=document.createElement('option');defaultProfile.value='';defaultProfile.textContent=tr('none');profileSelect.append(defaultProfile);
   profiles.filter(profile=>profile.enabled).forEach(profile=>{const option=document.createElement('option');option.value=profile.name;option.textContent=profile.name+' ('+profile.kind+')';profileSelect.append(option)});
+  profileSelect.onchange=()=>{const profile=profiles.find(item=>item.name===profileSelect.value);if(profile&&profile.default_model&&!$('model').value)$('model').value=profile.default_model};
   const models=$('models');models.replaceChildren();(state.models||[]).forEach(model=>{const option=document.createElement('option');option.value=model;models.append(option)});setText();render();
  }catch(error){notice(error.message,true)}
 }

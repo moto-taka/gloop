@@ -1,10 +1,15 @@
 //! Project graph template naming, discovery, resolution, and persistence.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 use gloop_core::{Graph, GraphError, IssueSeverity};
 
 pub const TEMPLATES_DIR: &str = ".gloop/templates";
+pub const GRAPHS_DIR: &str = ".gloop/graphs";
 pub const MAX_TEMPLATE_NAME_LEN: usize = 64;
 pub const DEFAULT_TEMPLATE_GOAL: &str = "work";
 
@@ -77,7 +82,10 @@ impl TemplateResolveError {
                 )
             }
             Self::Read { path, error } => {
-                format!("failed to read project template {}: {error}", path.display())
+                format!(
+                    "failed to read project template {}: {error}",
+                    path.display()
+                )
             }
             Self::Validation { path, error } => {
                 format!("project template {} is invalid: {error}", path.display())
@@ -97,13 +105,19 @@ pub fn is_valid_kebab_name(name: &str) -> bool {
 
     let mut parts = name.split('-');
     let first = parts.next().expect("non-empty name");
-    if first.is_empty() || !first.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit()) {
+    if first.is_empty()
+        || !first
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+    {
         return false;
     }
 
     for part in parts {
         if part.is_empty()
-            || !part.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+            || !part
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
         {
             return false;
         }
@@ -132,6 +146,115 @@ pub fn templates_dir(repo: &Path) -> PathBuf {
 
 pub fn template_path(repo: &Path, name: &str) -> PathBuf {
     templates_dir(repo).join(format!("{name}.yaml"))
+}
+
+pub fn graphs_dir(repo: &Path) -> PathBuf {
+    repo.join(GRAPHS_DIR)
+}
+
+pub fn graph_path(repo: &Path, name: &str) -> PathBuf {
+    graphs_dir(repo).join(format!("{name}.yaml"))
+}
+
+/// Find graph-shaped YAML files without descending into generated or dependency directories.
+/// Symlinks are skipped so a project cannot make a read-only catalog walk outside its tree.
+pub fn list_graph_files(repo: &Path) -> Result<Vec<PathBuf>, String> {
+    if !repo.is_dir() {
+        return Err(format!(
+            "repository path is not a directory: {}",
+            repo.display()
+        ));
+    }
+
+    let mut files = Vec::new();
+    collect_graph_files(repo, repo, 0, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn collect_graph_files(
+    repo: &Path,
+    directory: &Path,
+    depth: usize,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    if depth > 32 {
+        return Err(format!(
+            "graph search exceeded the maximum directory depth at {}",
+            directory.display()
+        ));
+    }
+
+    for entry in std::fs::read_dir(directory)
+        .map_err(|error| format!("failed to read {}: {error}", directory.display()))?
+    {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to read directory entry in {}: {error}",
+                directory.display()
+            )
+        })?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(repo)
+            .map_err(|error| format!("failed to relativize {}: {error}", path.display()))?;
+        if metadata.is_dir() {
+            if should_skip_graph_directory(relative) {
+                continue;
+            }
+            collect_graph_files(repo, &path, depth + 1, files)?;
+        } else if metadata.is_file()
+            && path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| matches!(extension, "yaml" | "yml"))
+            && looks_like_graph(&path)
+        {
+            files.push(path);
+            if files.len() > 2_048 {
+                return Err("graph search found more than 2048 graph files".to_owned());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn should_skip_graph_directory(relative: &Path) -> bool {
+    let mut components = relative.components();
+    let Some(first) = components
+        .next()
+        .and_then(|component| component.as_os_str().to_str())
+    else {
+        return false;
+    };
+    if matches!(first, ".git" | "target" | "node_modules") {
+        return true;
+    }
+    if first != ".gloop" {
+        return false;
+    }
+    matches!(
+        components
+            .next()
+            .and_then(|component| component.as_os_str().to_str()),
+        Some("templates" | "runs" | "worktrees" | "provider-e2e" | "provider-e2e-final")
+    )
+}
+
+fn looks_like_graph(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let mut source = String::new();
+    if file.take(128 * 1024).read_to_string(&mut source).is_err() {
+        return false;
+    }
+    source.contains("apiVersion: gloop.dev/") || source.contains("kind: Graph")
 }
 
 pub fn validate_template_lookup_name(name: &str) -> Result<(), String> {
@@ -164,12 +287,11 @@ pub fn confined_template_path(
         error,
     })?;
 
-    let canonical_repo = std::fs::canonicalize(repo).map_err(|error| {
-        TemplateResolveError::Read {
+    let canonical_repo =
+        std::fs::canonicalize(repo).map_err(|error| TemplateResolveError::Read {
             path: repo.to_path_buf(),
             error: error.to_string(),
-        }
-    })?;
+        })?;
 
     let dir = templates_dir(repo);
     let candidate = dir.join(format!("{name}.yaml"));
@@ -212,12 +334,10 @@ pub fn confined_template_path(
             Ok(Some(resolved))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => {
-            Err(TemplateResolveError::Read {
-                path: canonical_candidate,
-                error: error.to_string(),
-            })
-        }
+        Err(error) => Err(TemplateResolveError::Read {
+            path: canonical_candidate,
+            error: error.to_string(),
+        }),
     }
 }
 
@@ -241,25 +361,50 @@ pub fn list_builtin_templates() -> Vec<TemplateEntry> {
         .map(|name| TemplateEntry {
             name: (*name).to_owned(),
             source: TemplateSource::Builtin,
-            description: None,
+            description: Some(
+                match *name {
+                    "direct" => "one agent task",
+                    "plan-implement-verify" => "plan, implement, then verify",
+                    "parallel-research-reduce" => "research in parallel, then reduce",
+                    "review-fix-loop" => "bounded review and fix loop",
+                    _ => "built-in graph template",
+                }
+                .to_owned(),
+            ),
         })
         .collect()
 }
 
 pub fn list_project_templates(repo: &Path) -> Result<Vec<TemplateEntry>, String> {
     let dir = templates_dir(repo);
-    if !dir.is_dir() {
-        return Ok(Vec::new());
-    }
+    let canonical_repo = std::fs::canonicalize(repo)
+        .map_err(|error| format!("failed to inspect {}: {error}", repo.display()))?;
+    let dir = match std::fs::canonicalize(&dir) {
+        Ok(canonical_dir) if canonical_dir.starts_with(&canonical_repo) => canonical_dir,
+        Ok(canonical_dir) => {
+            return Err(format!(
+                "template directory escapes the repository: {}",
+                canonical_dir.display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!("failed to inspect {}: {error}", dir.display()));
+        }
+    };
 
     let mut entries = Vec::new();
-    for entry in std::fs::read_dir(&dir).map_err(|error| {
-        format!("failed to read {}: {error}", dir.display())
-    })? {
-        let entry = entry.map_err(|error| {
-            format!("failed to read template directory entry: {error}")
-        })?;
+    for entry in std::fs::read_dir(&dir)
+        .map_err(|error| format!("failed to read {}: {error}", dir.display()))?
+    {
+        let entry =
+            entry.map_err(|error| format!("failed to read template directory entry: {error}"))?;
         let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue;
+        }
         if path.extension().and_then(|ext| ext.to_str()) != Some("yaml") {
             continue;
         }
@@ -350,11 +495,11 @@ pub fn apply_new_overrides(graph: &mut Graph, name: &str, goal: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_new_overrides, confined_template_path, is_builtin_template_name, is_valid_kebab_name,
-        list_all_templates, list_project_templates, resolve_template, strict_validate_project_template,
-        template_path, templates_dir, validate_init_template_name, validate_template_lookup_name,
         BUILTIN_TEMPLATE_NAMES, DEFAULT_TEMPLATE_GOAL, MAX_TEMPLATE_NAME_LEN, ResolvedTemplate,
-        TemplateResolveError, TemplateSource,
+        TemplateResolveError, TemplateSource, apply_new_overrides, confined_template_path,
+        is_builtin_template_name, is_valid_kebab_name, list_all_templates, list_project_templates,
+        resolve_template, strict_validate_project_template, template_path, templates_dir,
+        validate_init_template_name, validate_template_lookup_name,
     };
     use gloop_core::{
         ContextSpec, Graph, Node, NodeKind, OutputSpec, PromptSpec, RetryPolicy, WorkspaceSpec,
@@ -460,8 +605,11 @@ mod tests {
         let templates = templates_dir(dir.path());
         fs::create_dir_all(&templates).expect("create templates dir");
         let graph = sample_project_graph("listed");
-        fs::write(template_path(dir.path(), "listed"), graph.to_yaml().expect("yaml"))
-            .expect("write template");
+        fs::write(
+            template_path(dir.path(), "listed"),
+            graph.to_yaml().expect("yaml"),
+        )
+        .expect("write template");
         fs::write(templates.join("notes.txt"), "skip").expect("write non-template");
 
         let entries = list_project_templates(dir.path()).expect("list");

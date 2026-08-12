@@ -82,6 +82,30 @@ gloop graph init --list
 gloop graph new workflow.yaml --template my-review-flow
 ```
 
+See everything available in the current project:
+
+~~~text
+gloop graph list
+gloop graph list --lang ja
+~~~
+
+'graph init --list' is only the short template list. 'graph list' also shows
+saved project templates and graph YAML files, including node/edge counts and
+validation status. Start editing by copying a name from the list:
+
+~~~text
+gloop graph edit plan-implement-verify --gui
+~~~
+
+Built-in templates are read-only until you save them. The first save creates
+'.gloop/graphs/plan-implement-verify.yaml'; later edits open that saved graph.
+For a named reusable project template, use:
+
+~~~text
+gloop graph init --name my-flow --from plan-implement-verify --gui --lang ja
+gloop graph update my-flow --gui
+~~~
+
 Open the same graph authoring flow in a local browser. The editor only binds to
 loopback, shows enabled provider profiles and known model defaults, and writes
 through gloop's normal validation and atomic-save path:
@@ -94,7 +118,20 @@ gloop graph update my-review-flow --repo /path/to/project --gui
 
 Without `--gui`, `graph edit` and `graph update` use the existing interactive
 TUI for selective node and edge edits. `update` addresses a saved project
-template by name; `edit` addresses a graph YAML path.
+template by name; `edit` accepts a graph YAML path or any name shown by
+`gloop graph list`.
+
+If you do not know what to type, use this order:
+
+1. gloop graph list
+2. Pick one name or file from the output.
+3. For a visual editor, run: gloop graph edit NAME --gui
+4. Click a node, choose the harness/model, and press Save changes.
+5. Run gloop graph validate PATH and then gloop run --graph PATH --repo .
+
+The bundled skill at skills/gloop-graph-authoring/SKILL.md contains the same
+flow in short, copyable instructions for an agent or assistant that does not
+know gloop yet.
 
 Run a saved graph in the foreground:
 

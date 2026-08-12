@@ -17,7 +17,9 @@ use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
 use crate::{
-    atomic_write::{write_text_atomic_if_unchanged_sync, write_text_atomic_sync},
+    atomic_write::{
+        write_text_atomic_if_unchanged_sync, write_text_atomic_sync, write_text_no_replace_sync,
+    },
     templates,
 };
 
@@ -44,6 +46,7 @@ pub enum GuiTarget {
     GraphFile {
         path: PathBuf,
         expected_sha256: Option<String>,
+        create_only: bool,
     },
     ProjectTemplate {
         repo: PathBuf,
@@ -58,12 +61,13 @@ pub struct ProfileOption {
     pub kind: String,
     pub enabled: bool,
     pub default_model: Option<String>,
+    pub known_models: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct GuiResult {
     pub graph: Graph,
-    pub written: PathBuf,
+    pub written: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -81,6 +85,7 @@ struct ProfileOptionPayload {
     kind: String,
     enabled: bool,
     default_model: Option<String>,
+    known_models: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -136,12 +141,8 @@ pub fn launch(
                 )?;
             }
             ("GET", "/api/state") => {
-                let payload = serde_json::to_vec(&build_state(
-                    &current_graph,
-                    profiles,
-                    language,
-                    &target,
-                )?)?;
+                let payload =
+                    serde_json::to_vec(&build_state(&current_graph, profiles, language, &target)?)?;
                 write_response(&mut stream, 200, "application/json", &payload)?;
             }
             ("POST", "/api/save") => match save_graph(&request.body, &mut target) {
@@ -179,7 +180,6 @@ pub fn launch(
         }
     }
 
-    let written = written.ok_or_else(|| anyhow!("GUI closed before saving"))?;
     Ok(GuiResult {
         graph: current_graph,
         written,
@@ -207,6 +207,13 @@ fn build_state(
         {
             models.insert(model.to_owned());
         }
+        models.extend(
+            profile
+                .known_models
+                .iter()
+                .filter(|model| !model.trim().is_empty())
+                .cloned(),
+        );
     }
     Ok(GuiState {
         graph: graph_value,
@@ -217,6 +224,7 @@ fn build_state(
                 kind: profile.kind.clone(),
                 enabled: profile.enabled,
                 default_model: profile.default_model.clone(),
+                known_models: profile.known_models.clone(),
             })
             .collect(),
         models: models.into_iter().collect(),
@@ -251,6 +259,7 @@ fn save_graph(body: &[u8], target: &mut GuiTarget) -> Result<(Graph, PathBuf)> {
         GuiTarget::GraphFile {
             path,
             expected_sha256,
+            create_only,
         } => {
             if let Some(expected) = expected_sha256 {
                 let actual = file_sha256(path)?;
@@ -259,6 +268,11 @@ fn save_graph(body: &[u8], target: &mut GuiTarget) -> Result<(Graph, PathBuf)> {
                         "graph changed on disk while the editor was open; reload before saving"
                     ));
                 }
+            } else if *create_only && std::fs::symlink_metadata(&*path).is_ok() {
+                return Err(anyhow!(
+                    "a graph was created at {} while the editor was open; reload before saving",
+                    path.display()
+                ));
             }
             path.clone()
         }
@@ -284,12 +298,19 @@ fn save_graph(body: &[u8], target: &mut GuiTarget) -> Result<(Graph, PathBuf)> {
         }
     };
     if let GuiTarget::GraphFile {
-        expected_sha256: Some(expected),
+        expected_sha256,
+        create_only,
         ..
     } = target
     {
-        write_text_atomic_if_unchanged_sync(&path, expected, &yaml)
-            .context("write graph file")?;
+        match (expected_sha256.as_deref(), *create_only) {
+            (Some(expected), _) => write_text_atomic_if_unchanged_sync(&path, expected, &yaml)
+                .context("write graph file")?,
+            (None, true) => {
+                write_text_no_replace_sync(&path, &yaml).context("create graph file")?;
+            }
+            (None, false) => write_text_atomic_sync(&path, &yaml).context("write graph file")?,
+        }
     } else {
         write_text_atomic_sync(&path, &yaml).context("write graph file")?;
     }
@@ -298,6 +319,9 @@ fn save_graph(body: &[u8], target: &mut GuiTarget) -> Result<(Graph, PathBuf)> {
     } = target
     {
         *expected_sha256 = Some(file_sha256(&path)?);
+    }
+    if let GuiTarget::GraphFile { create_only, .. } = target {
+        *create_only = false;
     }
     Ok((graph, path))
 }
@@ -441,4 +465,57 @@ pub fn file_sha256(path: &PathBuf) -> Result<String> {
 
 fn gui_html() -> String {
     include_str!("gui.html").to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn save_body() -> Vec<u8> {
+        let graph =
+            Graph::from_yaml_str(include_str!("../../../examples/direct.yaml")).expect("graph");
+        serde_json::to_vec(&json!({"graph": graph})).expect("save body")
+    }
+
+    #[test]
+    fn first_builtin_gui_save_is_create_only() {
+        let repo = tempdir().expect("temp repo");
+        let path = repo.path().join(".gloop/graphs/direct.yaml");
+        let mut target = GuiTarget::GraphFile {
+            path: path.clone(),
+            expected_sha256: None,
+            create_only: true,
+        };
+
+        let (_, written) = save_graph(&save_body(), &mut target).expect("create graph");
+
+        assert_eq!(written, path);
+        assert!(path.is_file());
+        assert!(matches!(
+            target,
+            GuiTarget::GraphFile {
+                expected_sha256: Some(_),
+                create_only: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn first_builtin_gui_save_does_not_replace_a_racing_file() {
+        let repo = tempdir().expect("temp repo");
+        let path = repo.path().join(".gloop/graphs/direct.yaml");
+        std::fs::create_dir_all(path.parent().expect("graph parent")).expect("parent");
+        std::fs::write(&path, "created elsewhere").expect("racing graph");
+        let mut target = GuiTarget::GraphFile {
+            path,
+            expected_sha256: None,
+            create_only: true,
+        };
+
+        let error = save_graph(&save_body(), &mut target).expect_err("must refuse overwrite");
+
+        assert!(error.to_string().contains("created at"));
+    }
 }

@@ -19,6 +19,7 @@ use gloop_runtime::{
     replay_journal,
 };
 use schemars::schema_for;
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::{
     fs, signal,
@@ -398,7 +399,10 @@ pub fn build_profile_choices(
     Ok(choices)
 }
 
-fn gui_profile_options(choices: &[wizard::ProfileChoice]) -> Vec<gui::ProfileOption> {
+fn gui_profile_options(
+    choices: &[wizard::ProfileChoice],
+    known_models: &[String],
+) -> Vec<gui::ProfileOption> {
     choices
         .iter()
         .map(|choice| gui::ProfileOption {
@@ -406,8 +410,36 @@ fn gui_profile_options(choices: &[wizard::ProfileChoice]) -> Vec<gui::ProfileOpt
             kind: choice.kind.clone(),
             enabled: choice.enabled,
             default_model: choice.default_model.clone(),
+            known_models: known_models.to_vec(),
         })
         .collect()
+}
+
+fn known_models_for_repo(repo: &Path) -> Vec<String> {
+    let mut models = std::collections::BTreeSet::new();
+    let mut add_graph_models = |graph: Graph| {
+        for node in graph.spec.nodes {
+            if let Some(model) = node.model().filter(|model| !model.trim().is_empty()) {
+                models.insert(model.to_owned());
+            }
+        }
+    };
+
+    if let Ok(paths) = templates::list_graph_files(repo) {
+        for path in paths {
+            if let Ok(graph) = Graph::from_path(path) {
+                add_graph_models(graph);
+            }
+        }
+    }
+    if let Ok(entries) = templates::list_project_templates(repo) {
+        for entry in entries {
+            if let Ok(graph) = Graph::from_path(templates::template_path(repo, &entry.name)) {
+                add_graph_models(graph);
+            }
+        }
+    }
+    models.into_iter().collect()
 }
 
 fn run_error_code(error: &RunError) -> ExitCode {
@@ -965,7 +997,7 @@ pub async fn graph_init(
         }
         return graph_gui(
             graph,
-            gui_profile_options(&profiles),
+            gui_profile_options(&profiles, &known_models_for_repo(&repo)),
             GuiTarget::ProjectTemplate {
                 repo,
                 force,
@@ -1011,11 +1043,13 @@ pub async fn graph_init(
 
         let mut lines = Vec::new();
         for entry in &entries {
-            let source = match entry.source {
-                templates::TemplateSource::Builtin => "builtin",
-                templates::TemplateSource::Project => "project",
+            let source = match (language, entry.source) {
+                (Language::En, templates::TemplateSource::Builtin) => "builtin",
+                (Language::En, templates::TemplateSource::Project) => "project",
+                (Language::Ja, templates::TemplateSource::Builtin) => "組み込み",
+                (Language::Ja, templates::TemplateSource::Project) => "プロジェクト",
             };
-            if let Some(description) = &entry.description {
+            if let Some(description) = localized_template_description(entry, language) {
                 lines.push(format!("{source} {name}: {description}", name = entry.name));
             } else {
                 lines.push(format!("{source} {name}", name = entry.name));
@@ -1024,6 +1058,11 @@ pub async fn graph_init(
         return CommandResult::success_text(lines.join("\n"));
     }
 
+    if language == Language::Ja && name.is_none() && from.is_none() {
+        eprintln!(
+            "TUI is English-only. Use --gui for the Japanese editor. / TUIは英語のみです。日本語エディタは --gui を使ってください。"
+        );
+    }
     if !(name.is_some() && from.is_some())
         && (description.is_some()
             || request.is_some()
@@ -1160,6 +1199,368 @@ pub async fn graph_init(
     }
 }
 
+#[derive(Debug, Serialize)]
+struct GraphCatalogEntry {
+    name: String,
+    source: String,
+    path: Option<String>,
+    description: Option<String>,
+    goal: Option<String>,
+    node_count: Option<usize>,
+    edge_count: Option<usize>,
+    status: String,
+    errors: Vec<String>,
+    warnings: Vec<String>,
+}
+
+pub async fn graph_list(repo: PathBuf, language: Language, json_mode: bool) -> CommandResult {
+    let templates = match templates::list_all_templates(&repo) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return CommandResult::failure_json(
+                ExitCode::Internal,
+                "failed to list graph templates",
+                Some(json!({"error": error})),
+            );
+        }
+    };
+    let graph_files = match templates::list_graph_files(&repo) {
+        Ok(paths) => paths,
+        Err(error) => {
+            return CommandResult::failure_json(
+                ExitCode::Internal,
+                "failed to search graph files",
+                Some(json!({"error": error})),
+            );
+        }
+    };
+
+    let template_entries = graph_template_catalog_entries(&repo, templates, language, json_mode);
+    let graph_entries = graph_files
+        .iter()
+        .map(|path| catalog_entry_from_path(repo.as_path(), path, "file".to_owned(), None))
+        .collect::<Vec<_>>();
+
+    if json_mode {
+        return CommandResult::success_json(json!({
+            "success": true,
+            "repo": repo,
+            "templates": template_entries,
+            "graphs": graph_entries,
+        }));
+    }
+
+    let mut lines = vec![match language {
+        Language::En => "Templates (use a name with 'graph edit NAME --gui'):".to_owned(),
+        Language::Ja => "テンプレート（名前を 'graph edit 名前 --gui' に渡せます）:".to_owned(),
+    }];
+    if template_entries.is_empty() {
+        lines.push(match language {
+            Language::En => "  (none)".to_owned(),
+            Language::Ja => "  （なし）".to_owned(),
+        });
+    } else {
+        lines.extend(
+            template_entries
+                .iter()
+                .map(|entry| format_catalog_entry(entry, language)),
+        );
+    }
+    lines.push(String::new());
+    lines.push(match language {
+        Language::En => "Saved graph files:".to_owned(),
+        Language::Ja => "保存済みグラフファイル:".to_owned(),
+    });
+    if graph_entries.is_empty() {
+        lines.push(match language {
+            Language::En => "  (none — try 'gloop graph init --gui')".to_owned(),
+            Language::Ja => "  （なし — 'gloop graph init --gui' を試してください）".to_owned(),
+        });
+    } else {
+        lines.extend(
+            graph_entries
+                .iter()
+                .map(|entry| format_catalog_entry(entry, language)),
+        );
+    }
+    CommandResult::success_text(lines.join("\n"))
+}
+
+fn graph_template_catalog_entries(
+    repo: &Path,
+    entries: Vec<templates::TemplateEntry>,
+    language: Language,
+    json_mode: bool,
+) -> Vec<GraphCatalogEntry> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            let description = if json_mode {
+                entry.description.clone()
+            } else {
+                localized_template_description(&entry, language)
+            };
+            match entry.source {
+                templates::TemplateSource::Builtin => {
+                    let graph = GraphTemplateArg::from_name(&entry.name).map(|template| {
+                        wizard::template_graph(
+                            entry.name.clone(),
+                            templates::DEFAULT_TEMPLATE_GOAL,
+                            template.to_template(),
+                            None,
+                            None,
+                            None,
+                        )
+                    });
+                    catalog_entry_from_graph(
+                        graph,
+                        entry.name,
+                        "builtin".to_owned(),
+                        None,
+                        description,
+                    )
+                }
+                templates::TemplateSource::Project => catalog_entry_from_path(
+                    repo,
+                    &templates::template_path(repo, &entry.name),
+                    "template".to_owned(),
+                    description,
+                ),
+            }
+        })
+        .collect()
+}
+
+fn catalog_entry_from_path(
+    repo: &Path,
+    path: &Path,
+    source: String,
+    description: Option<String>,
+) -> GraphCatalogEntry {
+    let name = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("unknown")
+        .to_owned();
+    let display_path = Some(display_catalog_path(repo, path));
+    match Graph::from_path(path) {
+        Ok(graph) => catalog_entry_from_graph(Some(graph), name, source, display_path, description),
+        Err(error) => GraphCatalogEntry {
+            name,
+            source,
+            path: display_path,
+            description,
+            goal: None,
+            node_count: None,
+            edge_count: None,
+            status: "invalid".to_owned(),
+            errors: vec![error.to_string()],
+            warnings: Vec::new(),
+        },
+    }
+}
+
+fn catalog_entry_from_graph(
+    graph: Option<Graph>,
+    fallback_name: String,
+    source: String,
+    path: Option<String>,
+    description: Option<String>,
+) -> GraphCatalogEntry {
+    let Some(graph) = graph else {
+        return GraphCatalogEntry {
+            name: fallback_name,
+            source,
+            path,
+            description,
+            goal: None,
+            node_count: None,
+            edge_count: None,
+            status: "invalid".to_owned(),
+            errors: vec!["unknown built-in graph template".to_owned()],
+            warnings: Vec::new(),
+        };
+    };
+    let issues = graph.validate();
+    let errors = issues
+        .iter()
+        .filter(|issue| issue.severity == IssueSeverity::Error)
+        .map(|issue| format!("[{}] {}", issue.code, issue.message))
+        .collect::<Vec<_>>();
+    let warnings = issues
+        .iter()
+        .filter(|issue| issue.severity == IssueSeverity::Warning)
+        .map(|issue| format!("[{}] {}", issue.code, issue.message))
+        .collect::<Vec<_>>();
+    GraphCatalogEntry {
+        name: graph.metadata.name,
+        source,
+        path,
+        description: description.or(graph.metadata.description),
+        goal: Some(graph.spec.goal),
+        node_count: Some(graph.spec.nodes.len()),
+        edge_count: Some(graph.spec.edges.len()),
+        status: if errors.is_empty() {
+            "valid".to_owned()
+        } else {
+            "invalid".to_owned()
+        },
+        errors,
+        warnings,
+    }
+}
+
+fn display_catalog_path(repo: &Path, path: &Path) -> String {
+    path.strip_prefix(repo).map_or_else(
+        |_| path.display().to_string(),
+        |relative| relative.display().to_string(),
+    )
+}
+
+fn format_catalog_entry(entry: &GraphCatalogEntry, language: Language) -> String {
+    let status = match (language, entry.status.as_str()) {
+        (Language::En, "valid") => "ok",
+        (Language::En, _) => "check",
+        (Language::Ja, "valid") => "OK",
+        (Language::Ja, _) => "要確認",
+    };
+    let source = match (language, entry.source.as_str()) {
+        (Language::En, "builtin") => "built-in",
+        (Language::En, "template") => "project template",
+        (Language::En, _) => "file",
+        (Language::Ja, "builtin") => "組み込み",
+        (Language::Ja, "template") => "プロジェクトテンプレート",
+        (Language::Ja, _) => "ファイル",
+    };
+    let location = entry
+        .path
+        .as_deref()
+        .map_or_else(String::new, |path| format!(" — {path}"));
+    let description = entry
+        .description
+        .as_deref()
+        .map_or_else(String::new, |description| match language {
+            Language::En => format!(" — {description}"),
+            Language::Ja => format!(" — 説明: {description}"),
+        });
+    let goal = entry
+        .goal
+        .as_deref()
+        .map_or_else(String::new, |goal| match language {
+            Language::En => format!(" — goal: {goal}"),
+            Language::Ja => format!(" — 目的: {goal}"),
+        });
+    let shape = match (entry.node_count, entry.edge_count, language) {
+        (Some(nodes), Some(edges), Language::En) => format!(" — {nodes} nodes, {edges} edges"),
+        (Some(nodes), Some(edges), Language::Ja) => format!(" — ノード{nodes}、エッジ{edges}"),
+        _ => String::new(),
+    };
+    let detail = entry
+        .errors
+        .first()
+        .map_or_else(String::new, |error| format!(" — {error}"));
+    format!(
+        "  [{status}] {source} {name}{location}{description}{goal}{shape}{detail}",
+        name = entry.name
+    )
+}
+
+fn localized_template_description(
+    entry: &templates::TemplateEntry,
+    language: Language,
+) -> Option<String> {
+    if entry.source == templates::TemplateSource::Builtin && language == Language::Ja {
+        let description = match entry.name.as_str() {
+            "direct" => "1つのエージェントに作業を頼む",
+            "plan-implement-verify" => "計画 → 実装 → 検証",
+            "parallel-research-reduce" => "並列で調べてからまとめる",
+            "review-fix-loop" => "レビューと修正を回数制限つきで繰り返す",
+            _ => return entry.description.clone(),
+        };
+        return Some(description.to_owned());
+    }
+    entry.description.clone()
+}
+
+#[derive(Debug)]
+struct GraphEditSource {
+    graph: Graph,
+    path: PathBuf,
+    expected_sha256: Option<String>,
+    create_only: bool,
+}
+
+fn resolve_graph_edit_source(
+    target: &Path,
+    repo: &Path,
+    update_mode: bool,
+) -> Result<GraphEditSource, String> {
+    if !update_mode && target.is_file() {
+        return Ok(GraphEditSource {
+            graph: Graph::from_path(target).map_err(|error| error.to_string())?,
+            path: target.to_path_buf(),
+            expected_sha256: Some(
+                gui::file_sha256(&target.to_path_buf()).map_err(|error| error.to_string())?,
+            ),
+            create_only: false,
+        });
+    }
+
+    let name = target
+        .to_str()
+        .ok_or_else(|| "graph target must be valid UTF-8".to_owned())?;
+    templates::validate_template_lookup_name(name)
+        .map_err(|error| format!("'{name}' is not a graph file or template name: {error}"))?;
+
+    let resolved = templates::resolve_template(name, repo).map_err(|error| error.message())?;
+    match resolved {
+        templates::ResolvedTemplate::Project(graph) => {
+            let path = templates::confined_template_path(repo, name)
+                .map_err(|error| error.message())?
+                .ok_or_else(|| format!("project template '{name}' does not have a file"))?;
+            Ok(GraphEditSource {
+                graph: *graph,
+                expected_sha256: Some(gui::file_sha256(&path).map_err(|error| error.to_string())?),
+                path,
+                create_only: false,
+            })
+        }
+        templates::ResolvedTemplate::Builtin(builtin_name) => {
+            if update_mode {
+                return Err(format!(
+                    "built-in template '{builtin_name}' is not a saved template; use 'graph edit {builtin_name}' to create an editable graph, or 'graph init --name NAME --from {builtin_name}' for a reusable template"
+                ));
+            }
+            let path = templates::graph_path(repo, builtin_name);
+            if path.is_file() {
+                return Ok(GraphEditSource {
+                    graph: Graph::from_path(&path).map_err(|error| error.to_string())?,
+                    expected_sha256: Some(
+                        gui::file_sha256(&path).map_err(|error| error.to_string())?,
+                    ),
+                    path,
+                    create_only: false,
+                });
+            }
+            let template = GraphTemplateArg::from_name(builtin_name)
+                .ok_or_else(|| format!("unknown built-in graph template '{builtin_name}'"))?;
+            Ok(GraphEditSource {
+                graph: wizard::template_graph(
+                    builtin_name,
+                    templates::DEFAULT_TEMPLATE_GOAL,
+                    template.to_template(),
+                    None,
+                    None,
+                    None,
+                ),
+                path,
+                expected_sha256: None,
+                create_only: true,
+            })
+        }
+    }
+}
+
 #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
 pub async fn graph_edit(
     target: PathBuf,
@@ -1170,28 +1571,23 @@ pub async fn graph_edit(
     update_mode: bool,
     trust_project_profiles: bool,
 ) -> CommandResult {
-    let path = if update_mode {
-        let Some(name) = target.to_str() else {
-            return CommandResult::failure_json(
-                ExitCode::InvalidGraph,
-                "template name must be valid UTF-8",
-                None,
-            );
-        };
-        if let Err(error) = templates::validate_template_lookup_name(name) {
-            return CommandResult::failure_json(ExitCode::InvalidGraph, error, None);
-        }
-        templates::template_path(&repo, name)
-    } else {
-        target
-    };
-    let graph = match Graph::from_path(&path) {
-        Ok(graph) => graph,
+    let source = match resolve_graph_edit_source(&target, &repo, update_mode) {
+        Ok(source) => source,
         Err(error) => {
+            let message = format!(
+                "failed to load graph for editing: {error}\nTry 'gloop graph list' to see available names and files."
+            );
+            if !json_mode {
+                return CommandResult::failure_text(ExitCode::InvalidGraph, message);
+            }
             return CommandResult::failure_json(
                 ExitCode::InvalidGraph,
                 "failed to load graph for editing",
-                Some(json!({"path": path, "error": error.to_string()})),
+                Some(json!({
+                    "target": target,
+                    "error": error,
+                    "hint": "use 'gloop graph list' to see available names and files",
+                })),
             );
         }
     };
@@ -1201,22 +1597,13 @@ pub async fn graph_edit(
     };
 
     if gui_mode {
-        let expected_sha256 = match gui::file_sha256(&path) {
-            Ok(value) => Some(value),
-            Err(error) => {
-                return CommandResult::failure_json(
-                    ExitCode::InvalidGraph,
-                    "failed to fingerprint graph before GUI editing",
-                    Some(json!({"path": path, "error": error.to_string()})),
-                );
-            }
-        };
         return graph_gui(
-            graph,
-            gui_profile_options(&profiles),
+            source.graph,
+            gui_profile_options(&profiles, &known_models_for_repo(&repo)),
             GuiTarget::GraphFile {
-                path,
-                expected_sha256,
+                path: source.path,
+                expected_sha256: source.expected_sha256,
+                create_only: source.create_only,
             },
             language,
             json_mode,
@@ -1224,11 +1611,16 @@ pub async fn graph_edit(
         .await;
     }
 
+    if language == Language::Ja {
+        eprintln!(
+            "TUI is English-only. Use --gui for the Japanese editor. / TUIは英語のみです。日本語エディタは --gui を使ってください。"
+        );
+    }
     let persist = wizard::EditorPersistTarget::GraphFile {
-        path: path.clone(),
-        force: true,
+        path: source.path.clone(),
+        force: !source.create_only,
     };
-    let edited = match wizard::interactive_edit_graph(graph, &profiles, &persist) {
+    let edited = match wizard::interactive_edit_graph(source.graph, &profiles, &persist) {
         Ok(graph) => graph,
         Err(error) => {
             return CommandResult::failure_json(
@@ -1243,12 +1635,12 @@ pub async fn graph_edit(
     if json_mode {
         CommandResult::success_json(json!({
             "success": true,
-            "written": path,
+            "written": source.path,
             "warnings": warnings,
             "validation": issues,
         }))
     } else {
-        CommandResult::success_text(format!("saved graph to {}", path.display()))
+        CommandResult::success_text(format!("saved graph to {}", source.path.display()))
     }
 }
 
@@ -1284,12 +1676,16 @@ async fn graph_gui(
     if json_mode {
         CommandResult::success_json(json!({
             "success": true,
+            "saved": result.written.is_some(),
             "written": result.written,
             "warnings": warnings,
             "validation": issues,
         }))
     } else {
-        CommandResult::success_text(format!("saved graph to {}", result.written.display()))
+        match result.written {
+            Some(path) => CommandResult::success_text(format!("saved graph to {}", path.display())),
+            None => CommandResult::success_text("closed graph editor without saving"),
+        }
     }
 }
 
@@ -2067,7 +2463,9 @@ pub fn present(result: CommandResult, json_mode: bool) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gloop_core::Graph;
     use std::path::PathBuf;
+    use tempfile::tempdir;
 
     #[tokio::test]
     async fn interactive_graph_new_rejects_unconsumed_template_seeds() {
@@ -2095,5 +2493,54 @@ mod tests {
             .and_then(Value::as_str)
             .expect("structured error");
         assert!(error.contains("--interactive does not accept"));
+    }
+
+    #[test]
+    fn edit_resolves_builtin_template_to_safe_new_graph_path() {
+        let repo = tempdir().expect("temp repo");
+        let source = resolve_graph_edit_source(
+            PathBuf::from("plan-implement-verify").as_path(),
+            repo.path(),
+            false,
+        )
+        .expect("built-in template should resolve");
+
+        assert!(source.create_only);
+        assert!(source.expected_sha256.is_none());
+        assert_eq!(
+            source.path,
+            repo.path().join(".gloop/graphs/plan-implement-verify.yaml")
+        );
+        assert_eq!(source.graph.spec.nodes.len(), 3);
+    }
+
+    #[test]
+    fn edit_reuses_materialized_builtin_graph_after_first_save() {
+        let repo = tempdir().expect("temp repo");
+        let path = templates::graph_path(repo.path(), "direct");
+        let graph = Graph::new("direct", "saved goal", vec![]);
+        std::fs::create_dir_all(path.parent().expect("graph parent")).expect("create graph parent");
+        std::fs::write(&path, graph.to_yaml().expect("serialize graph")).expect("write graph");
+
+        let source =
+            resolve_graph_edit_source(PathBuf::from("direct").as_path(), repo.path(), false)
+                .expect("materialized graph should resolve");
+
+        assert!(!source.create_only);
+        assert!(source.expected_sha256.is_some());
+        assert_eq!(source.graph.spec.goal, "saved goal");
+    }
+
+    #[test]
+    fn update_keeps_builtins_read_only() {
+        let repo = tempdir().expect("temp repo");
+        let error = resolve_graph_edit_source(
+            PathBuf::from("plan-implement-verify").as_path(),
+            repo.path(),
+            true,
+        )
+        .expect_err("update must not materialize a built-in");
+
+        assert!(error.contains("use 'graph edit plan-implement-verify'"));
     }
 }
