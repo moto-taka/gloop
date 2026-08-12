@@ -151,7 +151,7 @@ fn build_profile(name: &str, version: &str, marker: &str, timeout: bool) -> Prof
         timeout_seconds: None,
         capabilities: gloop_provider::AdapterCapabilities::text(),
         kind: ProfileKind::Command(CommandProfile {
-            version_args: vec!["--version".to_owned()],
+            version_args: vec!["-c".to_owned(), "exit 0".to_owned()],
             argv: vec!["sh".to_owned(), "-c".to_owned(), script],
             ..CommandProfile::new(vec!["noop".to_owned()])
         }),
