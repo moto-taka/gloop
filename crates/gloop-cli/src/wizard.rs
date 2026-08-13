@@ -566,16 +566,12 @@ fn direct_template(
     request: Option<String>,
     profiles: &[String],
 ) -> Graph {
-    let request = request.unwrap_or_else(|| "complete the requested task".to_owned());
+    let request = request.unwrap_or_else(|| "Complete the requested task".to_owned());
+    let prompt = format!("Complete this request and return the result:\n{request}");
     Graph::new(
         name,
         goal,
-        vec![agent_node(
-            "request",
-            &format!("Act as an assistant and complete this request:\n{request}"),
-            profiles.first().cloned(),
-            1,
-        )],
+        vec![agent_node("request", &prompt, profiles.first().cloned(), 1)],
     )
 }
 
@@ -3148,8 +3144,8 @@ mod tests {
     };
     use super::{parse_argv, synthesize_node};
     use gloop_core::{
-        ContextSpec, FailurePolicy, IssueSeverity, LoopCondition, OutputFormat, RetryPolicy,
-        RunBudgets, WorkspaceSpec,
+        ContextSpec, FailurePolicy, IssueSeverity, LoopCondition, OutputFormat, PromptSpec,
+        RetryPolicy, RunBudgets, WorkspaceSpec,
     };
     use serde_json::json;
     use std::fs;
@@ -3212,6 +3208,19 @@ mod tests {
             for node in &graph.spec.nodes {
                 assert_no_profiles(&node.kind);
             }
+        }
+    }
+
+    #[test]
+    fn builtin_direct_template_without_request_remains_valid() {
+        let graph = template_graph("t", "", GraphTemplate::Direct, None, None, None);
+
+        match &graph.spec.nodes[0].kind {
+            NodeKind::Agent {
+                prompt: PromptSpec::Inline(prompt),
+                ..
+            } => assert!(prompt.contains("Complete the requested task")),
+            _ => panic!("direct template must contain one agent node"),
         }
     }
 

@@ -175,6 +175,7 @@ impl ProviderInvoker for SerializedStartInvoker {
                     stderr: String::new(),
                     exit_code: Some(0),
                     reported_model: model,
+                    reported_model_informational: false,
                     usage: Some(TokenUsage::default()),
                 };
                 Ok(ProviderInvocation {
@@ -259,6 +260,7 @@ impl ProviderInvoker for TestInvoker {
                     stderr: String::new(),
                     exit_code: Some(0),
                     reported_model: model,
+                    reported_model_informational: false,
                     usage: Some(TokenUsage::default()),
                 };
                 Ok(ProviderInvocation {

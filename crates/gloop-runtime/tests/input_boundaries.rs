@@ -94,6 +94,7 @@ impl ProviderInvoker for TestInvoker {
                 stderr: String::new(),
                 exit_code: Some(0),
                 reported_model: None,
+                reported_model_informational: false,
                 usage: Some(TokenUsage::default()),
             },
         })

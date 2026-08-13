@@ -2657,6 +2657,7 @@ async fn normalize_provider_response(
         stderr,
         exit_code,
         reported_model,
+        reported_model_informational,
         ..
     } = response;
     let output_is_json = output.format == GraphOutputFormat::Json
@@ -2688,6 +2689,7 @@ async fn normalize_provider_response(
     }
 
     if let (Some(reported), Some(requested)) = (&reported_model, &effective_model)
+        && !reported_model_informational
         && reported != requested
     {
         return Err(provider_response_failure(
@@ -2758,13 +2760,18 @@ async fn normalize_provider_response(
             ));
         }
     };
-    let model_verified = reported_model.is_some();
+    let model_verified = reported_model.is_some() && !reported_model_informational;
+    let model = if reported_model_informational {
+        effective_model
+    } else {
+        reported_model.or(effective_model)
+    };
     Ok(NormalizedProviderOutput {
         value: validated.value,
         raw_output: validated.raw,
         stdout: stdout.into_bytes(),
         stderr: stderr.into_bytes(),
-        model: reported_model.or(effective_model),
+        model,
         model_verified,
     })
 }
@@ -3153,6 +3160,7 @@ mod tests {
                     stderr: String::new(),
                     exit_code: Some(0),
                     reported_model: Some("fake-model".to_owned()),
+                    reported_model_informational: false,
                     usage: Some(TokenUsage::default()),
                 },
             })

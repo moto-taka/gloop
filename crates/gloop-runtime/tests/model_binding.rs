@@ -107,6 +107,7 @@ impl ProviderInvoker for FakeProviderInvoker {
                 stderr: String::new(),
                 exit_code: Some(0),
                 reported_model: scripted.model,
+                reported_model_informational: false,
                 usage: Some(TokenUsage::default()),
             },
         })

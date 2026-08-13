@@ -90,6 +90,7 @@ fn build_graph_and_bad_response() -> (gloop_core::Graph, serde_json::Value, Adap
         stderr: "provider stderr sample\n".to_owned(),
         exit_code: Some(0),
         reported_model: Some("provider-model".to_owned()),
+        reported_model_informational: false,
         usage: Some(TokenUsage::default()),
     };
     (graph, bad_output, response)

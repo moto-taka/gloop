@@ -18,10 +18,11 @@ checking the list.
 2. Pick one name or file from the output.
 3. For a visual editor, run:
    gloop graph edit NAME --gui
-4. In the browser, click a step and choose what it should do. To add one, click
-   a card on the left or drag it onto the middle canvas. To connect steps, click
-   the right dot of one card and then the left dot of another. If unsure, keep
-   the suggested AI/app and model, then press Save.
+4. In the browser, click a step and configure its name and processing details.
+   To add one, choose AI processing, command execution, result verification,
+   or an approval checkpoint on the left. To connect steps, click the right
+   output of one card and then the left input of another. If unsure, keep the
+   execution tool and model at their defaults, then press Save.
 5. Validate the saved path shown by gloop:
    gloop graph validate PATH
 6. Run it only after validation succeeds:
@@ -73,14 +74,25 @@ gloop graph edit NAME --gui --lang ja
 
 The browser editor looks like a simple flow board:
 
-- left: add "Ask AI", "Run a command", "Check the answer", or "Ask a person";
+- left: add "AI processing", "Command execution", "Result verification", or
+  "Approval checkpoint";
 - middle: see the whole flow, drag cards to arrange them, and connect dots;
-- right: change the selected card's instruction, helper, and model.
+- right: set the selected step's display name, instructions, execution tool,
+  and model. Choose automatic to keep the runtime default, or select a named
+  tool before choosing one of its models. Model choices come from the selected
+  execution tool's defaults and discovered CLI list (when supported). Existing
+  custom model IDs remain editable under Technical settings.
+  If listing fails or the tool has no list command, use Technical settings →
+  Custom model ID.
 
 The flow name and goal are visible on the right when no card is selected. Node
-ids, edge kinds, fan-out, and other technical fields are under "More settings"
-/ "くわしい設定（上級者向け）". Do not open those settings unless the person
+ids, edge kinds, fan-out, and other technical fields are under "Technical settings"
+/ "技術設定". Do not open those settings unless the person
 specifically asks for them.
+
+For command execution and result verification, enter the command exactly as it
+would be written in a terminal, for example `cargo test --workspace`. The GUI
+splits the executable and arguments safely when saving.
 
 ## Important rules for an assistant
 
@@ -91,8 +103,8 @@ specifically asks for them.
   under .gloop/graphs/.
 - If the GUI reports that the file changed while it was open, reload it and
   save again; do not force the old copy over the new one.
-- A Harness is the execution program or provider profile. A Model is the model
-  identifier passed to that harness. If unsure, select an enabled profile and
-  one of the offered model defaults.
+- An execution tool is the local CLI or provider profile that runs an AI step.
+  A model is the model identifier passed to that tool. If unsure, keep both at
+  their defaults.
 - If a command fails, preserve the complete error, fix only the stated issue,
   and retry once. Do not silently fall back to another harness or model.

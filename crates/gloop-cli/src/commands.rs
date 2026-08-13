@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt, io,
     path::{Path, PathBuf},
 };
@@ -7,11 +7,13 @@ use std::{
 use anyhow::Result;
 use clap::ValueEnum;
 use gloop_core::{
-    FinalStatus, Graph, IssueSeverity, NodeKind, NodeStatus, RunEvent, RunSummary, ValidationIssue,
+    FinalStatus, Graph, IssueSeverity, NodeKind, NodeStatus, PromptSpec, RunEvent, RunSummary,
+    ValidationIssue,
 };
 use gloop_provider::{
-    AdapterError, ConfigError, PROJECT_CONFIG_PATH, Profile, ProfileKind, ProfileStore,
-    ProviderRegistry,
+    AdapterCapability, AdapterError, CatalogFamily, CatalogModel, ConfigError, ModelDiscovery,
+    PROJECT_CONFIG_PATH, Profile, ProfileKind, ProfileStore, ProviderRegistry,
+    catalog_family_for_argv0, discover_models_for_argv0, merge_profile_models,
 };
 use gloop_runtime::{
     JournalError, JournalRead, NodeFailureClass, ProgressEvent, ReplayError, ReplayReport,
@@ -399,47 +401,149 @@ pub fn build_profile_choices(
     Ok(choices)
 }
 
-fn gui_profile_options(
+async fn gui_profile_options(
+    repo: &Path,
+    trust_project_profiles: bool,
     choices: &[wizard::ProfileChoice],
-    known_models: &[String],
-) -> Vec<gui::ProfileOption> {
-    choices
+) -> Result<Vec<gui::ProfileOption>, ConfigError> {
+    let store = load_profiles_for_repo(repo, trust_project_profiles)?;
+    let runtime_default = store
         .iter()
-        .map(|choice| gui::ProfileOption {
-            name: choice.name.clone(),
-            kind: choice.kind.clone(),
-            enabled: choice.enabled,
-            default_model: choice.default_model.clone(),
-            known_models: known_models.to_vec(),
+        .filter(|(_, profile)| {
+            profile.enabled && profile.capabilities.contains(AdapterCapability::TextOutput)
         })
-        .collect()
+        .fold(
+            None,
+            |selected: Option<(&str, i32)>, (name, profile)| match selected {
+                Some((_, priority)) if priority >= profile.priority => selected,
+                _ => Some((name, profile.priority)),
+            },
+        )
+        .map(|(name, _)| name.to_owned());
+    let mut cache: HashMap<(CatalogFamily, String), ModelDiscovery> = HashMap::new();
+    let mut jobs = Vec::new();
+    for choice in choices {
+        let Some(profile) = store.get(&choice.name) else {
+            continue;
+        };
+        if !choice.enabled {
+            continue;
+        }
+        let ProfileKind::Command(command) = &profile.kind else {
+            continue;
+        };
+        if command.model_args.is_empty() {
+            continue;
+        }
+        let Some(argv0) = command.argv.first() else {
+            continue;
+        };
+        let Some(family) = catalog_family_for_argv0(argv0) else {
+            continue;
+        };
+        let key = (family, argv0.clone());
+        if !cache.contains_key(&key) && !jobs.iter().any(|job| job == &key) {
+            jobs.push(key);
+        }
+    }
+    let mut pending_discoveries = Vec::new();
+    for (family, argv0) in jobs {
+        pending_discoveries.push(tokio::spawn(async move {
+            let discovery = discover_models_for_argv0(&argv0).await;
+            ((family, argv0), discovery)
+        }));
+    }
+    for handle in pending_discoveries {
+        let (key, discovery) = handle.await.map_err(|error| ConfigError::InvalidProfile {
+            profile: "model-discovery".to_owned(),
+            message: format!("task failed: {error}"),
+        })?;
+        cache.insert(key, discovery);
+    }
+
+    Ok(choices
+        .iter()
+        .map(|choice| {
+            let default_model = choice.default_model.clone();
+            let (models, discovery, discovery_error) = match store.get(&choice.name) {
+                Some(profile) => profile_model_catalog(profile, &cache, default_model.as_deref()),
+                None => (
+                    merge_profile_models(default_model.as_deref(), &[], &[]),
+                    "unsupported".to_owned(),
+                    None,
+                ),
+            };
+            gui::ProfileOption {
+                name: choice.name.clone(),
+                kind: choice.kind.clone(),
+                enabled: choice.enabled,
+                runtime_default: runtime_default.as_deref() == Some(choice.name.as_str()),
+                default_model,
+                models,
+                discovery,
+                discovery_error,
+            }
+        })
+        .collect())
 }
 
-fn known_models_for_repo(repo: &Path) -> Vec<String> {
-    let mut models = std::collections::BTreeSet::new();
-    let mut add_graph_models = |graph: Graph| {
-        for node in graph.spec.nodes {
-            if let Some(model) = node.model().filter(|model| !model.trim().is_empty()) {
-                models.insert(model.to_owned());
+fn profile_model_catalog(
+    profile: &Profile,
+    cache: &HashMap<(CatalogFamily, String), ModelDiscovery>,
+    default_model: Option<&str>,
+) -> (Vec<CatalogModel>, String, Option<String>) {
+    match &profile.kind {
+        ProfileKind::OpenAi(openai) => (
+            merge_profile_models(Some(&openai.model), &[], &[]),
+            "unsupported".to_owned(),
+            None,
+        ),
+        ProfileKind::Anthropic(anthropic) => (
+            merge_profile_models(Some(&anthropic.model), &[], &[]),
+            "unsupported".to_owned(),
+            None,
+        ),
+        ProfileKind::Command(command) => {
+            if command.model_args.is_empty() {
+                return (
+                    merge_profile_models(default_model, &[], &[]),
+                    "unsupported".to_owned(),
+                    None,
+                );
             }
-        }
-    };
-
-    if let Ok(paths) = templates::list_graph_files(repo) {
-        for path in paths {
-            if let Ok(graph) = Graph::from_path(path) {
-                add_graph_models(graph);
+            let Some(argv0) = command.argv.first() else {
+                return (
+                    merge_profile_models(default_model, &[], &[]),
+                    "unsupported".to_owned(),
+                    None,
+                );
+            };
+            let Some(family) = catalog_family_for_argv0(argv0) else {
+                return (
+                    merge_profile_models(default_model, &[], &[]),
+                    "unsupported".to_owned(),
+                    None,
+                );
+            };
+            match cache.get(&(family, argv0.clone())) {
+                Some(ModelDiscovery::Listed(discovered)) => (
+                    merge_profile_models(default_model, discovered, &[]),
+                    "listed".to_owned(),
+                    None,
+                ),
+                Some(ModelDiscovery::Failed { reason }) => (
+                    merge_profile_models(default_model, &[], &[]),
+                    "failed".to_owned(),
+                    Some(reason.clone()),
+                ),
+                Some(ModelDiscovery::Unsupported) | None => (
+                    merge_profile_models(default_model, &[], &[]),
+                    "unsupported".to_owned(),
+                    None,
+                ),
             }
         }
     }
-    if let Ok(entries) = templates::list_project_templates(repo) {
-        for entry in entries {
-            if let Ok(graph) = Graph::from_path(templates::template_path(repo, &entry.name)) {
-                add_graph_models(graph);
-            }
-        }
-    }
-    models.into_iter().collect()
 }
 
 fn run_error_code(error: &RunError) -> ExitCode {
@@ -949,6 +1053,20 @@ pub async fn graph_new(
     }
 }
 
+fn gui_init_starts_blank(name: Option<&str>, from: Option<&str>, request: Option<&str>) -> bool {
+    name.is_none() && from.is_none() && request.is_none()
+}
+
+fn gui_init_goal(request: Option<&str>, starts_blank: bool) -> String {
+    if starts_blank {
+        String::new()
+    } else {
+        request
+            .unwrap_or(templates::DEFAULT_TEMPLATE_GOAL)
+            .to_owned()
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -981,7 +1099,7 @@ pub async fn graph_init(
             Ok(profiles) => profiles,
             Err(error) => return provider_store_error(error),
         };
-        let initial_name = name.clone().unwrap_or_else(|| "new-graph".to_owned());
+        let initial_name = name.clone().unwrap_or_else(|| "my-workflow".to_owned());
         let initial_template = from
             .as_deref()
             .and_then(GraphTemplateArg::from_name)
@@ -998,20 +1116,37 @@ pub async fn graph_init(
                 None,
             );
         }
+        let starts_blank =
+            gui_init_starts_blank(name.as_deref(), from.as_deref(), request.as_deref());
+        let initial_goal = gui_init_goal(request.as_deref(), starts_blank);
         let mut graph = wizard::template_graph(
             initial_name,
-            templates::DEFAULT_TEMPLATE_GOAL,
+            initial_goal,
             initial_template.to_template(),
             request,
             parse_provider_profiles(provider_profiles),
             loop_cap,
         );
+        if starts_blank && let Some(node) = graph.spec.nodes.first_mut() {
+            node.label = Some(match language {
+                Language::En => "Configure this step".to_owned(),
+                Language::Ja => "処理内容を設定".to_owned(),
+            });
+            if let NodeKind::Agent { prompt, .. } = &mut node.kind {
+                *prompt = PromptSpec::Inline(String::new());
+            }
+        }
         if let Some(description) = description {
             graph.metadata.description = Some(description);
         }
+        let profile_options =
+            match gui_profile_options(&repo, trust_project_profiles, &profiles).await {
+                Ok(options) => options,
+                Err(error) => return provider_store_error(error),
+            };
         return graph_gui(
             graph,
-            gui_profile_options(&profiles, &known_models_for_repo(&repo)),
+            profile_options,
             GuiTarget::ProjectTemplate {
                 repo,
                 force,
@@ -1661,9 +1796,14 @@ pub async fn graph_edit(
     };
 
     if gui_mode {
+        let profile_options =
+            match gui_profile_options(&repo, trust_project_profiles, &profiles).await {
+                Ok(options) => options,
+                Err(error) => return provider_store_error(error),
+            };
         return graph_gui(
             source.graph,
-            gui_profile_options(&profiles, &known_models_for_repo(&repo)),
+            profile_options,
             GuiTarget::GraphFile {
                 path: source.path,
                 expected_sha256: source.expected_sha256,
@@ -2531,6 +2671,24 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::tempdir;
 
+    #[test]
+    fn gui_init_is_blank_only_without_a_name_template_or_request() {
+        assert!(gui_init_starts_blank(None, None, None));
+        assert!(!gui_init_starts_blank(None, None, Some("review this")));
+        assert!(!gui_init_starts_blank(
+            Some("review-flow"),
+            Some("plan-implement-verify"),
+            None,
+        ));
+    }
+
+    #[test]
+    fn gui_init_preserves_explicit_and_template_default_goals() {
+        assert_eq!(gui_init_goal(None, true), "");
+        assert_eq!(gui_init_goal(Some("review this"), false), "review this");
+        assert_eq!(gui_init_goal(None, false), templates::DEFAULT_TEMPLATE_GOAL,);
+    }
+
     #[tokio::test]
     async fn interactive_graph_new_rejects_unconsumed_template_seeds() {
         let result = graph_new(
@@ -2602,12 +2760,9 @@ mod tests {
         let graph = Graph::new("friendly-name", "saved goal", vec![]);
         std::fs::write(&path, graph.to_yaml().expect("serialize graph")).expect("write graph");
 
-        let source = resolve_graph_edit_source(
-            PathBuf::from("friendly-name").as_path(),
-            repo.path(),
-            false,
-        )
-        .expect("metadata name should resolve");
+        let source =
+            resolve_graph_edit_source(PathBuf::from("friendly-name").as_path(), repo.path(), false)
+                .expect("metadata name should resolve");
 
         assert_eq!(source.path, path);
         assert_eq!(source.graph.metadata.name, "friendly-name");
@@ -2625,5 +2780,91 @@ mod tests {
         .expect_err("update must not materialize a built-in");
 
         assert!(error.contains("use 'graph edit plan-implement-verify'"));
+    }
+
+    #[test]
+    fn profile_model_catalog_scopes_models_per_profile() {
+        use gloop_provider::{CatalogFamily, CommandProfile, ModelDiscovery};
+
+        let mut cache = HashMap::new();
+        cache.insert(
+            (CatalogFamily::Pi, "/usr/bin/pi".to_owned()),
+            ModelDiscovery::Listed(vec![CatalogModel::uniform("openai/gpt-4.1")]),
+        );
+        cache.insert(
+            (CatalogFamily::OpenCode, "/usr/bin/opencode".to_owned()),
+            ModelDiscovery::Listed(vec![CatalogModel::uniform("anthropic/claude-fable-5")]),
+        );
+        let pi_profile = Profile {
+            enabled: true,
+            priority: 0,
+            timeout_seconds: None,
+            capabilities: gloop_provider::AdapterCapabilities::default(),
+            kind: ProfileKind::Command({
+                let mut profile = CommandProfile::new(vec!["/usr/bin/pi".to_owned()]);
+                profile.model_args = vec!["--model".to_owned(), "{model}".to_owned()];
+                profile
+            }),
+        };
+        let opencode_profile = Profile {
+            enabled: true,
+            priority: 0,
+            timeout_seconds: None,
+            capabilities: gloop_provider::AdapterCapabilities::default(),
+            kind: ProfileKind::Command({
+                let mut profile = CommandProfile::new(vec!["/usr/bin/opencode".to_owned()]);
+                profile.model_args = vec!["--model".to_owned(), "{model}".to_owned()];
+                profile
+            }),
+        };
+        let (pi_models, _, _) = profile_model_catalog(&pi_profile, &cache, None);
+        let (opencode_models, _, _) = profile_model_catalog(&opencode_profile, &cache, None);
+        assert!(pi_models.iter().any(|model| model.id == "openai/gpt-4.1"));
+        assert!(
+            !pi_models
+                .iter()
+                .any(|model| model.id == "anthropic/claude-fable-5")
+        );
+        assert!(
+            opencode_models
+                .iter()
+                .any(|model| model.id == "anthropic/claude-fable-5")
+        );
+        assert!(
+            !opencode_models
+                .iter()
+                .any(|model| model.id == "openai/gpt-4.1")
+        );
+    }
+
+    #[test]
+    fn http_profiles_mark_discovery_unsupported() {
+        let store = ProfileStore::from_toml_str(
+            r#"
+[profiles.openai]
+kind = "openai"
+model = "gpt-5"
+
+[profiles.anthropic]
+kind = "anthropic"
+model = "claude-opus-4"
+"#,
+        )
+        .expect("http profiles");
+        let openai = store.get("openai").expect("openai profile");
+        let anthropic = store.get("anthropic").expect("anthropic profile");
+        let cache = HashMap::new();
+        let (openai_models, openai_discovery, _) = profile_model_catalog(openai, &cache, None);
+        let (anthropic_models, anthropic_discovery, _) =
+            profile_model_catalog(anthropic, &cache, None);
+        assert_eq!(openai_discovery, "unsupported");
+        assert_eq!(anthropic_discovery, "unsupported");
+        assert!(openai_models.iter().any(|model| model.id == "gpt-5"));
+        assert!(!openai_models.iter().any(|model| model.id == "custom"));
+        assert!(
+            anthropic_models
+                .iter()
+                .any(|model| model.id == "claude-opus-4")
+        );
     }
 }

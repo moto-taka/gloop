@@ -528,9 +528,9 @@ fn probe_unavailable_error(probe: &ProbeResult) -> AdapterError {
 }
 
 #[derive(Debug)]
-struct CappedBytes {
-    bytes: Vec<u8>,
-    overflow: bool,
+pub(crate) struct CappedBytes {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) overflow: bool,
 }
 
 enum ProbeOutcome {
@@ -539,7 +539,7 @@ enum ProbeOutcome {
     TimedOut,
 }
 
-async fn drain_capped(
+pub(crate) async fn drain_capped(
     mut reader: impl AsyncRead + Unpin,
     limit: usize,
 ) -> std::io::Result<CappedBytes> {

@@ -64,6 +64,7 @@ impl ProviderInvoker for TestInvoker {
                 stderr: String::new(),
                 exit_code: Some(0),
                 reported_model: Some("model".to_owned()),
+                reported_model_informational: false,
                 usage: Some(TokenUsage::default()),
             },
         })
@@ -111,6 +112,7 @@ impl ProviderInvoker for RetryInvoker {
                 stderr: String::new(),
                 exit_code: Some(0),
                 reported_model: Some("model".to_owned()),
+                reported_model_informational: false,
                 usage: Some(TokenUsage::default()),
             },
         })

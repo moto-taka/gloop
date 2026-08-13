@@ -39,6 +39,7 @@ enum Invocation {
         output: AdapterOutput,
         selected_model: Option<String>,
         reported_model: Option<String>,
+        reported_model_informational: bool,
         stdout: String,
         stderr: String,
     },
@@ -171,6 +172,7 @@ impl ProviderInvoker for TestInvoker {
                     stderr: String::new(),
                     exit_code: Some(0),
                     reported_model: None,
+                    reported_model_informational: false,
                     usage: Some(TokenUsage::default()),
                 },
             }),
@@ -179,6 +181,7 @@ impl ProviderInvoker for TestInvoker {
                 output,
                 selected_model,
                 reported_model,
+                reported_model_informational,
                 stdout,
                 stderr,
             } => Ok(ProviderInvocation {
@@ -196,6 +199,7 @@ impl ProviderInvoker for TestInvoker {
                     stderr,
                     exit_code: Some(0),
                     reported_model,
+                    reported_model_informational,
                     usage: Some(TokenUsage::default()),
                 },
             }),
@@ -503,6 +507,7 @@ async fn mismatched_reported_model_fails_as_non_retryable_provider_protocol() {
             output: AdapterOutput::Text("valid output".to_owned()),
             selected_model: Some("requested-model".to_owned()),
             reported_model: Some("different-model".to_owned()),
+            reported_model_informational: false,
             stdout: String::new(),
             stderr: String::new(),
         },
@@ -523,6 +528,43 @@ async fn mismatched_reported_model_fails_as_non_retryable_provider_protocol() {
 }
 
 #[tokio::test]
+async fn informational_cursor_reported_model_does_not_fail_provider_protocol() {
+    let temp = tempdir().expect("temp");
+    let mut node = Node::agent("cursor_model", "cursor model");
+    if let NodeKind::Agent { model, .. } = &mut node.kind {
+        *model = Some("gpt-5.6-luna-xhigh".to_owned());
+    }
+    let graph = Graph::new("cursor_model", "cursor model", vec![node]);
+    let invoker = TestInvoker::new(vec![ScriptedInvocation {
+        expect_prompt_fragment: Some("cursor model".to_owned()),
+        wait_for_release: false,
+        invocation: Invocation::Raw {
+            profile: "cursor-agent".to_owned(),
+            output: AdapterOutput::Text("valid output".to_owned()),
+            selected_model: Some("gpt-5.6-luna-xhigh".to_owned()),
+            reported_model: Some("GPT-5.6 Luna 272K Extra High".to_owned()),
+            reported_model_informational: true,
+            stdout: String::new(),
+            stderr: String::new(),
+        },
+    }]);
+
+    let (runtime, options) = runtime_with(Arc::clone(&invoker), &temp);
+    let summary = runtime.run(&graph, options).await.expect("run");
+    let outcome = &summary.nodes["cursor_model"];
+
+    assert_eq!(outcome.status, NodeStatus::Succeeded);
+    assert_eq!(invoker.call_count().await, 1);
+    assert_eq!(summary.models_used.len(), 1);
+    assert_eq!(summary.models_used[0].profile, "cursor-agent");
+    assert_eq!(
+        summary.models_used[0].reported_model.as_deref(),
+        Some("gpt-5.6-luna-xhigh")
+    );
+    assert!(!summary.models_used[0].verified);
+}
+
+#[tokio::test]
 async fn blank_provider_text_fails_once_even_with_rebinds() {
     let temp = tempdir().expect("temp");
     let mut node = Node::agent("blank", "blank response");
@@ -537,6 +579,7 @@ async fn blank_provider_text_fails_once_even_with_rebinds() {
             output: AdapterOutput::Text("  \n\t".to_owned()),
             selected_model: Some("model".to_owned()),
             reported_model: Some("model".to_owned()),
+            reported_model_informational: false,
             stdout: String::new(),
             stderr: String::new(),
         },
@@ -574,6 +617,7 @@ async fn provider_schema_validation_failure_is_non_retryable() {
             output: AdapterOutput::Json(json!("not an integer")),
             selected_model: Some("model".to_owned()),
             reported_model: Some("model".to_owned()),
+            reported_model_informational: false,
             stdout: String::new(),
             stderr: String::new(),
         },
@@ -696,6 +740,7 @@ async fn retained_output_budget_is_global_across_multiple_succeeded_nodes() {
                 output: AdapterOutput::Text("ok".to_owned()),
                 selected_model: Some("m".to_owned()),
                 reported_model: None,
+                reported_model_informational: false,
                 stdout: large.clone(),
                 stderr: String::new(),
             },
@@ -708,6 +753,7 @@ async fn retained_output_budget_is_global_across_multiple_succeeded_nodes() {
                 output: AdapterOutput::Text("ok".to_owned()),
                 selected_model: Some("m".to_owned()),
                 reported_model: None,
+                reported_model_informational: false,
                 stdout: String::new(),
                 stderr: large.clone(),
             },
@@ -720,6 +766,7 @@ async fn retained_output_budget_is_global_across_multiple_succeeded_nodes() {
                 output: AdapterOutput::Text("ok".to_owned()),
                 selected_model: Some("m".to_owned()),
                 reported_model: None,
+                reported_model_informational: false,
                 stdout: large,
                 stderr: String::new(),
             },

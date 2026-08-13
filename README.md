@@ -107,12 +107,15 @@ gloop graph update my-flow --gui
 ~~~
 
 Open the graph in a local browser with an n8n-style visual editor. The screen
-has three simple areas: choose a step on the left, see the whole flow in the
-middle, and edit the selected step on the right. Click a palette card to add
-it, drag cards to move them, and click the right dot then the left dot to draw
-a connection. Technical fields stay behind "More settings". The editor only
-binds to loopback, shows enabled AI/app choices and known model defaults, and
-writes through gloop's normal validation and atomic-save path:
+has three areas: choose a processing type on the left, see the whole workflow
+in the middle, and configure the selected step on the right. Available types
+are AI processing, local command execution, result verification, and a human
+approval checkpoint. Each new step starts with a descriptive name, empty saved
+input, and a realistic placeholder example instead of a hidden no-op value.
+Technical fields stay behind "Technical settings". The editor only binds to loopback, shows enabled
+execution tools with per-tool model choices (discovered at launch from each CLI's supported list
+command when available), and writes through gloop's normal
+validation and atomic-save path:
 
 ```bash
 gloop graph init --gui --lang en
@@ -332,7 +335,9 @@ See [docs/SCHEMA.md](docs/SCHEMA.md) and the graphs in [examples](examples).
 - Worktree mode disables hooks, external filesystem monitors, and external diff/textconv helpers. It re-checks and rejects repository-local `filter.*.clean`, `filter.*.smudge`, `filter.*.process`, `diff.*.command`, and `diff.*.textconv` configuration before Git operations because those programs could otherwise execute during checkout/staging/inspection; use `current`/`inherit` or remove the local driver configuration.
 - Final successful worktree nodes can auto-commit into their dedicated branch when `auto_commit` is enabled, and `inherit` reuses the true source workspace by identity.
 - Cancellation is process-group based on Unix builds (`ProcessGroup`) and direct-child on non-Unix platforms.
-- Profiles accept arbitrary model ids and aliases, but gloop does not yet enumerate remote provider model catalogs or resume native harness sessions; each node invocation is fresh.
+- Profiles accept arbitrary model ids and aliases. Supported command profiles can
+  expose their current model list in the GUI; remote provider catalogs are still
+  not enumerated, and each node invocation is fresh.
 - Empty model/provider outputs are rejected when they do not satisfy node output contracts (including text/JSON output mode checks).
 - Serialized HTTP provider request bodies are capped at 1 MiB; profile `parameters` maps are capped at 256 entries and 256 KiB serialized.
 - Replay validates hash-chain integrity, run-id/sequence order, and schema compatibility before accepting a rerun; replay rehydrates scheduler state from events and summary checks. These unkeyed hashes detect partial/corrupt edits, not a same-user attacker who can consistently rewrite the whole run directory.

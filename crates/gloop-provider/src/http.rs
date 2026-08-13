@@ -388,6 +388,7 @@ fn parse_openai_response(
         stderr: String::new(),
         exit_code: None,
         reported_model,
+        reported_model_informational: false,
         usage,
     })
 }
@@ -414,6 +415,7 @@ fn parse_anthropic_response(
         stderr: String::new(),
         exit_code: None,
         reported_model,
+        reported_model_informational: false,
         usage,
     })
 }

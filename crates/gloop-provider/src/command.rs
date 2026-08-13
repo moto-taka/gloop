@@ -391,6 +391,9 @@ impl ProviderAdapter for CommandAdapter {
             stderr,
             exit_code: status.code(),
             reported_model,
+            reported_model_informational: crate::models::executable_basename(&executable)
+                == Some("cursor-agent")
+                && request.model.is_some(),
             usage,
         })
     }
@@ -1317,6 +1320,70 @@ mod tests {
             .expect("command succeeds");
         assert_eq!(response.output.as_text(), Some("ok"));
         println!("ENVIRONMENT_ISOLATION_PROBE_OK");
+    }
+
+    #[tokio::test]
+    async fn cursor_agent_reported_model_is_informational_when_explicit_model_requested() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cursor-agent");
+        fs::write(
+            &path,
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\",\"model\":\"GPT-5.6 Luna 272K Extra High\"}'\n",
+        )
+        .expect("script");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let mut command = CommandProfile::new(vec![path.to_string_lossy().into_owned()]);
+        command.model_args = vec!["--model".to_owned(), "{model}".to_owned()];
+        command.prompt_mode = CommandPromptMode::Argument;
+        command.prompt_args = vec!["--".to_owned(), "{prompt}".to_owned()];
+        command.output = OutputFormat::JsonLines;
+        command.output_pointer = Some("/result".to_owned());
+        let capabilities = AdapterCapabilities::new([
+            crate::adapter::AdapterCapability::TextOutput,
+            crate::adapter::AdapterCapability::JsonLinesOutput,
+            crate::adapter::AdapterCapability::ModelSelection,
+        ]);
+        let adapter = adapter(command, capabilities);
+        let mut request = AdapterRequest::new("ok");
+        request.model = Some("gpt-5.6-luna-xhigh".to_owned());
+        let response = adapter
+            .execute(request, CancellationToken::new(), None)
+            .await
+            .expect("command succeeds");
+        assert!(response.reported_model_informational);
+        assert_eq!(
+            response.reported_model.as_deref(),
+            Some("GPT-5.6 Luna 272K Extra High")
+        );
+    }
+
+    #[tokio::test]
+    async fn non_cursor_command_does_not_mark_reported_model_informational() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("pi");
+        fs::write(&path, "#!/bin/sh\nprintf '%s\\n' 'done'\n").expect("script");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let mut command = CommandProfile::new(vec![path.to_string_lossy().into_owned()]);
+        command.model_args = vec!["--model".to_owned(), "{model}".to_owned()];
+        command.prompt_mode = CommandPromptMode::Argument;
+        command.prompt_args = vec!["--".to_owned(), "{prompt}".to_owned()];
+        command.output = OutputFormat::Text;
+        let capabilities = AdapterCapabilities::new([
+            crate::adapter::AdapterCapability::TextOutput,
+            crate::adapter::AdapterCapability::ModelSelection,
+        ]);
+        let adapter = adapter(command, capabilities);
+        let mut request = AdapterRequest::new("ok");
+        request.model = Some("openai/gpt-4.1".to_owned());
+        let response = adapter
+            .execute(request, CancellationToken::new(), None)
+            .await
+            .expect("command succeeds");
+        assert!(!response.reported_model_informational);
     }
 
     #[tokio::test]

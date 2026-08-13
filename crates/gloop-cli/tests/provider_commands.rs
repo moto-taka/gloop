@@ -253,9 +253,13 @@ fn provider_doctor_json_reports_healthy_when_optional_builtins_are_absent() {
     assert_eq!(value["success"].as_bool(), Some(true));
     assert_eq!(value["healthy"].as_bool(), Some(true));
     assert!(value["checks"].as_array().is_some());
-    assert!(value["checks"].as_array().unwrap().iter().any(|check| {
-        check["profile"] == "opencode" && check["available"] == false
-    }));
+    assert!(
+        value["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| { check["profile"] == "opencode" && check["available"] == false })
+    );
 }
 
 #[test]
