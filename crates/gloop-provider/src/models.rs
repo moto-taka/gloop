@@ -1,9 +1,14 @@
 //! Bounded CLI model-list discovery for command profiles.
 
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{path::Path, process::Stdio, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
-use tokio::{process::Command, time};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::Command,
+    sync::Mutex,
+    time,
+};
 
 use crate::command::apply_isolated_environment;
 
@@ -11,6 +16,7 @@ const MODEL_LIST_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_MODEL_LIST_OUTPUT: usize = 256 * 1024;
 const MAX_DISCOVERED_MODELS: usize = 512;
 const MAX_MODEL_ID_BYTES: usize = 128;
+type CappedCapture = Arc<Mutex<crate::registry::CappedBytes>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogModel {
@@ -115,10 +121,10 @@ pub async fn discover_models_for_argv0(argv0: &str) -> ModelDiscovery {
     let process_group = child.id();
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
-    let mut stdout_task =
-        tokio::spawn(crate::registry::drain_capped(stdout, MAX_MODEL_LIST_OUTPUT));
-    let mut stderr_task =
-        tokio::spawn(crate::registry::drain_capped(stderr, MAX_MODEL_LIST_OUTPUT));
+    let stdout_capture = new_capped_capture(MAX_MODEL_LIST_OUTPUT);
+    let stderr_capture = new_capped_capture(MAX_MODEL_LIST_OUTPUT);
+    let mut stdout_task = spawn_capped_drain(stdout, MAX_MODEL_LIST_OUTPUT, &stdout_capture);
+    let mut stderr_task = spawn_capped_drain(stderr, MAX_MODEL_LIST_OUTPUT, &stderr_capture);
 
     let wait_outcome = time::timeout_at(deadline, child.wait()).await;
     let status = match wait_outcome {
@@ -133,7 +139,7 @@ pub async fn discover_models_for_argv0(argv0: &str) -> ModelDiscovery {
             terminate_child(&mut child, process_group).await;
             abort_drains(&mut stdout_task, &mut stderr_task).await;
             return ModelDiscovery::Failed {
-                reason: "timed out".to_owned(),
+                reason: capture_failure_reason(&stderr_capture, "timed out").await,
             };
         }
     };
@@ -155,6 +161,11 @@ pub async fn discover_models_for_argv0(argv0: &str) -> ModelDiscovery {
         Err(_) => {
             terminate_child(&mut child, process_group).await;
             abort_drains(&mut stdout_task, &mut stderr_task).await;
+            if !status.success() {
+                return ModelDiscovery::Failed {
+                    reason: capture_failure_reason(&stderr_capture, "timed out").await,
+                };
+            }
             return ModelDiscovery::Failed {
                 reason: "timed out".to_owned(),
             };
@@ -196,6 +207,57 @@ async fn abort_drain(
     }
     task.abort();
     let _ = task.await;
+}
+
+fn new_capped_capture(limit: usize) -> CappedCapture {
+    Arc::new(Mutex::new(crate::registry::CappedBytes {
+        bytes: Vec::with_capacity(limit),
+        overflow: false,
+    }))
+}
+
+fn spawn_capped_drain(
+    reader: impl AsyncRead + Unpin + Send + 'static,
+    limit: usize,
+    capture: &CappedCapture,
+) -> tokio::task::JoinHandle<std::io::Result<crate::registry::CappedBytes>> {
+    tokio::spawn(drain_capped_with_capture(
+        reader,
+        limit,
+        Arc::clone(capture),
+    ))
+}
+
+async fn drain_capped_with_capture(
+    mut reader: impl AsyncRead + Unpin,
+    limit: usize,
+    capture: CappedCapture,
+) -> std::io::Result<crate::registry::CappedBytes> {
+    let mut buffer = [0_u8; 1024];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let mut captured = capture.lock().await;
+        let retained = limit.saturating_sub(captured.bytes.len()).min(read);
+        captured.bytes.extend_from_slice(&buffer[..retained]);
+        captured.overflow |= retained < read;
+    }
+    let captured = capture.lock().await;
+    Ok(crate::registry::CappedBytes {
+        bytes: captured.bytes.clone(),
+        overflow: captured.overflow,
+    })
+}
+
+async fn capture_failure_reason(capture: &CappedCapture, fallback: &str) -> String {
+    let captured = capture.lock().await;
+    let snippet = String::from_utf8_lossy(&captured.bytes);
+    snippet
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map_or_else(|| fallback.to_owned(), |line| line.trim().to_owned())
 }
 
 async fn join_drain(
