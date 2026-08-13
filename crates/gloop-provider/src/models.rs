@@ -184,10 +184,18 @@ async fn abort_drains(
     stdout_task: &mut tokio::task::JoinHandle<std::io::Result<crate::registry::CappedBytes>>,
     stderr_task: &mut tokio::task::JoinHandle<std::io::Result<crate::registry::CappedBytes>>,
 ) {
-    stdout_task.abort();
-    stderr_task.abort();
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
+    abort_drain(stdout_task).await;
+    abort_drain(stderr_task).await;
+}
+
+async fn abort_drain(
+    task: &mut tokio::task::JoinHandle<std::io::Result<crate::registry::CappedBytes>>,
+) {
+    if task.is_finished() {
+        return;
+    }
+    task.abort();
+    let _ = task.await;
 }
 
 async fn join_drain(
