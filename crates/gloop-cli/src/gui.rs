@@ -44,6 +44,7 @@ const SOCKET_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_READ_DEADLINE: Duration = Duration::from_secs(30);
 const CLOSE_IDLE_GRACE: Duration = Duration::from_millis(250);
 const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_REJECTED_BODY_DISCARD_BYTES: usize = 64 * 1024;
 const IDLE_CAPACITY_REJECTION_BODY: &[u8] = br#"{"error":"idle connection capacity exceeded"}"#;
 
 #[derive(Debug, Clone, Copy)]
@@ -213,6 +214,24 @@ fn reject_unclassified_idle(mut stream: TcpStream) {
     payload.extend_from_slice(IDLE_CAPACITY_REJECTION_BODY);
     let _ = stream.write(&payload);
     let _ = stream.shutdown(std::net::Shutdown::Both);
+}
+
+fn discard_available_rejected_bytes(stream: &mut TcpStream) {
+    if stream.set_nonblocking(true).is_err() {
+        return;
+    }
+    let mut buffer = [0_u8; 8192];
+    let mut remaining = MAX_REJECTED_BODY_DISCARD_BYTES;
+    while remaining > 0 {
+        let length = remaining.min(buffer.len());
+        match stream.read(&mut buffer[..length]) {
+            Ok(0) => break,
+            Ok(read) => remaining -= read,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        }
+    }
+    let _ = stream.set_nonblocking(false);
 }
 
 fn register_accept_order(
@@ -587,6 +606,10 @@ fn serve(
                     // consuming them in application code. This keeps an
                     // unauthorized body out of the process while allowing the
                     // response to close cleanly instead of causing a TCP reset.
+                    // Do not wait for the declared body, but discard bytes that
+                    // are already queued so closing the TCP stream does not
+                    // reset a client that pipelined an unauthorized body.
+                    discard_available_rejected_bytes(&mut stream);
                     let _ = stream.shutdown(Shutdown::Read);
                     let _ = write_response(&mut stream, status, "application/json", &body);
                     let _ = stream.shutdown(Shutdown::Write);
