@@ -589,6 +589,7 @@ fn serve(
                     // response to close cleanly instead of causing a TCP reset.
                     let _ = stream.shutdown(Shutdown::Read);
                     let _ = write_response(&mut stream, status, "application/json", &body);
+                    let _ = stream.shutdown(Shutdown::Write);
                     if is_save {
                         in_flight_saves.remove(&order);
                     }
