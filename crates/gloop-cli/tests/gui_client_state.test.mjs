@@ -134,6 +134,7 @@ function createHarness() {
         defaultModel: 'Use tool default',
         none: 'Choose automatically',
         runtimeDefault: 'runtime default',
+        runtimeDefaultOption: 'Runtime default: {name}',
         profileKinds: { command: 'local CLI', openai: 'OpenAI API', anthropic: 'Anthropic API' },
         saving: 'Saving…',
         saved: 'Saved',
@@ -221,9 +222,6 @@ function createHarness() {
     removeNode() {},
     syncBefore() {},
     changeKind() {},
-    parseArgv(value) {
-      return value ? [value] : [];
-    },
     fresh() {
       return {};
     },
@@ -258,6 +256,9 @@ ${extractFunctions([
     'profileModels',
     'modelLabel',
     'catalogIncludes',
+    'parseArgv',
+    'quoteArg',
+    'formatArgv',
     'renderModelNote',
     'renderModels',
     'profileLabel',
@@ -573,6 +574,8 @@ test('runtime default profile clears a carried custom model', () => {
     },
   };
   harness.selectedId = 'a';
+  harness.runtimeModels = ['legacy-model'];
+  const runtimeModelsBeforeSwitch = [...harness.runtimeModels];
   harness.renderProfiles('writer');
   harness.renderModels(harness.selectedNode());
   harness.$('profile').value = '';
@@ -582,6 +585,7 @@ test('runtime default profile clears a carried custom model', () => {
   assert.equal(harness.selectedNode().model, undefined);
   assert.equal(harness.$('modelAdvanced').value, '');
   assert.equal(harness.$('modelChoice').value, '');
+  assert.deepEqual(harness.runtimeModels, runtimeModelsBeforeSwitch);
 });
 
 test('cursor catalog renders friendly labels while saving ids', () => {
@@ -792,4 +796,33 @@ test('profileModels returns empty catalog without an explicit profile', () => {
     harness.profileModels(harness.profiles[0]).map((model) => model.id),
     ['gpt-5'],
   );
+});
+
+test('command argv formatting round-trips shell-like values', () => {
+  const harness = createHarness();
+  const argv = ['bash', '-c', 'echo "a b"', "it's", 'a\nb', '', 'a\\b'];
+
+  assert.deepEqual([...harness.parseArgv(harness.formatArgv(argv))], argv);
+});
+
+test('save blocks an incomplete new step before writing', async () => {
+  const harness = createHarness();
+  harness.graph = {
+    metadata: { name: 'flow' },
+    spec: {
+      goal: 'goal',
+      nodes: [agentNode('a')],
+      edges: [],
+      policies: {},
+    },
+  };
+  harness.selectedId = 'a';
+  harness.$('prompt').value = '';
+  await harness.save();
+
+  assert.deepEqual(harness.apiCalls, []);
+
+  harness.$('prompt').value = 'do work';
+  await harness.save();
+  assert.deepEqual(harness.apiCalls.map((call) => call.path), ['/api/save']);
 });

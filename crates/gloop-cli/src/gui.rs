@@ -171,6 +171,7 @@ struct DeferredConnection {
 enum ConnectionProbe {
     Idle,
     Request { headers_complete: bool },
+    Closed,
 }
 
 struct PendingRequest {
@@ -233,22 +234,22 @@ fn release_accept_order(order: u64, unresolved_orders: &Arc<std::sync::Mutex<BTr
         .remove(&order);
 }
 
-fn probe_connection(stream: &TcpStream) -> Result<ConnectionProbe> {
-    stream
-        .set_nonblocking(true)
-        .context("configure local GUI connection probe")?;
+fn probe_connection(stream: &TcpStream) -> ConnectionProbe {
+    if stream.set_nonblocking(true).is_err() {
+        return ConnectionProbe::Closed;
+    }
     let mut probe = [0_u8; PROBE_BYTES];
     let result = match stream.peek(&mut probe) {
-        Ok(0) => Ok(ConnectionProbe::Idle),
-        Ok(read) => Ok(ConnectionProbe::Request {
+        Ok(0) => ConnectionProbe::Closed,
+        Ok(read) => ConnectionProbe::Request {
             headers_complete: probe[..read].windows(4).any(|window| window == b"\r\n\r\n"),
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(ConnectionProbe::Idle),
-        Err(source) => Err(source).context("peek local GUI connection"),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => ConnectionProbe::Idle,
+        Err(_) => ConnectionProbe::Closed,
     };
-    stream
-        .set_nonblocking(false)
-        .context("restore local GUI connection blocking mode")?;
+    if stream.set_nonblocking(false).is_err() {
+        return ConnectionProbe::Closed;
+    }
     result
 }
 
@@ -256,26 +257,21 @@ fn admit_deferred_idle(
     deferred_streams: &mut Vec<DeferredConnection>,
     connection: DeferredConnection,
     unresolved_orders: &Arc<std::sync::Mutex<BTreeSet<u64>>>,
-) -> Result<Option<(DeferredConnection, ConnectionProbe)>> {
+) -> (Option<(DeferredConnection, ConnectionProbe)>, bool) {
     if deferred_streams.len() >= MAX_IDLE_PRECONNECT_READERS {
         let evicted = deferred_streams.remove(0);
-        let probe = match probe_connection(&evicted.stream) {
-            Ok(probe) => probe,
-            Err(error) => {
-                release_accept_order(evicted.accept_order, unresolved_orders);
-                reject_unclassified_idle(evicted.stream);
-                return Err(error);
-            }
-        };
+        let probe = probe_connection(&evicted.stream);
         if matches!(probe, ConnectionProbe::Request { .. }) {
             deferred_streams.push(connection);
-            return Ok(Some((evicted, probe)));
+            return (Some((evicted, probe)), false);
         }
         release_accept_order(evicted.accept_order, unresolved_orders);
-        reject_unclassified_idle(evicted.stream);
+        if matches!(probe, ConnectionProbe::Idle) {
+            reject_unclassified_idle(evicted.stream);
+        }
     }
     deferred_streams.push(connection);
-    Ok(None)
+    (None, false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -375,24 +371,26 @@ fn receive_pending(
     accept_order: &Arc<AtomicU64>,
     deferred_streams: &mut Vec<DeferredConnection>,
     auth: &(Arc<str>, Arc<str>),
+    close_order: Option<u64>,
     tuning: ServerTuning,
-) -> Result<PendingRequest> {
+) -> Result<Option<PendingRequest>> {
     if let Ok(request) = request_receiver.try_recv() {
-        return Ok(request);
+        return Ok(Some(request));
     }
     let (token, origin) = auth;
     loop {
+        let mut released_connection = false;
         let mut promoted = 0;
         while promoted < deferred_streams.len()
             && active_readers.load(Ordering::Relaxed) < tuning.max_pending_readers
         {
             let connection = deferred_streams.remove(promoted);
             let stream = connection.stream;
-            let probe = probe_connection(&stream)?;
-            if let ConnectionProbe::Request { headers_complete } = probe {
-                if headers_complete
-                    || unclassified_readers.load(Ordering::Relaxed)
-                        < MAX_UNCLASSIFIED_HEADER_READERS
+            match probe_connection(&stream) {
+                ConnectionProbe::Request { headers_complete }
+                    if headers_complete
+                        || unclassified_readers.load(Ordering::Relaxed)
+                            < MAX_UNCLASSIFIED_HEADER_READERS =>
                 {
                     start_unclassified_reader(
                         stream,
@@ -406,7 +404,13 @@ fn receive_pending(
                         origin,
                         tuning,
                     );
-                } else {
+                }
+                ConnectionProbe::Closed => {
+                    release_accept_order(connection.accept_order, unresolved_orders);
+                    drop(stream);
+                    released_connection = true;
+                }
+                ConnectionProbe::Request { .. } | ConnectionProbe::Idle => {
                     deferred_streams.insert(
                         promoted,
                         DeferredConnection {
@@ -417,74 +421,103 @@ fn receive_pending(
                     );
                     promoted += 1;
                 }
-            } else {
-                deferred_streams.insert(
-                    promoted,
-                    DeferredConnection {
-                        accept_order: connection.accept_order,
-                        accepted_at: connection.accepted_at,
-                        stream,
-                    },
-                );
-                promoted += 1;
             }
         }
         loop {
-            if active_readers.load(Ordering::Relaxed) >= tuning.max_pending_readers
-                || unclassified_readers.load(Ordering::Relaxed) >= MAX_UNCLASSIFIED_HEADER_READERS
-            {
+            if active_readers.load(Ordering::Relaxed) >= tuning.max_pending_readers {
                 break;
             }
             match listener.accept() {
                 Ok((stream, _)) => {
                     let accept_order = register_accept_order(accept_order, unresolved_orders);
-                    let probe = probe_connection(&stream)?;
-                    if let ConnectionProbe::Request { headers_complete } = probe {
-                        start_unclassified_reader(
-                            stream,
-                            accept_order,
-                            headers_complete,
-                            request_sender,
-                            active_readers,
-                            unclassified_readers,
-                            unresolved_orders,
-                            token,
-                            origin,
-                            tuning,
-                        );
-                    } else if let Some((
-                        connection,
-                        ConnectionProbe::Request { headers_complete },
-                    )) = admit_deferred_idle(
-                        deferred_streams,
-                        DeferredConnection {
-                            accept_order,
-                            accepted_at: Instant::now(),
-                            stream,
-                        },
-                        unresolved_orders,
-                    )? {
-                        start_unclassified_reader(
-                            connection.stream,
-                            connection.accept_order,
-                            headers_complete,
-                            request_sender,
-                            active_readers,
-                            unclassified_readers,
-                            unresolved_orders,
-                            token,
-                            origin,
-                            tuning,
-                        );
+                    let accepted_at = Instant::now();
+                    match probe_connection(&stream) {
+                        ConnectionProbe::Closed => {
+                            release_accept_order(accept_order, unresolved_orders);
+                            drop(stream);
+                        }
+                        ConnectionProbe::Request { headers_complete }
+                            if headers_complete
+                                || unclassified_readers.load(Ordering::Relaxed)
+                                    < MAX_UNCLASSIFIED_HEADER_READERS =>
+                        {
+                            start_unclassified_reader(
+                                stream,
+                                accept_order,
+                                headers_complete,
+                                request_sender,
+                                active_readers,
+                                unclassified_readers,
+                                unresolved_orders,
+                                token,
+                                origin,
+                                tuning,
+                            );
+                        }
+                        _ => {
+                            let (evicted, evicted_order_released) = admit_deferred_idle(
+                                deferred_streams,
+                                DeferredConnection {
+                                    accept_order,
+                                    accepted_at,
+                                    stream,
+                                },
+                                unresolved_orders,
+                            );
+                            released_connection |= evicted_order_released;
+                            if let Some((
+                                connection,
+                                ConnectionProbe::Request { headers_complete },
+                            )) = evicted
+                            {
+                                if headers_complete
+                                    || unclassified_readers.load(Ordering::Relaxed)
+                                        < MAX_UNCLASSIFIED_HEADER_READERS
+                                {
+                                    start_unclassified_reader(
+                                        connection.stream,
+                                        connection.accept_order,
+                                        headers_complete,
+                                        request_sender,
+                                        active_readers,
+                                        unclassified_readers,
+                                        unresolved_orders,
+                                        token,
+                                        origin,
+                                        tuning,
+                                    );
+                                } else {
+                                    release_accept_order(
+                                        connection.accept_order,
+                                        unresolved_orders,
+                                    );
+                                    reject_unclassified_idle(connection.stream);
+                                    released_connection = true;
+                                }
+                            }
+                        }
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(error) => return Err(error).context("accept local GUI connection"),
             }
         }
+        if close_order.is_some() && released_connection {
+            return Ok(None);
+        }
         match request_receiver.recv_timeout(REQUEST_QUEUE_WAIT) {
-            Ok(request) => return Ok(request),
-            Err(RecvTimeoutError::Timeout) => {}
+            Ok(request) => return Ok(Some(request)),
+            Err(RecvTimeoutError::Timeout) => {
+                if let Some(close_order) = close_order
+                    && discard_idle_deferred_before_close(
+                        close_order,
+                        deferred_streams,
+                        unresolved_orders,
+                    )
+                {
+                    return Ok(None);
+                }
+            }
             Err(RecvTimeoutError::Disconnected) => {
                 return Err(anyhow!("local GUI request reader stopped"));
             }
@@ -527,15 +560,15 @@ fn serve(
             insert_pending_request(&mut pending, &unresolved_orders, pending_request);
         }
 
-        if let Some(close_order) = pending
+        let close_order = pending
             .iter()
-            .find_map(|(&order, request)| is_close_request(&request.incoming).then_some(order))
-        {
-            discard_idle_deferred_before_close(
+            .find_map(|(&order, request)| is_close_request(&request.incoming).then_some(order));
+        if let Some(close_order) = close_order {
+            let _ = discard_idle_deferred_before_close(
                 close_order,
                 &mut deferred_streams,
                 &unresolved_orders,
-            )?;
+            );
         }
 
         if let Some(order) = next_dispatchable(&pending, &in_flight_saves, &unresolved_orders) {
@@ -687,9 +720,12 @@ fn serve(
             &accept_order,
             &mut deferred_streams,
             &auth,
+            close_order,
             tuning,
         )?;
-        insert_pending_request(&mut pending, &unresolved_orders, pending_request);
+        if let Some(pending_request) = pending_request {
+            insert_pending_request(&mut pending, &unresolved_orders, pending_request);
+        }
     }
 
     Ok(GuiResult {
@@ -762,26 +798,33 @@ fn discard_idle_deferred_before_close(
     close_order: u64,
     deferred_streams: &mut Vec<DeferredConnection>,
     unresolved_orders: &Arc<std::sync::Mutex<BTreeSet<u64>>>,
-) -> Result<()> {
+) -> bool {
+    let mut released = false;
     let mut retained = Vec::with_capacity(deferred_streams.len());
     for connection in deferred_streams.drain(..) {
         if connection.accept_order >= close_order {
             retained.push(connection);
             continue;
         }
-        match probe_connection(&connection.stream)? {
+        match probe_connection(&connection.stream) {
             ConnectionProbe::Idle if connection.accepted_at.elapsed() >= CLOSE_IDLE_GRACE => {
                 release_accept_order(connection.accept_order, unresolved_orders);
                 reject_unclassified_idle(connection.stream);
+                released = true;
             }
             ConnectionProbe::Idle => {
                 retained.push(connection);
             }
             ConnectionProbe::Request { .. } => retained.push(connection),
+            ConnectionProbe::Closed => {
+                release_accept_order(connection.accept_order, unresolved_orders);
+                drop(connection.stream);
+                released = true;
+            }
         }
     }
     *deferred_streams = retained;
-    Ok(())
+    released
 }
 
 fn insert_pending_request(
@@ -1304,7 +1347,7 @@ mod tests {
 
         for server in servers.drain(..MAX_IDLE_PRECONNECT_READERS) {
             let order = register_accept_order(&accept_order, &unresolved_orders);
-            admit_deferred_idle(
+            let _ = admit_deferred_idle(
                 &mut deferred,
                 DeferredConnection {
                     accept_order: order,
@@ -1312,14 +1355,13 @@ mod tests {
                     stream: server,
                 },
                 &unresolved_orders,
-            )
-            .expect("admit idle connection");
+            );
         }
         assert_eq!(deferred.len(), MAX_IDLE_PRECONNECT_READERS);
 
         let newest = servers.pop().expect("newest server");
         let order = register_accept_order(&accept_order, &unresolved_orders);
-        admit_deferred_idle(
+        let _ = admit_deferred_idle(
             &mut deferred,
             DeferredConnection {
                 accept_order: order,
@@ -1327,8 +1369,7 @@ mod tests {
                 stream: newest,
             },
             &unresolved_orders,
-        )
-        .expect("admit idle connection");
+        );
         assert_eq!(deferred.len(), MAX_IDLE_PRECONNECT_READERS);
 
         let mut evicted = clients.remove(0);
@@ -1370,7 +1411,7 @@ mod tests {
             let client = TcpStream::connect(address).expect("connect");
             let (server, _) = listener.accept().expect("accept");
             let order = register_accept_order(&accept_order, &unresolved_orders);
-            admit_deferred_idle(
+            let _ = admit_deferred_idle(
                 &mut deferred,
                 DeferredConnection {
                     accept_order: order,
@@ -1378,8 +1419,7 @@ mod tests {
                     stream: server,
                 },
                 &unresolved_orders,
-            )
-            .expect("admit idle connection");
+            );
             clients.push(client);
             assert!(
                 deferred.len() <= MAX_IDLE_PRECONNECT_READERS,
@@ -1701,6 +1741,67 @@ mod tests {
             "close response: {close_response}"
         );
         assert_eq!(result.written.as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn one_idle_preconnect_is_released_while_close_waits() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let holding_listener = TcpListener::bind(("127.0.0.1", 0)).expect("holding listener");
+        let idle_client = TcpStream::connect(holding_listener.local_addr().expect("address"))
+            .expect("idle connection");
+        let (idle_server, _) = holding_listener.accept().expect("accept idle connection");
+        let unresolved_orders = Arc::new(std::sync::Mutex::new(BTreeSet::from([1_u64])));
+        let active_readers = Arc::new(AtomicUsize::new(0));
+        let unclassified_readers = Arc::new(AtomicUsize::new(0));
+        let accept_order = Arc::new(AtomicU64::new(1));
+        let (request_sender, request_receiver) = mpsc::channel();
+        let token = Arc::<str>::from("test-token");
+        let origin = Arc::<str>::from("http://127.0.0.1");
+        let auth = (token, origin);
+        let mut deferred_streams = vec![DeferredConnection {
+            accept_order: 1,
+            accepted_at: Instant::now()
+                .checked_sub(CLOSE_IDLE_GRACE)
+                .expect("current time is after the idle grace period"),
+            stream: idle_server,
+        }];
+
+        let started = Instant::now();
+        let result = receive_pending(
+            &listener,
+            &request_sender,
+            &request_receiver,
+            &active_readers,
+            &unclassified_readers,
+            &unresolved_orders,
+            &accept_order,
+            &mut deferred_streams,
+            &auth,
+            Some(2),
+            ServerTuning {
+                read_timeout: Duration::from_millis(50),
+                request_deadline: Duration::from_secs(1),
+                max_pending_readers: MAX_PENDING_REQUEST_READERS,
+            },
+        )
+        .expect("receive pending");
+
+        assert!(result.is_none(), "close should regain dispatch control");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "idle close guard took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            unresolved_orders
+                .lock()
+                .expect("unresolved orders")
+                .is_empty()
+        );
+        drop(idle_client);
     }
 
     #[test]
