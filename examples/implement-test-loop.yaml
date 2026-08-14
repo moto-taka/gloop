@@ -28,7 +28,7 @@ spec:
     kind: agent
     prompt: |-
       Implementer role: implement the following so that the verification command passes:
-      Implement the feature and keep pnpm run test green
+      Implement the feature and keep the test suite green
     fan_out: 1
     output:
       format: text
@@ -100,8 +100,8 @@ spec:
           continue_on_failure: false
           kind: agent
           prompt: |-
-            Fixer role: the verification command failed. You receive the failure details upstream. Diagnose the root cause, apply the smallest correct fix, and describe exactly what you changed for:
-            Implement the feature and keep pnpm run test green
+            Fixer role: the verification command failed. Upstream you receive failure details: the error, exit code, and artifact paths (stdout_artifact / stderr_artifact). Read those artifact files to see the actual test output, diagnose the root cause, apply the smallest correct fix, and describe exactly what you changed for:
+            Implement the feature and keep the test suite green
           fan_out: 1
           output:
             format: text
@@ -114,7 +114,7 @@ spec:
       node: test
       status: succeeded
     max_iterations: 3
-    stagnation_after: 2
+    stagnation_after: 3
   - id: report
     requires: []
     resources: []

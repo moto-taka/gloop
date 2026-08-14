@@ -3345,7 +3345,7 @@ fn implement_test_loop_template(
         agent_node(
             "fix",
             &format!(
-                "Fixer role: the verification command failed. You receive the failure details upstream. Diagnose the root cause, apply the smallest correct fix, and describe exactly what you changed for:\n{request}"
+                "Fixer role: the verification command failed. Upstream you receive failure details: the error, exit code, and artifact paths (stdout_artifact / stderr_artifact). Read those artifact files to see the actual test output, diagnose the root cause, apply the smallest correct fix, and describe exactly what you changed for:\n{request}"
             ),
             fix_profile,
             1,
@@ -3384,7 +3384,11 @@ fn implement_test_loop_template(
                 equals: None,
             },
             max_iterations,
-            stagnation_after: 2,
+            // A failing verify node carries no output, so every red iteration
+            // fingerprints identically; the stagnation guard would abort
+            // before max_iterations even while the fixer is making progress.
+            // The loop cap is the real bound here.
+            stagnation_after: max_iterations,
         },
     };
 

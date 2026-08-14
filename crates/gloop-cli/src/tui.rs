@@ -1756,7 +1756,14 @@ fn render(frame: &mut Frame, app: &App) {
             render_input(frame, input, strings, centered_rect(90, height, area));
         }
         Some(Modal::TemplatePicker { selected, previews }) => {
-            render_template_picker(frame, app, *selected, previews, centered_rect(84, 17, area));
+            let height = u16::try_from(previews.len().saturating_mul(2) + 3).unwrap_or(u16::MAX);
+            render_template_picker(
+                frame,
+                app,
+                *selected,
+                previews,
+                centered_rect(84, height, area),
+            );
         }
         Some(Modal::ProfilePicker { selected }) => {
             render_profile_picker(frame, app, *selected, centered_rect(70, 15, area));
@@ -2702,7 +2709,7 @@ mod tests {
             graph: nested,
             until,
             max_iterations,
-            ..
+            stagnation_after,
         } = &loop_node.kind
         else {
             panic!("test_fix_loop must be a loop node");
@@ -2710,6 +2717,10 @@ mod tests {
         assert_eq!(until.node, "test");
         assert_eq!(until.status, NodeStatus::Succeeded);
         assert_eq!(*max_iterations, 5, "--loop-cap flows into the template");
+        assert_eq!(
+            *stagnation_after, *max_iterations,
+            "failed verifies carry no output, so the stagnation guard must not pre-empt the loop cap"
+        );
         assert!(
             nested.spec.edges.iter().any(|edge| edge.from == "test"
                 && edge.to == "fix"
