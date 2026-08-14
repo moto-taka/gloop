@@ -81,6 +81,7 @@ function createMockElement(id) {
       const handler = this[`on${type}`] || handlers[type];
       if (handler) handler();
     },
+    focus() {},
   };
   Object.defineProperty(element, 'children', {
     get() {
@@ -131,6 +132,14 @@ function createHarness() {
         modelHelpUnsupported: 'unsupported',
         modelHelpFailed: 'failed ({reason})',
         modelHelpCustom: 'custom',
+        jsonReady: 'JSON is valid and synced.',
+        jsonInvalid: 'JSON has an error. Fix it before saving.',
+        jsonRootError: 'JSON must be an object.',
+        jsonMetadataError: 'Graph JSON needs a metadata object.',
+        jsonSpecError: 'Graph JSON needs a spec object.',
+        jsonGoalError: 'spec.goal must be a string.',
+        jsonNodesError: 'spec.nodes must be an array.',
+        jsonEdgesError: 'spec.edges must be an array.',
         defaultModel: 'Use tool default',
         none: 'Choose automatically',
         runtimeDefault: 'runtime default',
@@ -141,8 +150,19 @@ function createHarness() {
         unsaved: 'Unsaved changes',
         unsavedClose: 'Discard changes?',
         selected: 'Step',
+        different: 'Choose two different steps.',
+        duplicate: 'That connection already exists.',
+        connected: 'Connected.',
+        cycleBlocked: 'cycle blocked',
+        edgeKindData: 'Result',
         kindNames: { agent: 'AI processing', command: 'Command execution', verify: 'Result verification', gate: 'Approval checkpoint', reduce: 'Consolidate results', synthesize: 'Produce final result', loop: 'Repeat workflow', subgraph: 'Nested workflow' },
         kindDescriptions: { agent: 'Give instructions to an AI and use its response.', verify: 'Run a check; a non-zero result stops the workflow.' },
+      },
+    },
+    helpCopy: {
+      loop: {
+        en: { title: 'Repeat workflow', body: 'loop body' },
+        ja: { title: 'ワークフローを反復', body: 'loop body ja' },
       },
     },
     lang: 'en',
@@ -160,6 +180,8 @@ function createHarness() {
     pan: { x: 0, y: 0 },
     connectingFrom: null,
     selectedEdge: null,
+    jsonOpen: false,
+    jsonError: false,
     promptOriginal: null,
     dragging: null,
     KINDS: ['agent'],
@@ -184,6 +206,12 @@ function createHarness() {
       this.dirty = false;
       this.savedRevision = this.draftRevision;
     },
+    LOCKED_KINDS: new Set(['loop', 'subgraph']),
+    cancelConnecting() {
+      this.connectingFrom = null;
+    },
+    showConnecting() {},
+    renderInspector() {},
     notice() {},
     renderCanvas() {},
     render() {},
@@ -219,6 +247,10 @@ function createHarness() {
     zoom() {},
     fitCanvas() {},
     renderText() {},
+    renderChecklist() {},
+    wouldCreateCycle() {
+      return false;
+    },
     removeNode() {},
     syncBefore() {},
     changeKind() {},
@@ -240,7 +272,13 @@ function createHarness() {
     },
   };
 
-  const source = `function tr(key){return T[lang][key]??key}
+  const source = `const LOCKED_KINDS=new Set(['loop','subgraph']);
+var jsonOpen=false;var jsonError=false;
+function cancelConnecting(){connectingFrom=null}
+function showConnecting(){}
+function renderInspector(){}
+function tr(key){return T[lang][key]??key}
+${extractFunctions(['jsonGraphText', 'parseJsonGraph', 'renderJsonStatus', 'applyJsonText'])}
 function kind(node){return node?.kind||'agent'}
 function nodeList(){return graph?.spec?.nodes||[]}
 function selectedNode(){return nodeList().find(node=>node.id===selectedId)||null}
@@ -273,11 +311,16 @@ ${extractFunctions([
     'save',
     'closeEditor',
     'setupEvents',
+    'wouldCreateCycle',
+    'connectTo',
+    'changeKind',
+    'edgeKindLabel',
+    'helpText',
   ])}`;
 
   vm.createContext(context);
   vm.runInContext(source, context);
-  ['topName', 'name', 'goal', 'parallel', 'description', 'statusText', 'save', 'close', 'viewport', 'zoomIn', 'zoomOut', 'zoomReset', 'fit', 'lang', 'remove', 'before', 'kind', 'nodeName', 'prompt', 'modelChoice', 'modelAdvanced', 'profile', 'edgeFrom', 'edgeTo', 'edgeKind', 'addEdge', 'advancedHelp'].forEach((id) => {
+  ['topName', 'name', 'goal', 'parallel', 'description', 'statusText', 'save', 'close', 'viewport', 'zoomIn', 'zoomOut', 'zoomReset', 'fit', 'lang', 'remove', 'before', 'kind', 'nodeName', 'prompt', 'modelChoice', 'modelAdvanced', 'profile', 'edgeFrom', 'edgeTo', 'edgeKind', 'addEdge', 'advancedHelp', 'jsonEditor', 'jsonStatus'].forEach((id) => {
     context.$(id);
   });
   context.$('goal').value = 'goal';
@@ -825,4 +868,157 @@ test('save blocks an incomplete new step before writing', async () => {
   harness.$('prompt').value = 'do work';
   await harness.save();
   assert.deepEqual(harness.apiCalls.map((call) => call.path), ['/api/save']);
+});
+
+test('connectTo always creates data edges', () => {
+  const harness = createHarness();
+  harness.graph = {
+    metadata: { name: 'flow' },
+    spec: {
+      goal: 'goal',
+      nodes: [agentNode('a'), agentNode('b', 'writer', 'm1')],
+      edges: [],
+      policies: {},
+    },
+  };
+  harness.connectingFrom = 'a';
+  harness.connectTo('b');
+
+  assert.equal(harness.graph.spec.edges.length, 1);
+  assert.equal(harness.graph.spec.edges[0].from, 'a');
+  assert.equal(harness.graph.spec.edges[0].to, 'b');
+  assert.equal(harness.graph.spec.edges[0].kind, 'data');
+});
+
+test('wouldCreateCycle rejects a back-edge without mutating edges', () => {
+  const harness = createHarness();
+  harness.graph = {
+    metadata: { name: 'flow' },
+    spec: {
+      goal: 'goal',
+      nodes: [agentNode('a'), agentNode('b', 'writer', 'm1')],
+      edges: [{ from: 'a', to: 'b', kind: 'data' }],
+      policies: {},
+    },
+  };
+
+  assert.equal(harness.wouldCreateCycle('b', 'a'), true);
+  harness.connectingFrom = 'b';
+  harness.connectTo('a');
+
+  assert.equal(JSON.stringify(harness.graph.spec.edges), '[{"from":"a","to":"b","kind":"data"}]');
+});
+
+test('changeKind does not switch into or out of loop nodes', () => {
+  const harness = createHarness();
+  const loopNode = {
+    ...agentNode('loop-1'),
+    kind: 'loop',
+    graph: { spec: { goal: 'inner', nodes: [], edges: [] } },
+    until: { node: 'inner', status: 'succeeded' },
+    max_iterations: 3,
+  };
+  harness.graph = {
+    metadata: { name: 'flow' },
+    spec: {
+      goal: 'goal',
+      nodes: [loopNode, agentNode('a')],
+      edges: [],
+      policies: {},
+    },
+  };
+  harness.selectedId = 'loop-1';
+  harness.changeKind('agent');
+  assert.equal(harness.selectedNode().kind, 'loop');
+
+  harness.selectedId = 'a';
+  harness.changeKind('loop');
+  assert.equal(harness.selectedNode().kind, 'agent');
+});
+
+test('helpText exposes loop copy in ja and en', () => {
+  const harness = createHarness();
+  harness.lang = 'en';
+  assert.equal(harness.helpText('loop').title, 'Repeat workflow');
+  harness.lang = 'ja';
+  assert.equal(harness.helpText('loop').title, 'ワークフローを反復');
+});
+
+test('edgeKindLabel maps data edges to beginner wording', () => {
+  const harness = createHarness();
+  assert.equal(harness.edgeKindLabel('data'), 'Result');
+  harness.T.en.edgeKindControl = 'Order';
+  assert.equal(harness.edgeKindLabel('control'), 'Order');
+});
+
+test('valid JSON editor input updates the graph immediately', () => {
+  const harness = createHarness();
+  harness.jsonOpen = true;
+  harness.graph = {
+    metadata: { name: 'flow' },
+    spec: {
+      goal: 'old goal',
+      nodes: [agentNode('a')],
+      edges: [],
+      policies: {},
+    },
+  };
+  harness.$('jsonEditor').value = JSON.stringify({
+    metadata: { name: 'flow' },
+    spec: {
+      goal: 'new goal',
+      nodes: [agentNode('a'), agentNode('b')],
+      edges: [{ from: 'a', to: 'b', kind: 'data' }],
+      policies: { max_parallel: 2 },
+    },
+  });
+
+  harness.applyJsonText();
+
+  assert.equal(harness.graph.spec.goal, 'new goal');
+  assert.equal(harness.graph.spec.nodes.length, 2);
+  assert.equal(JSON.stringify(harness.graph.spec.edges), '[{"from":"a","to":"b","kind":"data"}]');
+  assert.equal(harness.dirty, true);
+  assert.equal(harness.$('jsonStatus').className, 'status-message');
+});
+
+test('invalid JSON stays in the editor and reports an error without replacing the graph', () => {
+  const harness = createHarness();
+  harness.jsonOpen = true;
+  harness.graph = {
+    metadata: { name: 'flow' },
+    spec: { goal: 'keep me', nodes: [], edges: [], policies: {} },
+  };
+  harness.$('jsonEditor').value = '{"metadata":';
+
+  harness.applyJsonText();
+
+  assert.equal(harness.graph.spec.goal, 'keep me');
+  assert.equal(harness.$('jsonEditor').value, '{"metadata":');
+  assert.equal(harness.$('jsonStatus').className, 'status-message error');
+  assert.equal(harness.dirty, false);
+});
+
+test('save is blocked while the JSON editor contains invalid text', async () => {
+  const harness = createHarness();
+  harness.jsonOpen = true;
+  harness.jsonError = true;
+  harness.graph = {
+    metadata: { name: 'flow' },
+    spec: { goal: 'goal', nodes: [], edges: [], policies: {} },
+  };
+
+  await harness.save();
+
+  assert.deepEqual(harness.apiCalls, []);
+  assert.equal(harness.$('jsonStatus').className, 'status-message error');
+});
+
+test('JSON parser rejects a graph with a non-array edge list', () => {
+  const harness = createHarness();
+
+  assert.throws(
+    () => harness.parseJsonGraph(JSON.stringify({ metadata: {}, spec: { goal: 'goal', nodes: [], edges: {} } })),
+    /spec\.edges must be an array/,
+  );
 });

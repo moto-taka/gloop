@@ -70,6 +70,21 @@ Create a graph interactively, in the style of TAKT's authoring flow:
 gloop graph new workflow.yaml --interactive
 ```
 
+Start the resident Graph Agent TUI when you want to choose the graph, harness,
+profile, model, and task from one keyboard-first workspace:
+
+```bash
+gloop graph
+# explicit alias:
+gloop graph tui
+```
+
+The TUI keeps the existing Graph IR and foreground runtime. Use `1/2/3` for
+Overview / Graph Builder / Run Monitor, `i` for the natural-language task,
+`t/p/m` for template/profile/model, `v` to validate, `s` to save, and `r` to
+run. `Ctrl-C` cancels an active run; `q` exits when idle. See
+[docs/TUI_DESIGN.md](docs/TUI_DESIGN.md) for the screen model and next slice.
+
 Save a reusable project template interactively (the wizard builds graphs node-by-node and selects providers from your configured profiles) or non-interactively from a built-in base:
 
 ```bash

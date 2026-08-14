@@ -3,6 +3,7 @@ mod cli;
 mod commands;
 mod gui;
 mod templates;
+mod tui;
 mod wizard;
 
 #[tokio::main]

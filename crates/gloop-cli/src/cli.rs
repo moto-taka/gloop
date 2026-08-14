@@ -4,11 +4,12 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 use crate::commands::{
-    RenderFormat, graph_edit, graph_explain, graph_init, graph_list, graph_new, graph_render,
-    graph_schema, graph_validate, inspect_run_at, present, provider_add, provider_doctor,
-    provider_list, provider_probe, replay_run, run_foreground, run_logs,
+    CommandResult, RenderFormat, graph_edit, graph_explain, graph_init, graph_list, graph_new,
+    graph_render, graph_schema, graph_validate, inspect_run_at, present, provider_add,
+    provider_doctor, provider_list, provider_probe, replay_run, run_foreground, run_logs,
 };
 use crate::gui::Language;
+use crate::tui;
 
 #[derive(Parser)]
 #[command(name = "gloop", version = env!("CARGO_PKG_VERSION"), about = "Gloop CLI")]
@@ -29,7 +30,6 @@ enum Command {
     /// Run a graph or create a one-node graph from a goal.
     Run(RunCommand),
     /// Create, validate, explain, render, or inspect the graph schema.
-    #[command(subcommand)]
     Graph(GraphCommand),
     /// Configure and diagnose model/harness profiles.
     #[command(subcommand)]
@@ -96,8 +96,20 @@ struct RunCommand {
     max_parallel: Option<usize>,
 }
 
+#[derive(Args)]
+struct GraphCommand {
+    /// Start the resident graph TUI when no graph subcommand is supplied.
+    #[command(subcommand)]
+    command: Option<GraphSubcommand>,
+
+    #[arg(long = "repo", value_name = "PATH", default_value = ".")]
+    repo: PathBuf,
+}
+
 #[derive(Subcommand)]
-enum GraphCommand {
+enum GraphSubcommand {
+    /// Start the resident graph TUI explicitly.
+    Tui(GraphTui),
     /// Show built-in templates, saved templates, and graph YAML files in this project.
     List(GraphList),
     /// Create a graph file from a template or interactively.
@@ -116,6 +128,12 @@ enum GraphCommand {
     Render(GraphRender),
     /// Print the machine-readable graph schema.
     Schema(GraphSchema),
+}
+
+#[derive(Args)]
+struct GraphTui {
+    #[arg(long = "repo", value_name = "PATH", default_value = ".")]
+    repo: PathBuf,
 }
 
 #[derive(Args)]
@@ -328,13 +346,16 @@ impl Command {
     fn json_mode(&self) -> bool {
         match self {
             Self::Run(c) => c.json,
-            Self::Graph(GraphCommand::List(c)) => c.json,
-            Self::Graph(GraphCommand::New(c)) => c.json,
-            Self::Graph(GraphCommand::Init(c)) => c.json,
-            Self::Graph(GraphCommand::Edit(c) | GraphCommand::Update(c)) => c.json,
-            Self::Graph(GraphCommand::Validate(c) | GraphCommand::Explain(c)) => c.json,
-            Self::Graph(GraphCommand::Render(c)) => c.json,
-            Self::Graph(GraphCommand::Schema(c)) => c.json,
+            Self::Graph(c) => c.command.as_ref().is_some_and(|command| match command {
+                GraphSubcommand::Tui(_) => false,
+                GraphSubcommand::List(c) => c.json,
+                GraphSubcommand::New(c) => c.json,
+                GraphSubcommand::Init(c) => c.json,
+                GraphSubcommand::Edit(c) | GraphSubcommand::Update(c) => c.json,
+                GraphSubcommand::Validate(c) | GraphSubcommand::Explain(c) => c.json,
+                GraphSubcommand::Render(c) => c.json,
+                GraphSubcommand::Schema(c) => c.json,
+            }),
             Self::Provider(ProviderCommand::List(c) | ProviderCommand::Doctor(c)) => c.json,
             Self::Provider(ProviderCommand::Probe(c)) => c.json,
             Self::Provider(ProviderCommand::Add(c)) => c.json,
@@ -367,9 +388,33 @@ pub async fn run() -> Result<()> {
             )
             .await
         }
-        Command::Graph(cmd) => match cmd {
-            GraphCommand::List(c) => graph_list(c.repo, c.language, c.json).await,
-            GraphCommand::New(c) => {
+        Command::Graph(cmd) => match cmd.command {
+            None => match tui::launch(cmd.repo, cli.trust_project_profiles).await {
+                Ok(()) => CommandResult {
+                    code: crate::commands::ExitCode::Success,
+                    output: None,
+                    text: None,
+                },
+                Err(error) => CommandResult::failure_text(
+                    crate::commands::ExitCode::Internal,
+                    format!("graph TUI failed: {error}"),
+                ),
+            },
+            Some(GraphSubcommand::Tui(c)) => {
+                match tui::launch(c.repo, cli.trust_project_profiles).await {
+                    Ok(()) => CommandResult {
+                        code: crate::commands::ExitCode::Success,
+                        output: None,
+                        text: None,
+                    },
+                    Err(error) => CommandResult::failure_text(
+                        crate::commands::ExitCode::Internal,
+                        format!("graph TUI failed: {error}"),
+                    ),
+                }
+            }
+            Some(GraphSubcommand::List(c)) => graph_list(c.repo, c.language, c.json).await,
+            Some(GraphSubcommand::New(c)) => {
                 graph_new(
                     c.name,
                     c.goal,
@@ -386,7 +431,7 @@ pub async fn run() -> Result<()> {
                 )
                 .await
             }
-            GraphCommand::Init(c) => {
+            Some(GraphSubcommand::Init(c)) => {
                 graph_init(
                     c.name,
                     c.from,
@@ -404,7 +449,7 @@ pub async fn run() -> Result<()> {
                 )
                 .await
             }
-            GraphCommand::Edit(c) => {
+            Some(GraphSubcommand::Edit(c)) => {
                 graph_edit(
                     c.target,
                     c.repo,
@@ -416,7 +461,7 @@ pub async fn run() -> Result<()> {
                 )
                 .await
             }
-            GraphCommand::Update(c) => {
+            Some(GraphSubcommand::Update(c)) => {
                 graph_edit(
                     c.target,
                     c.repo,
@@ -428,10 +473,10 @@ pub async fn run() -> Result<()> {
                 )
                 .await
             }
-            GraphCommand::Validate(c) => graph_validate(c.path, c.json).await,
-            GraphCommand::Explain(c) => graph_explain(c.path, c.json).await,
-            GraphCommand::Render(c) => graph_render(c.path, c.format, c.json).await,
-            GraphCommand::Schema(c) => graph_schema(c.json),
+            Some(GraphSubcommand::Validate(c)) => graph_validate(c.path, c.json).await,
+            Some(GraphSubcommand::Explain(c)) => graph_explain(c.path, c.json).await,
+            Some(GraphSubcommand::Render(c)) => graph_render(c.path, c.format, c.json).await,
+            Some(GraphSubcommand::Schema(c)) => graph_schema(c.json),
         },
         Command::Provider(cmd) => match cmd {
             ProviderCommand::List(c) => provider_list(c.json, cli.trust_project_profiles).await,

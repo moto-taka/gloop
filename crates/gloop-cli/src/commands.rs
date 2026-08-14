@@ -95,7 +95,7 @@ impl CommandResult {
         }
     }
 
-    fn failure_text(code: ExitCode, message: impl Into<String>) -> Self {
+    pub(crate) fn failure_text(code: ExitCode, message: impl Into<String>) -> Self {
         Self {
             code,
             output: None,
@@ -278,7 +278,7 @@ async fn validate_journal_file_path(journal_path: &std::path::Path) -> io::Resul
     Ok(())
 }
 
-fn apply_profile_to_agent_nodes(graph: &mut Graph, profile: &str) {
+pub(crate) fn apply_profile_to_agent_nodes(graph: &mut Graph, profile: &str) {
     for node in &mut graph.spec.nodes {
         match &mut node.kind {
             NodeKind::Agent {
@@ -297,7 +297,7 @@ fn apply_profile_to_agent_nodes(graph: &mut Graph, profile: &str) {
     }
 }
 
-fn apply_model_to_agent_nodes(graph: &mut Graph, model: &str) {
+pub(crate) fn apply_model_to_agent_nodes(graph: &mut Graph, model: &str) {
     for node in &mut graph.spec.nodes {
         match &mut node.kind {
             NodeKind::Agent {
