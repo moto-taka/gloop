@@ -517,6 +517,7 @@ pub enum GraphTemplate {
     PlanImplementVerify,
     ParallelResearchReduce,
     ReviewFixLoop,
+    DesignWallBounce,
 }
 
 pub fn request_graph(
@@ -556,6 +557,9 @@ pub fn template_graph(
         }
         GraphTemplate::ReviewFixLoop => {
             review_fix_loop_template(name, goal, request, &profiles, loop_cap)
+        }
+        GraphTemplate::DesignWallBounce => {
+            design_wall_bounce_template(name, goal, request, &profiles)
         }
     }
 }
@@ -731,6 +735,133 @@ fn review_fix_loop_template(
     graph
 }
 
+/// Two designers produce independent blind proposals, critique each other's
+/// proposal (wall-bounce), revise their own design in light of the critique,
+/// and a final node integrates the two revised designs.
+fn design_wall_bounce_template(
+    name: String,
+    goal: String,
+    request: Option<String>,
+    profiles: &[String],
+) -> Graph {
+    let request = request.unwrap_or_else(|| "the requested design".to_owned());
+    let lane_one_profile = profiles
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "claude".to_owned());
+    let lane_two_profile = profiles
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "codex".to_owned());
+    // The default model aliases only exist on the default harnesses; skip the
+    // binding when a lane is rebound to a different profile.
+    let lane_one_model = (lane_one_profile == "claude").then(|| "fable".to_owned());
+    let lane_two_model = (lane_two_profile == "codex").then(|| "gpt-5.6-sol".to_owned());
+
+    let design_prompt = |lane: &str| {
+        format!(
+            "You are designer {lane}, one of two independent designers. Produce a complete design for the following request. Work blindly: do not reference or assume any other proposal.\n\nRequest:\n{request}\n\nOutput sections: 1) goal and scope, 2) proposed design, 3) risks and mitigations, 4) open questions."
+        )
+    };
+    let critique_prompt = |lane: &str, other: &str| {
+        format!(
+            "You are designer {lane}. Act as a wall-bounce partner for designer {other}: critique designer {other}'s proposal, which is provided in the dependency output. Identify weaknesses, gaps, risks, and concrete improvements. Be specific and constructive; do not rewrite the whole design."
+        )
+    };
+    let revise_prompt = |lane: &str, other: &str| {
+        format!(
+            "You are designer {lane}. Revise your original design in light of designer {other}'s critique; both are provided in the dependency output. Keep what survives critique, fix what does not, and note any remaining disagreements explicitly."
+        )
+    };
+    let lane_node = |id: &str, prompt: &str, profile: &str, model: Option<&str>| {
+        let mut node = agent_node(id, prompt, Some(profile.to_owned()), 1);
+        set_node_model(&mut node, model);
+        node
+    };
+
+    let graph_nodes = vec![
+        lane_node(
+            "design_one",
+            &design_prompt("one"),
+            &lane_one_profile,
+            lane_one_model.as_deref(),
+        ),
+        lane_node(
+            "design_two",
+            &design_prompt("two"),
+            &lane_two_profile,
+            lane_two_model.as_deref(),
+        ),
+        lane_node(
+            "review_by_one",
+            &critique_prompt("one", "two"),
+            &lane_one_profile,
+            lane_one_model.as_deref(),
+        ),
+        lane_node(
+            "review_by_two",
+            &critique_prompt("two", "one"),
+            &lane_two_profile,
+            lane_two_model.as_deref(),
+        ),
+        lane_node(
+            "revise_one",
+            &revise_prompt("one", "two"),
+            &lane_one_profile,
+            lane_one_model.as_deref(),
+        ),
+        lane_node(
+            "revise_two",
+            &revise_prompt("two", "one"),
+            &lane_two_profile,
+            lane_two_model.as_deref(),
+        ),
+        {
+            let mut final_design = synthesize_node(
+                "final_design",
+                &format!(
+                    "Integrate the two revised designs (provided in the dependency output) into one final design for:\n{request}\n\nOutput sections: 1) points of agreement, 2) disagreements and how they are resolved, 3) final design decisions, 4) remaining open questions."
+                ),
+                Some(lane_one_profile.clone()),
+            );
+            set_node_model(&mut final_design, lane_one_model.as_deref());
+            final_design
+        },
+    ];
+
+    let mut graph = Graph::new(name, goal, graph_nodes);
+    graph.spec.edges = vec![
+        Edge::data("design_two", "review_by_one"),
+        Edge::data("design_one", "review_by_two"),
+        Edge::data("design_one", "revise_one"),
+        Edge::data("review_by_two", "revise_one"),
+        Edge::data("design_two", "revise_two"),
+        Edge::data("review_by_one", "revise_two"),
+        Edge::data("revise_one", "final_design"),
+        Edge::data("revise_two", "final_design"),
+    ];
+    graph.spec.policies.max_parallel = 4;
+    graph.spec.budgets = gloop_core::RunBudgets {
+        wall_time_seconds: Some(3600),
+        model_calls: Some(7),
+    };
+    graph.metadata.description = Some(
+        "two independent designers wall-bounce each other's proposals and integrate".to_owned(),
+    );
+    graph
+}
+
+fn set_node_model(node: &mut Node, model: Option<&str>) {
+    match &mut node.kind {
+        NodeKind::Agent { model: slot, .. }
+        | NodeKind::Reduce { model: slot, .. }
+        | NodeKind::Synthesize { model: slot, .. } => {
+            *slot = model.map(ToOwned::to_owned);
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 pub fn graph_from_yaml_bytes(contents: impl AsRef<str>) -> Result<Graph> {
     Graph::from_yaml_str(contents.as_ref())
@@ -843,6 +974,7 @@ fn prompt_start_from(theme: &ColorfulTheme) -> Result<StartTemplate> {
         "plan-implement-verify",
         "parallel-research-reduce",
         "review-fix-loop",
+        "design-wall-bounce",
     ];
     let selected = Select::with_theme(theme)
         .with_prompt("Start from")
@@ -856,6 +988,7 @@ fn prompt_start_from(theme: &ColorfulTheme) -> Result<StartTemplate> {
         2 => StartTemplate::Builtin(GraphTemplate::PlanImplementVerify),
         3 => StartTemplate::Builtin(GraphTemplate::ParallelResearchReduce),
         4 => StartTemplate::Builtin(GraphTemplate::ReviewFixLoop),
+        5 => StartTemplate::Builtin(GraphTemplate::DesignWallBounce),
         _ => unreachable!("invalid start template selection"),
     })
 }
@@ -886,7 +1019,9 @@ pub(crate) struct TemplateKnobs {
 fn template_profile_slot_count(template: GraphTemplate) -> usize {
     match template {
         GraphTemplate::Direct => 1,
-        GraphTemplate::PlanImplementVerify | GraphTemplate::ReviewFixLoop => 2,
+        GraphTemplate::PlanImplementVerify
+        | GraphTemplate::ReviewFixLoop
+        | GraphTemplate::DesignWallBounce => 2,
         GraphTemplate::ParallelResearchReduce => 4,
     }
 }
@@ -3221,6 +3356,99 @@ mod tests {
                 ..
             } => assert!(prompt.contains("Complete the requested task")),
             _ => panic!("direct template must contain one agent node"),
+        }
+    }
+
+    #[test]
+    fn design_wall_bounce_defaults_to_claude_fable_and_codex_sol() {
+        let graph = template_graph(
+            "design",
+            "design task",
+            GraphTemplate::DesignWallBounce,
+            Some("design a sync engine".to_owned()),
+            None,
+            None,
+        );
+
+        assert!(
+            graph
+                .validate()
+                .iter()
+                .all(|issue| issue.severity != IssueSeverity::Error),
+            "wall-bounce template must validate by default"
+        );
+
+        let expected = [
+            ("design_one", "claude", Some("fable")),
+            ("design_two", "codex", Some("gpt-5.6-sol")),
+            ("review_by_one", "claude", Some("fable")),
+            ("review_by_two", "codex", Some("gpt-5.6-sol")),
+            ("revise_one", "claude", Some("fable")),
+            ("revise_two", "codex", Some("gpt-5.6-sol")),
+            ("final_design", "claude", Some("fable")),
+        ];
+        assert_eq!(graph.spec.nodes.len(), expected.len());
+        for (node, (id, profile, model)) in graph.spec.nodes.iter().zip(expected) {
+            assert_eq!(node.id, id);
+            match &node.kind {
+                NodeKind::Agent {
+                    profile: bound,
+                    model: bound_model,
+                    ..
+                }
+                | NodeKind::Synthesize {
+                    profile: bound,
+                    model: bound_model,
+                    ..
+                } => {
+                    assert_eq!(bound.as_deref(), Some(profile));
+                    assert_eq!(bound_model.as_deref(), model);
+                }
+                _ => panic!("{id} must be prompt-based"),
+            }
+        }
+
+        let edges: Vec<(String, String)> = graph
+            .spec
+            .edges
+            .iter()
+            .map(|edge| (edge.from.clone(), edge.to.clone()))
+            .collect();
+        assert_eq!(
+            edges,
+            vec![
+                ("design_two".to_owned(), "review_by_one".to_owned()),
+                ("design_one".to_owned(), "review_by_two".to_owned()),
+                ("design_one".to_owned(), "revise_one".to_owned()),
+                ("review_by_two".to_owned(), "revise_one".to_owned()),
+                ("design_two".to_owned(), "revise_two".to_owned()),
+                ("review_by_one".to_owned(), "revise_two".to_owned()),
+                ("revise_one".to_owned(), "final_design".to_owned()),
+                ("revise_two".to_owned(), "final_design".to_owned()),
+            ]
+        );
+        assert_eq!(graph.spec.budgets.model_calls, Some(7));
+    }
+
+    #[test]
+    fn design_wall_bounce_skips_model_bindings_for_rebound_lanes() {
+        let graph = template_graph(
+            "design",
+            "design task",
+            GraphTemplate::DesignWallBounce,
+            Some("design a sync engine".to_owned()),
+            Some(vec!["qwen".to_owned(), "opencode".to_owned()]),
+            None,
+        );
+        for node in &graph.spec.nodes {
+            match &node.kind {
+                NodeKind::Agent { profile, model, .. }
+                | NodeKind::Synthesize { profile, model, .. } => {
+                    assert!(model.is_none(), "rebound lanes must not pin model aliases");
+                    assert!(matches!(profile.as_deref(), Some("qwen" | "opencode")));
+                }
+                _ => {}
+            }
         }
     }
 

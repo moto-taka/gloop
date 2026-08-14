@@ -110,6 +110,7 @@ pub enum GraphTemplateArg {
     PlanImplementVerify,
     ParallelResearchReduce,
     ReviewFixLoop,
+    DesignWallBounce,
 }
 
 impl GraphTemplateArg {
@@ -119,6 +120,7 @@ impl GraphTemplateArg {
             "plan-implement-verify" => Some(Self::PlanImplementVerify),
             "parallel-research-reduce" => Some(Self::ParallelResearchReduce),
             "review-fix-loop" => Some(Self::ReviewFixLoop),
+            "design-wall-bounce" => Some(Self::DesignWallBounce),
             _ => None,
         }
     }
@@ -129,6 +131,7 @@ impl GraphTemplateArg {
             Self::PlanImplementVerify => wizard::GraphTemplate::PlanImplementVerify,
             Self::ParallelResearchReduce => wizard::GraphTemplate::ParallelResearchReduce,
             Self::ReviewFixLoop => wizard::GraphTemplate::ReviewFixLoop,
+            Self::DesignWallBounce => wizard::GraphTemplate::DesignWallBounce,
         }
     }
 }
@@ -1647,6 +1650,7 @@ fn localized_template_description(
             "plan-implement-verify" => "計画 → 実装 → 検証",
             "parallel-research-reduce" => "並列で調べてからまとめる",
             "review-fix-loop" => "レビューと修正を回数制限つきで繰り返す",
+            "design-wall-bounce" => "2人の設計者が互いの案を壁打ちして統合する",
             _ => return entry.description.clone(),
         };
         return Some(description.to_owned());

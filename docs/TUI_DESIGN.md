@@ -143,9 +143,9 @@ never required.
 ### Template gallery
 
 Templates are data, not roles. The initial gallery can include the existing
-built-ins (`direct`, `plan-implement-verify`, `parallel-research-reduce`, and
-`review-fix-loop`) plus saved project templates. A template is copied into an
-editable draft; built-ins stay read-only.
+built-ins (`direct`, `plan-implement-verify`, `parallel-research-reduce`,
+`review-fix-loop`, and `design-wall-bounce`) plus saved project templates. A
+template is copied into an editable draft; built-ins stay read-only.
 
 ### Visual list
 

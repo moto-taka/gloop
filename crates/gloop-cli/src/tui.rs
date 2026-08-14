@@ -45,11 +45,12 @@ use crate::{
     wizard::{self, EditorState, GraphTemplate, ProfileChoice},
 };
 
-const TEMPLATE_CHOICES: [GraphTemplate; 4] = [
+const TEMPLATE_CHOICES: [GraphTemplate; 5] = [
     GraphTemplate::Direct,
     GraphTemplate::PlanImplementVerify,
     GraphTemplate::ParallelResearchReduce,
     GraphTemplate::ReviewFixLoop,
+    GraphTemplate::DesignWallBounce,
 ];
 
 const DEFAULT_TASK: &str = "Describe the task for the graph";
@@ -982,6 +983,7 @@ fn template_label(template: GraphTemplate) -> &'static str {
         GraphTemplate::PlanImplementVerify => "plan-implement-verify",
         GraphTemplate::ParallelResearchReduce => "parallel-research-reduce",
         GraphTemplate::ReviewFixLoop => "review-fix-loop",
+        GraphTemplate::DesignWallBounce => "design-wall-bounce",
     }
 }
 
