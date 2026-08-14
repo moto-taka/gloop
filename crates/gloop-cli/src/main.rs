@@ -2,6 +2,7 @@ mod atomic_write;
 mod cli;
 mod commands;
 mod gui;
+pub(crate) mod i18n;
 mod templates;
 mod tui;
 mod wizard;

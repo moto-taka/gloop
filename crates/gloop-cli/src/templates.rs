@@ -412,9 +412,7 @@ pub fn list_builtin_templates() -> Vec<TemplateEntry> {
                     "plan-implement-verify" => "plan, implement, then verify",
                     "parallel-research-reduce" => "research in parallel, then reduce",
                     "review-fix-loop" => "bounded review and fix loop",
-                    "design-wall-bounce" => {
-                        "two designers wall-bounce proposals and integrate"
-                    }
+                    "design-wall-bounce" => "two designers wall-bounce proposals and integrate",
                     _ => "built-in graph template",
                 }
                 .to_owned(),

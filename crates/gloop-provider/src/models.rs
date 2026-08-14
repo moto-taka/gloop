@@ -919,11 +919,7 @@ mod tests {
     async fn discover_overflow_output_is_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("opencode");
-        fs::write(
-            &path,
-            "#!/bin/sh\nyes openai/gpt-4.1 | head -c 1100000\n",
-        )
-        .expect("script");
+        fs::write(&path, "#!/bin/sh\nyes openai/gpt-4.1 | head -c 1100000\n").expect("script");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
         let discovery = discover_models_for_argv0(path.to_str().expect("utf8 path")).await;
         assert_eq!(
@@ -1019,7 +1015,8 @@ mod tests {
 
     #[test]
     fn parse_qwen_current_model_yields_single_entry() {
-        let output = "Current model: qwen3.8-max-preview\nUse \"/model <model-id>\" to switch models.\n";
+        let output =
+            "Current model: qwen3.8-max-preview\nUse \"/model <model-id>\" to switch models.\n";
         let ModelDiscovery::Listed(models) =
             parse_model_list(CatalogFamily::Qwen, output.as_bytes())
         else {
@@ -1065,10 +1062,9 @@ mod tests {
 
     #[test]
     fn parse_aider_no_match_output_fails() {
-        let ModelDiscovery::Failed { reason } = parse_model_list(
-            CatalogFamily::Aider,
-            b"No models match \"zzz\".\n",
-        ) else {
+        let ModelDiscovery::Failed { reason } =
+            parse_model_list(CatalogFamily::Aider, b"No models match \"zzz\".\n")
+        else {
             panic!("expected failure");
         };
         assert_eq!(reason, "no models in output");

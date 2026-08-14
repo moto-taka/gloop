@@ -1,0 +1,634 @@
+//! Language detection and localized strings.
+//!
+//! User-facing text is presented through a single [`Strings`] table per
+//! language. Every string exists in every language at compile time, so a
+//! missing translation is a compile error, not a runtime gap.
+
+use std::env;
+
+/// Supported display languages. Shared by the browser GUI, the resident TUI,
+/// and non-interactive commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Language {
+    En,
+    Ja,
+}
+
+impl Language {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::En => "en",
+            Self::Ja => "ja",
+        }
+    }
+
+    /// Parse one environment variable value such as `ja_JP.UTF-8`.
+    fn from_env_value(value: &str) -> Option<Self> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("c") || trimmed == "POSIX" {
+            return None;
+        }
+        let primary = trimmed.split(['.', '@', '_']).next().unwrap_or(trimmed);
+        if primary.eq_ignore_ascii_case("ja") {
+            return Some(Self::Ja);
+        }
+        if primary.eq_ignore_ascii_case("en") {
+            return Some(Self::En);
+        }
+        None
+    }
+
+    /// Detect the display language from the environment.
+    ///
+    /// `GLOOP_LANG` wins (accepts `en`, `ja`, or locale-like values), then
+    /// the standard `LC_ALL`, `LC_MESSAGES`, and `LANG` variables. Unknown or
+    /// unset locales fall back to English.
+    pub fn detect() -> Self {
+        for variable in ["GLOOP_LANG", "LC_ALL", "LC_MESSAGES", "LANG"] {
+            if let Ok(value) = env::var(variable)
+                && let Some(language) = Self::from_env_value(&value)
+            {
+                return language;
+            }
+        }
+        Self::En
+    }
+
+    pub const fn strings(self) -> &'static Strings {
+        match self {
+            Self::En => &EN,
+            Self::Ja => &JA,
+        }
+    }
+}
+
+/// Fill `{placeholders}` in a translated template. Unknown placeholders stay
+/// untouched so problems remain visible instead of silently vanishing.
+#[must_use]
+pub fn fill(template: &str, args: &[(&str, &str)]) -> String {
+    let mut output = template.to_owned();
+    for (key, value) in args {
+        output = output.replace(&format!("{{{key}}}"), value);
+    }
+    output
+}
+
+/// Every user-facing TUI string. Adding a field forces both languages to
+/// provide it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Strings {
+    // screens
+    pub screen_overview: &'static str,
+    pub screen_builder: &'static str,
+    pub screen_run: &'static str,
+    // footer keys
+    pub key_screens: &'static str,
+    pub key_task: &'static str,
+    pub key_template: &'static str,
+    pub key_profile: &'static str,
+    pub key_model: &'static str,
+    pub key_validate: &'static str,
+    pub key_run: &'static str,
+    pub key_save: &'static str,
+    pub key_help: &'static str,
+    pub key_lang: &'static str,
+    pub key_quit: &'static str,
+    pub key_move: &'static str,
+    pub key_apply: &'static str,
+    pub key_close: &'static str,
+    pub key_scroll: &'static str,
+    // overview
+    pub start_here: &'static str,
+    pub label_task: &'static str,
+    pub label_template: &'static str,
+    pub label_profile: &'static str,
+    pub label_model: &'static str,
+    pub label_graph: &'static str,
+    pub label_shape: &'static str,
+    pub label_save: &'static str,
+    pub label_dirty: &'static str,
+    pub nodes_edges: &'static str,
+    pub runtime_default: &'static str,
+    pub provider_default: &'static str,
+    pub guide_task: &'static str,
+    pub guide_bindings: &'static str,
+    pub guide_builder: &'static str,
+    pub guide_run: &'static str,
+    pub guide_help: &'static str,
+    pub graph_flow_title: &'static str,
+    pub edges_header: &'static str,
+    // statuses
+    pub status_ready: &'static str,
+    pub status_load_profiles_failed: &'static str,
+    pub status_task_updated: &'static str,
+    pub status_task_goal_only: &'static str,
+    pub status_task_empty: &'static str,
+    pub status_template_applied: &'static str,
+    pub status_template_edits_discarded: &'static str,
+    pub status_edits_discarded_note: &'static str,
+    pub status_profile_applied: &'static str,
+    pub status_profile_none: &'static str,
+    pub status_model_override: &'static str,
+    pub status_node_prompt_updated: &'static str,
+    pub status_no_node: &'static str,
+    pub status_not_prompt_node: &'static str,
+    pub status_edit_cancelled: &'static str,
+    pub status_cancel_requested: &'static str,
+    pub status_run_started: &'static str,
+    pub status_run_dir: &'static str,
+    pub status_gate_waiting: &'static str,
+    pub status_run_finished: &'static str,
+    pub status_run_failed: &'static str,
+    pub status_run_task_stopped: &'static str,
+    pub status_gate_approved: &'static str,
+    pub status_gate_rejected: &'static str,
+    pub status_save_blocked: &'static str,
+    pub status_saved: &'static str,
+    pub status_run_blocked_invalid: &'static str,
+    pub status_run_active: &'static str,
+    pub status_graph_valid: &'static str,
+    pub status_graph_invalid: &'static str,
+    pub status_added_node: &'static str,
+    pub status_add_node_failed: &'static str,
+    pub status_connect_new_failed: &'static str,
+    pub status_keep_one_node: &'static str,
+    pub status_removed_node: &'static str,
+    pub status_remove_failed: &'static str,
+    pub status_connecting: &'static str,
+    pub status_connect_cancelled: &'static str,
+    pub status_self_connect: &'static str,
+    pub status_connect_rejected: &'static str,
+    pub status_edge_added: &'static str,
+    pub status_language: &'static str,
+    pub status_autosave_before_run: &'static str,
+    // input modals
+    pub input_task: &'static str,
+    pub input_model: &'static str,
+    pub input_prompt: &'static str,
+    // gate modal
+    pub gate_title: &'static str,
+    pub gate_node: &'static str,
+    pub gate_keys: &'static str,
+    pub gate_approve: &'static str,
+    pub gate_reject: &'static str,
+    // pickers
+    pub template_picker_title: &'static str,
+    pub profile_picker_title: &'static str,
+    pub picker_discard_warning: &'static str,
+    pub picker_current: &'static str,
+    pub picker_disabled: &'static str,
+    pub picker_source_builtin: &'static str,
+    pub picker_source_user: &'static str,
+    pub picker_source_project: &'static str,
+    pub template_desc_direct: &'static str,
+    pub template_desc_plan_implement_verify: &'static str,
+    pub template_desc_parallel_research_reduce: &'static str,
+    pub template_desc_review_fix_loop: &'static str,
+    pub template_desc_design_wall_bounce: &'static str,
+    // builder
+    pub builder_nodes_title: &'static str,
+    pub builder_connecting: &'static str,
+    pub builder_editor_title: &'static str,
+    pub builder_no_node: &'static str,
+    pub builder_not_prompt: &'static str,
+    pub builder_keys: &'static str,
+    pub builder_label_kind: &'static str,
+    pub builder_label_profile: &'static str,
+    pub builder_label_model: &'static str,
+    pub builder_label_retry: &'static str,
+    pub builder_label_fanout: &'static str,
+    pub builder_label_prompt: &'static str,
+    pub builder_label_edges: &'static str,
+    // run monitor
+    pub run_nodes_running: &'static str,
+    pub run_nodes_idle: &'static str,
+    pub run_events: &'static str,
+    pub run_result: &'static str,
+    pub run_status_label: &'static str,
+    pub run_meta: &'static str,
+    pub run_selected: &'static str,
+    pub run_output: &'static str,
+    pub run_error: &'static str,
+    pub run_open_output: &'static str,
+    pub run_dir_label: &'static str,
+    pub run_hint_gate: &'static str,
+    // node statuses
+    pub node_pending: &'static str,
+    pub node_ready: &'static str,
+    pub node_running: &'static str,
+    pub node_succeeded: &'static str,
+    pub node_failed: &'static str,
+    pub node_skipped: &'static str,
+    pub node_blocked: &'static str,
+    pub node_cancelled: &'static str,
+    // event kinds
+    pub event_run_started: &'static str,
+    pub event_ready: &'static str,
+    pub event_running: &'static str,
+    pub event_output: &'static str,
+    pub event_succeeded: &'static str,
+    pub event_failed: &'static str,
+    pub event_skipped: &'static str,
+    pub event_blocked: &'static str,
+    pub event_retry: &'static str,
+    pub event_loop_started: &'static str,
+    pub event_iteration: &'static str,
+    pub event_iteration_done: &'static str,
+    pub event_loop_done: &'static str,
+    pub event_cancelled: &'static str,
+    pub event_run_finished: &'static str,
+    // output viewer
+    pub output_title: &'static str,
+    pub output_unavailable: &'static str,
+    pub output_live_hint: &'static str,
+    // issues overlay
+    pub issues_title: &'static str,
+    pub issues_none: &'static str,
+    pub issue_error: &'static str,
+    pub issue_warning: &'static str,
+    // help overlay
+    pub help_title: &'static str,
+    pub help_intro: &'static str,
+    pub help_step_task: &'static str,
+    pub help_step_bindings: &'static str,
+    pub help_step_builder: &'static str,
+    pub help_step_validate: &'static str,
+    pub help_step_run: &'static str,
+    pub help_step_monitor: &'static str,
+    pub help_step_status: &'static str,
+    pub help_keys_title: &'static str,
+}
+
+pub const EN: Strings = Strings {
+    screen_overview: "Overview",
+    screen_builder: "Graph Builder",
+    screen_run: "Run Monitor",
+    key_screens: "screens",
+    key_task: "task",
+    key_template: "template",
+    key_profile: "profile",
+    key_model: "model",
+    key_validate: "validate",
+    key_run: "run",
+    key_save: "save",
+    key_help: "help",
+    key_lang: "language",
+    key_quit: "quit",
+    key_move: "j/k move",
+    key_apply: "Enter apply",
+    key_close: "Esc close",
+    key_scroll: "j/k scroll",
+    start_here: "START HERE",
+    label_task: "Task",
+    label_template: "Template",
+    label_profile: "Profile",
+    label_model: "Model",
+    label_graph: "Graph",
+    label_shape: "Shape",
+    label_save: "Save",
+    label_dirty: "unsaved",
+    nodes_edges: "{nodes} nodes / {edges} edges",
+    runtime_default: "runtime default",
+    provider_default: "provider default",
+    guide_task: "i  type the task (multi-line: Enter = newline, Ctrl+S = save)",
+    guide_bindings: "t/p/m  pick template / profile / model (pickers show previews)",
+    guide_builder: "2  inspect and edit the node list; v lists validation issues",
+    guide_run: "r  run (auto-saves first) · 3 monitor · o view node output",
+    guide_help: "?  help · l language (English/日本語)",
+    graph_flow_title: " Graph flow ",
+    edges_header: "EDGES",
+    status_ready: "Ready. Press i to enter a task, then r to run.",
+    status_load_profiles_failed: "failed to load provider profiles: {error}",
+    status_task_updated: "Task updated and graph rebuilt. Press 2 to review, s to save, r to run.",
+    status_task_goal_only: "Task updated (goal only). Node prompts still contain the previous task text; press e on a node to edit it.",
+    status_task_empty: "Task cannot be empty.",
+    status_template_applied: "Template '{name}' applied: {shape}.",
+    status_template_edits_discarded: "Template '{name}' applied: {shape}. Your previous node edits were replaced by the template.",
+    status_edits_discarded_note: "Your previous node edits were replaced by this selection.",
+    status_profile_applied: "Profile '{name}' applied to agent-like nodes.",
+    status_profile_none: "No enabled provider profiles were found; runtime default routing remains active.",
+    status_model_override: "Model override: {model}.",
+    status_node_prompt_updated: "Node prompt updated.",
+    status_no_node: "No node is selected.",
+    status_not_prompt_node: "The selected node does not have an inline prompt.",
+    status_edit_cancelled: "Edit cancelled.",
+    status_cancel_requested: "Cancellation requested; waiting for the runtime to finish...",
+    status_run_started: "Run started. The runtime owns scheduling; this screen only observes events.",
+    status_run_dir: "Run {run_id}: .gloop/runs/{run_id} — poll it with 'gloop status {run_id}'",
+    status_gate_waiting: "Human gate waiting: press y to approve, n to reject, Enter for default.",
+    status_run_finished: "Run finished: {status}. Press o on a node to view its output.",
+    status_run_failed: "Run failed: {error}",
+    status_run_task_stopped: "Run task stopped unexpectedly: {error}",
+    status_gate_approved: "Gate {node}: approved.",
+    status_gate_rejected: "Gate {node}: rejected.",
+    status_save_blocked: "Save blocked: graph is invalid. Press v to list issues.",
+    status_saved: "Saved {path}.",
+    status_run_blocked_invalid: "Run blocked: fix graph validation errors first (press v to list them).",
+    status_run_active: "A run is already active.",
+    status_graph_valid: "Graph valid ({warnings} warning(s)).",
+    status_graph_invalid: "Graph invalid: {errors} error(s), {warnings} warning(s). Issues are listed above.",
+    status_added_node: "Added {id}. Press e to edit its prompt or c to connect it.",
+    status_add_node_failed: "Could not add node: {error}",
+    status_connect_new_failed: "Could not connect new node: {error}",
+    status_keep_one_node: "Keep at least one node in the graph.",
+    status_removed_node: "Removed {id} and its incident edges.",
+    status_remove_failed: "Could not remove {id}: {error}",
+    status_connecting: "Connecting from {id}. Move to a target node and press Enter; Esc cancels.",
+    status_connect_cancelled: "Connection cancelled.",
+    status_self_connect: "A node cannot connect to itself.",
+    status_connect_rejected: "Connection rejected: {error}",
+    status_edge_added: "Added data edge {from} -> {to}.",
+    status_language: "Language: {lang}.",
+    status_autosave_before_run: "Graph auto-saved before run.",
+    input_task: " Task · Enter = newline · Ctrl+S save · Esc cancel ",
+    input_model: " Model override · Enter save · blank clears ",
+    input_prompt: " Node prompt · Enter = newline · Ctrl+S save · Esc cancel ",
+    gate_title: " Human gate ",
+    gate_node: "Node: {node}",
+    gate_keys: "y approve · n reject · Enter default ({default})",
+    gate_approve: "approve",
+    gate_reject: "reject",
+    template_picker_title: " Templates · j/k select · Enter apply · Esc close ",
+    profile_picker_title: " Profiles · j/k select · Enter apply · Esc close ",
+    picker_discard_warning: "Manual node edits exist: applying rebuilds from this selection and discards them.",
+    picker_current: "(current)",
+    picker_disabled: "(disabled)",
+    picker_source_builtin: "builtin",
+    picker_source_user: "user",
+    picker_source_project: "project",
+    template_desc_direct: "one agent task",
+    template_desc_plan_implement_verify: "plan, implement, then verify",
+    template_desc_parallel_research_reduce: "research in parallel, then reduce",
+    template_desc_review_fix_loop: "bounded review and fix loop",
+    template_desc_design_wall_bounce: "two designers wall-bounce proposals and integrate",
+    builder_nodes_title: " Nodes · j/k select ",
+    builder_connecting: " Nodes · connecting from {id} ",
+    builder_editor_title: " Node editor ",
+    builder_no_node: "No node selected.",
+    builder_not_prompt: "(not a prompt node)",
+    builder_keys: "a add agent · e edit prompt · x remove · c connect · Enter finish",
+    builder_label_kind: "kind",
+    builder_label_profile: "profile",
+    builder_label_model: "model",
+    builder_label_retry: "retry attempts",
+    builder_label_fanout: "fan-out",
+    builder_label_prompt: "PROMPT",
+    builder_label_edges: "EDGES",
+    run_nodes_running: " Nodes · RUNNING ",
+    run_nodes_idle: " Nodes · IDLE ",
+    run_events: "EVENT STREAM",
+    run_result: "RESULT",
+    run_status_label: "status: {status}",
+    run_meta: "run: {id} · {ms}ms",
+    run_selected: "selected: {id} → {status}",
+    run_output: "output: {output}",
+    run_error: "error: {error}",
+    run_open_output: "o open full output",
+    run_dir_label: "run dir",
+    run_hint_gate: "y/n/Enter answer the gate",
+    node_pending: "Pending",
+    node_ready: "Ready",
+    node_running: "Running",
+    node_succeeded: "Succeeded",
+    node_failed: "Failed",
+    node_skipped: "Skipped",
+    node_blocked: "Blocked",
+    node_cancelled: "Cancelled",
+    event_run_started: "run started",
+    event_ready: "ready",
+    event_running: "running",
+    event_output: "output",
+    event_succeeded: "succeeded",
+    event_failed: "failed",
+    event_skipped: "skipped",
+    event_blocked: "blocked",
+    event_retry: "retry",
+    event_loop_started: "loop started",
+    event_iteration: "iteration",
+    event_iteration_done: "iteration done",
+    event_loop_done: "loop done",
+    event_cancelled: "cancelled",
+    event_run_finished: "run finished",
+    output_title: " Output · {node} · j/k scroll · Esc close ",
+    output_unavailable: "No output for this node yet.",
+    output_live_hint: "While a run is in flight, poll intermediate results with: gloop status {run_id} --json",
+    issues_title: " Validation issues · j/k scroll · Esc close ",
+    issues_none: "No issues: the graph is valid.",
+    issue_error: "error",
+    issue_warning: "warning",
+    help_title: " Help · Esc close ",
+    help_intro: "gloop runs graphs of agent/command nodes. A typical first run:",
+    help_step_task: "1. i        type your task in natural language (multi-line)",
+    help_step_bindings: "2. t / p    pick a template and a provider profile (pickers show previews)",
+    help_step_builder: "3. 2        review the nodes; a/x/e/c add, remove, edit, connect",
+    help_step_validate: "4. v        validate; the issue list opens automatically on errors",
+    help_step_run: "5. s / r    save the YAML, or run immediately (r auto-saves)",
+    help_step_monitor: "6. 3        watch node states; o opens a node's full output",
+    help_step_status: "Outside the TUI, any agent can poll a run: gloop status --json",
+    help_keys_title: "KEYS",
+};
+
+pub const JA: Strings = Strings {
+    screen_overview: "概要",
+    screen_builder: "グラフビルダー",
+    screen_run: "実行モニター",
+    key_screens: "画面",
+    key_task: "タスク",
+    key_template: "テンプレート",
+    key_profile: "プロファイル",
+    key_model: "モデル",
+    key_validate: "検証",
+    key_run: "実行",
+    key_save: "保存",
+    key_help: "ヘルプ",
+    key_lang: "言語",
+    key_quit: "終了",
+    key_move: "j/k 移動",
+    key_apply: "Enter 適用",
+    key_close: "Esc 閉じる",
+    key_scroll: "j/k スクロール",
+    start_here: "ここから始めよう",
+    label_task: "タスク",
+    label_template: "テンプレート",
+    label_profile: "プロファイル",
+    label_model: "モデル",
+    label_graph: "グラフ",
+    label_shape: "形",
+    label_save: "保存先",
+    label_dirty: "未保存",
+    nodes_edges: "{nodes} ノード / {edges} エッジ",
+    runtime_default: "ランタイム既定",
+    provider_default: "プロバイダ既定",
+    guide_task: "i  タスクを自然言語で入力（複数行対応: Enter=改行、Ctrl+S=保存）",
+    guide_bindings: "t/p/m  テンプレート／プロファイル／モデルを選択（プレビュー付き）",
+    guide_builder: "2  ノード一覧の確認と編集 · v で検証結果を表示",
+    guide_run: "r  実行（直前に自動保存）· 3 で監視 · o でノード出力を表示",
+    guide_help: "?  ヘルプ · l 言語切替 (English/日本語)",
+    graph_flow_title: " グラフの流れ ",
+    edges_header: "エッジ",
+    status_ready: "準備完了。i でタスクを入力し、r で実行してください。",
+    status_load_profiles_failed: "プロファイルの読み込みに失敗: {error}",
+    status_task_updated: "タスクを更新し、グラフを再構築しました。2 で確認、s で保存、r で実行。",
+    status_task_goal_only: "タスク（ゴール）のみ更新しました。ノードのpromptは以前のタスク文のままです。必要なら e で編集してください。",
+    status_task_empty: "タスクは空にできません。",
+    status_template_applied: "テンプレート '{name}' を適用: {shape}。",
+    status_template_edits_discarded: "テンプレート '{name}' を適用: {shape}。これまでのノード編集はテンプレートの内容で置き換わりました。",
+    status_edits_discarded_note: "これまでのノード編集は、この選択内容で置き換わりました。",
+    status_profile_applied: "プロファイル '{name}' を agent 系ノードに適用しました。",
+    status_profile_none: "有効なプロファイルが見つかりません。ランタイム既定のルーティングのままです。",
+    status_model_override: "モデル指定: {model}。",
+    status_node_prompt_updated: "ノードのpromptを更新しました。",
+    status_no_node: "ノードが選択されていません。",
+    status_not_prompt_node: "選択中のノードにはinline promptがありません。",
+    status_edit_cancelled: "編集をキャンセルしました。",
+    status_cancel_requested: "停止を要求しました。ランタイムの終了を待っています…",
+    status_run_started: "実行を開始しました。進行管理はランタイムが担当し、この画面は観察のみ行います。",
+    status_run_dir: "実行 {run_id}: .gloop/runs/{run_id} — 'gloop status {run_id}' で進行を確認できます",
+    status_gate_waiting: "承認ゲートが待機中: y=承認、n=拒否、Enter=既定値。",
+    status_run_finished: "実行終了: {status}。ノードを選んで o を押すと全出力を見られます。",
+    status_run_failed: "実行失敗: {error}",
+    status_run_task_stopped: "実行タスクが予期せず停止しました: {error}",
+    status_gate_approved: "ゲート {node}: 承認しました。",
+    status_gate_rejected: "ゲート {node}: 拒否しました。",
+    status_save_blocked: "保存できません: グラフが不正です。v で問題一覧を確認してください。",
+    status_saved: "{path} に保存しました。",
+    status_run_blocked_invalid: "実行できません: まず検証エラーを修正してください（v で一覧表示）。",
+    status_run_active: "すでに実行中です。",
+    status_graph_valid: "グラフは妥当です（警告 {warnings} 件）。",
+    status_graph_invalid: "グラフが不正: エラー {errors} 件、警告 {warnings} 件。一覧を上部に表示しました。",
+    status_added_node: "{id} を追加しました。e でprompt編集、c で接続できます。",
+    status_add_node_failed: "ノードを追加できません: {error}",
+    status_connect_new_failed: "新規ノードを接続できません: {error}",
+    status_keep_one_node: "グラフには最低1つのノードが必要です。",
+    status_removed_node: "{id} と、それにつながるエッジを削除しました。",
+    status_remove_failed: "{id} を削除できません: {error}",
+    status_connecting: "{id} から接続中。対象ノードに移動して Enter、Esc でキャンセル。",
+    status_connect_cancelled: "接続をキャンセルしました。",
+    status_self_connect: "自分自身への接続はできません。",
+    status_connect_rejected: "接続を拒否されました: {error}",
+    status_edge_added: "データエッジ {from} -> {to} を追加しました。",
+    status_language: "言語: {lang}。",
+    status_autosave_before_run: "実行前にグラフを自動保存しました。",
+    input_task: " タスク · Enter=改行 · Ctrl+S=保存 · Esc=キャンセル ",
+    input_model: " モデル指定 · Enter=保存 · 空欄で解除 ",
+    input_prompt: " ノードprompt · Enter=改行 · Ctrl+S=保存 · Esc=キャンセル ",
+    gate_title: " 承認ゲート ",
+    gate_node: "ノード: {node}",
+    gate_keys: "y=承認 · n=拒否 · Enter=既定({default})",
+    gate_approve: "承認",
+    gate_reject: "拒否",
+    template_picker_title: " テンプレート · j/k 選択 · Enter 適用 · Esc 閉じる ",
+    profile_picker_title: " プロファイル · j/k 選択 · Enter 適用 · Esc 閉じる ",
+    picker_discard_warning: "ノードの手編集があります: 適用すると、この選択内容で再構築され、手編集は破棄されます。",
+    picker_current: "（現在）",
+    picker_disabled: "（無効）",
+    picker_source_builtin: "組み込み",
+    picker_source_user: "ユーザー",
+    picker_source_project: "プロジェクト",
+    template_desc_direct: "単一のagentタスク",
+    template_desc_plan_implement_verify: "計画 → 実装 → 検証",
+    template_desc_parallel_research_reduce: "並列でリサーチしてから統合",
+    template_desc_review_fix_loop: "回数限定のレビュー&修正ループ",
+    template_desc_design_wall_bounce: "2人のデザイナーが壁打ちして統合",
+    builder_nodes_title: " ノード · j/k 選択 ",
+    builder_connecting: " ノード · {id} から接続中 ",
+    builder_editor_title: " ノード編集 ",
+    builder_no_node: "ノードが選択されていません。",
+    builder_not_prompt: "（promptノードではありません）",
+    builder_keys: "a agent追加 · e prompt編集 · x 削除 · c 接続 · Enter 確定",
+    builder_label_kind: "種類",
+    builder_label_profile: "プロファイル",
+    builder_label_model: "モデル",
+    builder_label_retry: "リトライ回数",
+    builder_label_fanout: "fan-out",
+    builder_label_prompt: "PROMPT",
+    builder_label_edges: "エッジ",
+    run_nodes_running: " ノード · 実行中 ",
+    run_nodes_idle: " ノード · 待機中 ",
+    run_events: "イベント",
+    run_result: "結果",
+    run_status_label: "状態: {status}",
+    run_meta: "実行: {id} · {ms}ms",
+    run_selected: "選択中: {id} → {status}",
+    run_output: "出力: {output}",
+    run_error: "エラー: {error}",
+    run_open_output: "o 全出力を開く",
+    run_dir_label: "実行ディレクトリ",
+    run_hint_gate: "y/n/Enter でゲートに回答",
+    node_pending: "待機",
+    node_ready: "準備完了",
+    node_running: "実行中",
+    node_succeeded: "成功",
+    node_failed: "失敗",
+    node_skipped: "スキップ",
+    node_blocked: "ブロック",
+    node_cancelled: "取り消し",
+    event_run_started: "実行開始",
+    event_ready: "準備完了",
+    event_running: "実行中",
+    event_output: "出力",
+    event_succeeded: "成功",
+    event_failed: "失敗",
+    event_skipped: "スキップ",
+    event_blocked: "ブロック",
+    event_retry: "リトライ",
+    event_loop_started: "ループ開始",
+    event_iteration: "反復",
+    event_iteration_done: "反復完了",
+    event_loop_done: "ループ完了",
+    event_cancelled: "取り消し",
+    event_run_finished: "実行終了",
+    output_title: " 出力 · {node} · j/k スクロール · Esc 閉じる ",
+    output_unavailable: "このノードにはまだ出力がありません。",
+    output_live_hint: "実行中の中間結果は別ターミナルから確認できます: gloop status {run_id} --json",
+    issues_title: " 検証結果 · j/k スクロール · Esc 閉じる ",
+    issues_none: "問題はありません。グラフは妥当です。",
+    issue_error: "エラー",
+    issue_warning: "警告",
+    help_title: " ヘルプ · Esc 閉じる ",
+    help_intro: "gloop は agent/command ノードのグラフを実行します。まずはこの順番で:",
+    help_step_task: "1. i        タスクを自然言語で入力（複数行対応）",
+    help_step_bindings: "2. t / p    テンプレートとプロファイルを選択（プレビュー付きピッカー）",
+    help_step_builder: "3. 2        ノードを確認。a/x/e/c で追加・削除・編集・接続",
+    help_step_validate: "4. v        検証。エラーがあれば一覧が自動で開きます",
+    help_step_run: "5. s / r    YAMLを保存、または即実行（r は直前に自動保存）",
+    help_step_monitor: "6. 3        ノードの状態を監視。o でノードの全出力を表示",
+    help_step_status: "TUIの外からは任意のagentが進行をポーリングできます: gloop status --json",
+    help_keys_title: "キー一覧",
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_locale_like_values() {
+        assert_eq!(Language::from_env_value("ja"), Some(Language::Ja));
+        assert_eq!(Language::from_env_value("ja_JP.UTF-8"), Some(Language::Ja));
+        assert_eq!(Language::from_env_value("ja_JP"), Some(Language::Ja));
+        assert_eq!(Language::from_env_value("en_US.UTF-8"), Some(Language::En));
+        assert_eq!(Language::from_env_value("C"), None);
+        assert_eq!(Language::from_env_value("POSIX"), None);
+        assert_eq!(Language::from_env_value(""), None);
+        assert_eq!(Language::from_env_value("fr_FR.UTF-8"), None);
+    }
+
+    #[test]
+    fn fill_replaces_placeholders_and_keeps_unknown_ones_visible() {
+        let filled = fill("Saved {path}.", &[("path", "/tmp/x.yaml")]);
+        assert_eq!(filled, "Saved /tmp/x.yaml.");
+        let unfilled = fill("Saved {path}.", &[("other", "y")]);
+        assert_eq!(unfilled, "Saved {path}.");
+    }
+
+    #[test]
+    fn every_language_has_every_string() {
+        let en = Language::En.strings();
+        let ja = Language::Ja.strings();
+        assert_eq!(en.screen_overview, "Overview");
+        assert_eq!(ja.screen_overview, "概要");
+        assert_ne!(en.status_ready, ja.status_ready);
+        assert_eq!(Language::En.as_str(), "en");
+        assert_eq!(Language::Ja.as_str(), "ja");
+    }
+}

@@ -791,3 +791,116 @@ fn run_logs_missing_final_run_finished_row_is_a_local_cli_error() {
             .is_some_and(|message| message.contains("incomplete"))
     );
 }
+
+#[test]
+fn status_reports_live_progress_then_final_result() {
+    let dir = tempdir().expect("create tempdir");
+    let repo = dir.path();
+    let script = write_script(&repo.join("slow.sh"), "sleep 2\nprintf \"slow-ok\\n\"");
+    let graph = write_graph(&repo.join("run.yml"), &script, "status-live");
+    let run_id = "status-live-run";
+    let repo_arg = repo.to_str().expect("repo path");
+
+    let mut child = gloop_cmd()
+        .args([
+            "run",
+            "--non-interactive",
+            "--graph",
+            graph.as_str(),
+            "--repo",
+            repo_arg,
+            "--run-id",
+            run_id,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn run");
+
+    let mut saw_running = false;
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let output = gloop_cmd()
+            .args(["status", run_id, "--repo", repo_arg, "--json"])
+            .output()
+            .expect("status runs");
+        if !output.status.success() {
+            continue;
+        }
+        let value = parse_json_output(&output.stdout);
+        if value["run"]["phase"] == "running" {
+            saw_running = true;
+            let nodes = value["run"]["nodes"].as_array().expect("nodes");
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(value["run"]["run_id"], run_id);
+            assert_eq!(value["run"]["finished"], false);
+            break;
+        }
+    }
+    assert!(saw_running, "status must observe the run while in flight");
+
+    let exit = child.wait().expect("wait for run");
+    assert!(exit.success(), "foreground run succeeds");
+
+    let output = gloop_cmd()
+        .args(["status", run_id, "--repo", repo_arg, "--json"])
+        .output()
+        .expect("status after finish");
+    assert!(output.status.success());
+    let value = parse_json_output(&output.stdout);
+    assert_eq!(value["run"]["phase"], "finished");
+    assert_eq!(value["run"]["final_status"], "ready_for_human");
+    assert_eq!(value["run"]["finished"], true);
+    assert_eq!(value["run"]["nodes"][0]["status"], "succeeded");
+    assert!(value["run"]["summary"].is_object(), "summary merged");
+}
+
+#[test]
+fn status_wait_returns_run_exit_code_and_newest_run_is_default() {
+    let dir = tempdir().expect("create tempdir");
+    let repo = dir.path();
+    let script = write_script(&repo.join("fail.sh"), "printf \"boom\\n\" >&2\nexit 1");
+    let graph = write_graph(&repo.join("run.yml"), &script, "status-wait");
+    let repo_arg = repo.to_str().expect("repo path");
+
+    gloop_cmd()
+        .args([
+            "run",
+            "--json",
+            "--non-interactive",
+            "--graph",
+            graph.as_str(),
+            "--repo",
+            repo_arg,
+        ])
+        .assert()
+        .failure();
+
+    // --wait on an already finished run returns the run's exit code.
+    gloop_cmd()
+        .args(["status", "--wait", "--repo", repo_arg, "--json"])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("\"phase\": \"finished\""));
+
+    // Text mode works and stays human readable.
+    gloop_cmd()
+        .args(["status", "--repo", repo_arg])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("phase"));
+}
+
+#[test]
+fn status_unknown_run_fails_with_error() {
+    let dir = tempdir().expect("create tempdir");
+    let repo = dir.path();
+    let repo_arg = repo.to_str().expect("repo path");
+    fs::create_dir_all(repo.join(".gloop").join("runs")).expect("create runs dir");
+
+    gloop_cmd()
+        .args(["status", "does-not-exist", "--repo", repo_arg, "--json"])
+        .assert()
+        .code(6)
+        .stdout(predicate::str::contains("run not found"));
+}

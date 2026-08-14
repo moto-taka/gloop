@@ -64,13 +64,17 @@ show the exact error and run gloop graph list again.
 
 ## English and Japanese
 
-The browser editor starts in English by default. Use --lang ja to start in
-Japanese, or press the language button in the editor:
+All commands pick their display language from the system locale (`GLOOP_LANG`,
+`LC_ALL`, `LC_MESSAGES`, or `LANG`; `ja*` selects Japanese). Force a language
+with `--lang`:
 
 ~~~text
 gloop graph edit NAME --gui --lang en
 gloop graph edit NAME --gui --lang ja
+gloop graph tui --lang ja
 ~~~
+
+Inside the TUI, press `l` to switch English/日本語 live.
 
 The browser editor looks like a simple flow board:
 
@@ -93,6 +97,43 @@ specifically asks for them.
 For command execution and result verification, enter the command exactly as it
 would be written in a terminal, for example `cargo test --workspace`. The GUI
 splits the executable and arguments safely when saving.
+
+## Orchestrating runs from an agent (supervisor pattern)
+
+A cheap model can build and start a graph, and a supervisor (human or another
+agent) can poll progress and collect intermediate + final results without
+holding the run open:
+
+~~~text
+1. Start the run with a stable id you choose, in the background:
+   gloop run --graph PATH --repo . --run-id my-task &
+2. Poll live status (safe while the run is in flight):
+   gloop status my-task --json
+3. Or block until the run finishes and get the run's exit code:
+   gloop status my-task --wait --json
+4. For full post-run inspection:
+   gloop inspect .gloop/runs/my-task
+~~~
+
+`gloop status --json` fields that matter to a supervisor:
+
+- `run.phase`: `initializing`, `running`, or `finished`.
+- `run.nodes[]`: per-node `status`, `attempts`, intermediate `output`, `error`.
+- `run.events_tail`: the most recent journal events.
+- `run.last_event_age_ms`: how stale the last event is; use it to detect a
+  crashed or stuck run (the journal alone cannot distinguish them).
+- `run.summary`: present once the run finishes; contains the final results.
+
+Querying status always exits 0 when the query itself succeeds; use
+`--wait` when the exit code must reflect the run outcome (`0` success,
+`2` blocked/human gate, `3` verification/execution failure, `5` budget
+exhausted, `130` cancelled). With no run id, `gloop status` reports the
+newest run under `.gloop/runs/`.
+
+The resident TUI (`gloop graph`) is the human-friendly equivalent: it shows
+template/profile pickers with previews, validates with a visible issue list,
+auto-saves before running, and displays each node's output (`o`) while and
+after a run.
 
 ## Important rules for an assistant
 
