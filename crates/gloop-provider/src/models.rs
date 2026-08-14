@@ -12,8 +12,10 @@ use tokio::{
 
 use crate::command::apply_isolated_environment;
 
-const MODEL_LIST_TIMEOUT: Duration = Duration::from_secs(4);
-const MAX_MODEL_LIST_OUTPUT: usize = 256 * 1024;
+// `/model` probes start the full claude/qwen CLI runtime, so they need more
+// headroom than native list commands even with their fast-path flags.
+const MODEL_LIST_TIMEOUT: Duration = Duration::from_secs(8);
+const MAX_MODEL_LIST_OUTPUT: usize = 1024 * 1024;
 const MAX_DISCOVERED_MODELS: usize = 512;
 const MAX_MODEL_ID_BYTES: usize = 128;
 type CappedCapture = Arc<Mutex<crate::registry::CappedBytes>>;
@@ -54,6 +56,10 @@ pub enum CatalogFamily {
     CursorAgent,
     Pi,
     OpenCode,
+    Claude,
+    Codex,
+    Qwen,
+    Aider,
 }
 
 pub fn executable_basename(argv0: &str) -> Option<&'static str> {
@@ -70,6 +76,10 @@ pub fn executable_basename(argv0: &str) -> Option<&'static str> {
         "cursor-agent" => Some("cursor-agent"),
         "pi" => Some("pi"),
         "opencode" => Some("opencode"),
+        "claude" => Some("claude"),
+        "codex" => Some("codex"),
+        "qwen" => Some("qwen"),
+        "aider" => Some("aider"),
         _ => None,
     }
 }
@@ -79,6 +89,10 @@ pub fn catalog_family_for_argv0(argv0: &str) -> Option<CatalogFamily> {
         "cursor-agent" => Some(CatalogFamily::CursorAgent),
         "pi" => Some(CatalogFamily::Pi),
         "opencode" => Some(CatalogFamily::OpenCode),
+        "claude" => Some(CatalogFamily::Claude),
+        "codex" => Some(CatalogFamily::Codex),
+        "qwen" => Some(CatalogFamily::Qwen),
+        "aider" => Some(CatalogFamily::Aider),
         _ => None,
     }
 }
@@ -87,6 +101,17 @@ fn listing_args(family: CatalogFamily) -> &'static [&'static str] {
     match family {
         CatalogFamily::CursorAgent | CatalogFamily::Pi => &["--list-models"],
         CatalogFamily::OpenCode => &["models"],
+        // `--bare`/`--safe-mode` skip hooks/MCP/context loading so the probe
+        // returns in about a second; `/model` is handled client-side without
+        // a model call.
+        CatalogFamily::Claude => &["--bare", "-p", "/model"],
+        CatalogFamily::Qwen => &["--safe-mode", "-p", "/model"],
+        CatalogFamily::Codex => &["debug", "models"],
+        // An empty search string makes aider print every known chat model
+        // from its bundled metadata, one `- <id>` per line, without any API
+        // call (aider/models.py: fuzzy_match_models treats "" as a substring
+        // of every model).
+        CatalogFamily::Aider => &["--list-models", ""],
     }
 }
 
@@ -290,7 +315,15 @@ pub fn parse_model_list(family: CatalogFamily, stdout: &[u8]) -> ModelDiscovery 
         Ok(value) => strip_ansi(value),
         Err(_) => return failed("invalid utf-8 output"),
     };
-    let models = parse_json_models(&text).or_else(|| parse_line_models(family, &text));
+    let models = match family {
+        CatalogFamily::Codex => parse_codex_models(&text),
+        CatalogFamily::Claude => parse_claude_models(&text),
+        CatalogFamily::Qwen => parse_qwen_models(&text),
+        CatalogFamily::Aider => parse_aider_models(&text),
+        CatalogFamily::CursorAgent | CatalogFamily::Pi | CatalogFamily::OpenCode => {
+            parse_json_models(&text).or_else(|| parse_line_models(family, &text))
+        }
+    };
     let Some(models) = models else {
         return failed("no models in output");
     };
@@ -299,6 +332,92 @@ pub fn parse_model_list(family: CatalogFamily, stdout: &[u8]) -> ModelDiscovery 
         return failed("no models in output");
     }
     ModelDiscovery::Listed(models)
+}
+
+/// `codex debug models` prints `{"models":[{slug, display_name, visibility, ...}]}`.
+/// Only entries marked `visibility: "list"` are user-selectable; hidden entries
+/// carry large embedded instruction blobs and are skipped.
+fn parse_codex_models(text: &str) -> Option<Vec<CatalogModel>> {
+    let value: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
+    let entries = value.get("models")?.as_array()?;
+    let mut models = Vec::new();
+    for entry in entries {
+        let visible = entry
+            .get("visibility")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|visibility| visibility == "list");
+        if !visible {
+            continue;
+        }
+        let Some(slug) = entry.get("slug").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let label = entry
+            .get("display_name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(slug);
+        push_catalog_model(&mut models, slug, label);
+    }
+    if models.is_empty() {
+        None
+    } else {
+        Some(models)
+    }
+}
+
+/// `claude --bare -p /model` answers client-side (no model call) with a line
+/// like `Available: sonnet, opus, haiku, fable, best, sonnet[1m], ..., or a
+/// full model ID.` The trailing prose is dropped by model-id validation.
+fn parse_claude_models(text: &str) -> Option<Vec<CatalogModel>> {
+    let start = text.find("Available:")? + "Available:".len();
+    let segment = text[start..].lines().next().unwrap_or_default();
+    let mut models = Vec::new();
+    for candidate in segment.split(',') {
+        push_uniform_model(&mut models, candidate);
+    }
+    if models.is_empty() {
+        None
+    } else {
+        Some(models)
+    }
+}
+
+/// `qwen --safe-mode -p /model` answers client-side with the active model
+/// (`Current model: <id>`) but no catalog, so the probe yields one entry.
+fn parse_qwen_models(text: &str) -> Option<Vec<CatalogModel>> {
+    if let Some(models) = parse_claude_models(text) {
+        return Some(models);
+    }
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("Current model:"))?;
+    let model = line.trim_start_matches("Current model:");
+    let mut models = Vec::new();
+    push_uniform_model(&mut models, model);
+    if models.is_empty() {
+        None
+    } else {
+        Some(models)
+    }
+}
+
+/// `aider --list-models ""` prints `Models which match "":` followed by one
+/// `- <id>` line per known chat model. The header is dropped by model-id
+/// validation.
+fn parse_aider_models(text: &str) -> Option<Vec<CatalogModel>> {
+    let mut models = Vec::new();
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix("- ") else {
+            continue;
+        };
+        push_uniform_model(&mut models, rest);
+    }
+    if models.is_empty() {
+        None
+    } else {
+        Some(models)
+    }
 }
 
 fn failed(reason: &str) -> ModelDiscovery {
@@ -398,6 +517,12 @@ fn parse_line_models(family: CatalogFamily, text: &str) -> Option<Vec<CatalogMod
                 }
                 push_uniform_model(&mut models, token);
             }
+            // Claude/Codex/Qwen/Aider output is parsed by dedicated handlers
+            // in parse_model_list and never reaches this line-based fallback.
+            CatalogFamily::Claude
+            | CatalogFamily::Codex
+            | CatalogFamily::Qwen
+            | CatalogFamily::Aider => {}
         }
     }
     if models.is_empty() {
@@ -437,6 +562,8 @@ fn valid_model_id(candidate: &str) -> bool {
                 | b'/'
                 | b'@'
                 | b'-'
+                | b'['
+                | b']'
         )
     })
 }
@@ -666,7 +793,19 @@ mod tests {
             catalog_family_for_argv0(r"C:\tools\opencode.exe"),
             Some(CatalogFamily::OpenCode)
         );
-        assert_eq!(catalog_family_for_argv0("/opt/bin/codex"), None);
+        assert_eq!(
+            catalog_family_for_argv0("/opt/bin/codex"),
+            Some(CatalogFamily::Codex)
+        );
+        assert_eq!(
+            catalog_family_for_argv0("/opt/bin/claude"),
+            Some(CatalogFamily::Claude)
+        );
+        assert_eq!(
+            catalog_family_for_argv0(r"C:\tools\qwen.cmd"),
+            Some(CatalogFamily::Qwen)
+        );
+        assert_eq!(catalog_family_for_argv0("/opt/bin/unknown-agent"), None);
     }
 
     #[tokio::test]
@@ -692,13 +831,33 @@ mod tests {
         let cases = [
             (
                 "cursor-agent",
-                "--list-models",
+                "--list-models\n",
                 "gpt-5.6-luna-xhigh - GPT-5.6 Luna Extra High\n",
             ),
-            ("pi", "--list-models", "provider model\nopenai gpt-4.1\n"),
-            ("opencode", "models", "openai/gpt-4.1\n"),
+            ("pi", "--list-models\n", "provider model\nopenai gpt-4.1\n"),
+            ("opencode", "models\n", "openai/gpt-4.1\n"),
+            (
+                "claude",
+                "--bare\n-p\n/model\n",
+                "Current model: Fable 5 (effort: xhigh)\nUsage: /model <name>. Available: sonnet, opus, fable, or a full model ID.\n",
+            ),
+            (
+                "codex",
+                "debug\nmodels\n",
+                "{\"models\":[{\"slug\":\"gpt-5.6-sol\",\"display_name\":\"GPT-5.6-Sol\",\"visibility\":\"list\"}]}\n",
+            ),
+            (
+                "qwen",
+                "--safe-mode\n-p\n/model\n",
+                "Current model: qwen3.8-max-preview\n",
+            ),
+            (
+                "aider",
+                "--list-models\n\n",
+                "Models which match \"\":\n- openai/gpt-4o\n- anthropic/claude-sonnet-4-5\n",
+            ),
         ];
-        for (name, expected_arg, output) in cases {
+        for (name, expected_args, output) in cases {
             let path = dir.path().join(name);
             let args_path = dir.path().join(format!("{name}.args"));
             let script = format!(
@@ -710,11 +869,11 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
 
             let discovery = discover_models_for_argv0(path.to_str().expect("utf8 path")).await;
-            assert!(matches!(discovery, ModelDiscovery::Listed(_)));
-            assert_eq!(
-                fs::read_to_string(&args_path).expect("args"),
-                format!("{expected_arg}\n")
+            assert!(
+                matches!(discovery, ModelDiscovery::Listed(_)),
+                "{name}: expected listed models, got {discovery:?}"
             );
+            assert_eq!(fs::read_to_string(&args_path).expect("args"), expected_args);
         }
     }
 
@@ -760,7 +919,11 @@ mod tests {
     async fn discover_overflow_output_is_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("opencode");
-        fs::write(&path, "#!/bin/sh\nyes openai/gpt-4.1 | head -c 300000\n").expect("script");
+        fs::write(
+            &path,
+            "#!/bin/sh\nyes openai/gpt-4.1 | head -c 1100000\n",
+        )
+        .expect("script");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
         let discovery = discover_models_for_argv0(path.to_str().expect("utf8 path")).await;
         assert_eq!(
@@ -780,5 +943,143 @@ mod tests {
                 reason: "not installed".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn parse_codex_json_filters_hidden_models_and_maps_labels() {
+        let output = r#"{
+            "models": [
+                {"slug": "gpt-5.6-sol", "display_name": "GPT-5.6-Sol", "visibility": "list"},
+                {"slug": "gpt-5.6-sol-wm", "display_name": "GPT-5.6-Sol-WM", "visibility": "hide"},
+                {"slug": "gpt-5.6-terra", "display_name": "GPT-5.6-Terra", "visibility": "list"},
+                {"slug": "codex-auto-review", "display_name": "Codex Auto Review", "visibility": "hide"}
+            ]
+        }"#;
+        let ModelDiscovery::Listed(models) =
+            parse_model_list(CatalogFamily::Codex, output.as_bytes())
+        else {
+            panic!("expected listed models");
+        };
+        assert_eq!(
+            models,
+            vec![
+                CatalogModel::new("gpt-5.6-sol", "GPT-5.6-Sol"),
+                CatalogModel::new("gpt-5.6-terra", "GPT-5.6-Terra"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_codex_json_rejects_non_json_output() {
+        let ModelDiscovery::Failed { reason } =
+            parse_model_list(CatalogFamily::Codex, b"not json at all")
+        else {
+            panic!("expected failure");
+        };
+        assert_eq!(reason, "no models in output");
+    }
+
+    #[test]
+    fn parse_claude_available_line_drops_trailing_prose() {
+        let output = "Current model: Fable 5 (effort: xhigh)\nUsage: /model <name>. Available: sonnet, opus, haiku, fable, best, sonnet[1m], opus[1m], fable[1m], opusplan, default, or a full model ID.\n";
+        let ModelDiscovery::Listed(models) =
+            parse_model_list(CatalogFamily::Claude, output.as_bytes())
+        else {
+            panic!("expected listed models");
+        };
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "best",
+                "default",
+                "fable",
+                "fable[1m]",
+                "haiku",
+                "opus",
+                "opus[1m]",
+                "opusplan",
+                "sonnet",
+                "sonnet[1m]",
+            ],
+            "aliases must be sorted, bracket suffixes kept, prose dropped"
+        );
+    }
+
+    #[test]
+    fn parse_claude_without_available_line_fails() {
+        let ModelDiscovery::Failed { reason } = parse_model_list(
+            CatalogFamily::Claude,
+            b"Current model: Fable 5 (effort: xhigh)\n",
+        ) else {
+            panic!("expected failure");
+        };
+        assert_eq!(reason, "no models in output");
+    }
+
+    #[test]
+    fn parse_qwen_current_model_yields_single_entry() {
+        let output = "Current model: qwen3.8-max-preview\nUse \"/model <model-id>\" to switch models.\n";
+        let ModelDiscovery::Listed(models) =
+            parse_model_list(CatalogFamily::Qwen, output.as_bytes())
+        else {
+            panic!("expected listed models");
+        };
+        assert_eq!(models, vec![CatalogModel::uniform("qwen3.8-max-preview")]);
+    }
+
+    #[test]
+    fn parse_qwen_prefers_available_list_when_present() {
+        let output = "Current model: qwen3.8-max-preview\nAvailable: qwen3.8-max, qwen3.6-plus\n";
+        let ModelDiscovery::Listed(models) =
+            parse_model_list(CatalogFamily::Qwen, output.as_bytes())
+        else {
+            panic!("expected listed models");
+        };
+        assert_eq!(
+            models,
+            vec![
+                CatalogModel::uniform("qwen3.6-plus"),
+                CatalogModel::uniform("qwen3.8-max"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_aider_list_drops_header_and_keeps_provider_prefixed_ids() {
+        let output = "Models which match \"\":\n- openai/gpt-4o\n- anthropic/claude-sonnet-4-5\n- openai/gpt-4o-mini\n";
+        let ModelDiscovery::Listed(models) =
+            parse_model_list(CatalogFamily::Aider, output.as_bytes())
+        else {
+            panic!("expected listed models");
+        };
+        assert_eq!(
+            models,
+            vec![
+                CatalogModel::uniform("anthropic/claude-sonnet-4-5"),
+                CatalogModel::uniform("openai/gpt-4o"),
+                CatalogModel::uniform("openai/gpt-4o-mini"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_aider_no_match_output_fails() {
+        let ModelDiscovery::Failed { reason } = parse_model_list(
+            CatalogFamily::Aider,
+            b"No models match \"zzz\".\n",
+        ) else {
+            panic!("expected failure");
+        };
+        assert_eq!(reason, "no models in output");
+    }
+
+    #[test]
+    fn model_id_validation_accepts_bracket_aliases_and_rejects_prose() {
+        assert!(valid_model_id("sonnet[1m]"));
+        assert!(valid_model_id("gpt-5.6-sol"));
+        assert!(!valid_model_id("or a full model ID."));
+        assert!(!valid_model_id(""));
+        assert!(!valid_model_id("-flag"));
     }
 }

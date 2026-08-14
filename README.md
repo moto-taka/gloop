@@ -64,6 +64,18 @@ gloop run --graph examples/multi-provider-review.yaml --repo .
 See [examples/multi-provider-review.yaml](examples/multi-provider-review.yaml), with context in
 [examples/review-input.md](examples/review-input.md). The review graph uses built-in profiles (`claude`, `opencode`, and `qwen`) and requires whichever provider CLIs/auth are installed for your setup.
 
+Run a two-designer wall-bounce: `claude` (model `fable`) and `codex` (model
+`gpt-5.6-sol`) produce blind independent designs, critique each other's
+proposal, revise in light of the critique, and a final node integrates both.
+
+```bash
+gloop graph new design.yaml --template design-wall-bounce --request "Design the sync engine"
+gloop run --graph design.yaml --repo .
+```
+
+The template is also selectable in the TUI (`t` cycles templates) and in
+`gloop graph new --interactive`.
+
 Create a graph interactively, in the style of TAKT's authoring flow:
 
 ```bash
@@ -350,9 +362,15 @@ See [docs/SCHEMA.md](docs/SCHEMA.md) and the graphs in [examples](examples).
 - Worktree mode disables hooks, external filesystem monitors, and external diff/textconv helpers. It re-checks and rejects repository-local `filter.*.clean`, `filter.*.smudge`, `filter.*.process`, `diff.*.command`, and `diff.*.textconv` configuration before Git operations because those programs could otherwise execute during checkout/staging/inspection; use `current`/`inherit` or remove the local driver configuration.
 - Final successful worktree nodes can auto-commit into their dedicated branch when `auto_commit` is enabled, and `inherit` reuses the true source workspace by identity.
 - Cancellation is process-group based on Unix builds (`ProcessGroup`) and direct-child on non-Unix platforms.
-- Profiles accept arbitrary model ids and aliases. Supported command profiles can
-  expose their current model list in the GUI; remote provider catalogs are still
-  not enumerated, and each node invocation is fresh.
+- Profiles accept arbitrary model ids and aliases. Command profiles expose their
+  model list in the GUI and TUI selectors, discovered at launch from each CLI's
+  own listing command: `cursor-agent`/`pi` use `--list-models`, `opencode` uses
+  `models`, `aider` uses `--list-models ""` (bundled offline catalog), `codex`
+  uses `codex debug models` (only `visibility: "list"` entries), and
+  `claude`/`qwen` answer a client-side `/model` probe (`claude --bare -p
+  /model`, `qwen --safe-mode -p /model`) without a model call; `qwen` currently
+  reports its active model only. Remote provider catalogs are still not
+  enumerated, and each node invocation is fresh.
 - Empty model/provider outputs are rejected when they do not satisfy node output contracts (including text/JSON output mode checks).
 - Serialized HTTP provider request bodies are capped at 1 MiB; profile `parameters` maps are capped at 256 entries and 256 KiB serialized.
 - Replay validates hash-chain integrity, run-id/sequence order, and schema compatibility before accepting a rerun; replay rehydrates scheduler state from events and summary checks. These unkeyed hashes detect partial/corrupt edits, not a same-user attacker who can consistently rewrite the whole run directory.
