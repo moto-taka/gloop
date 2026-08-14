@@ -13,8 +13,8 @@ anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 futures.workspace = true
-gloop-core = { path = "../gloop-core", version = "0.4.5" }
-gloop-provider = { path = "../gloop-provider", version = "0.4.5" }
+gloop-core = { path = "../gloop-core", version = "0.5.0" }
+gloop-provider = { path = "../gloop-provider", version = "0.5.0" }
 hex.workspace = true
 indexmap.workspace = true
 jsonschema.workspace = true

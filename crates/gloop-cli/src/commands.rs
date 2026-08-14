@@ -16,9 +16,9 @@ use gloop_provider::{
     catalog_family_for_argv0, discover_models_for_argv0, merge_profile_models,
 };
 use gloop_runtime::{
-    JournalError, JournalRead, NodeFailureClass, ProgressEvent, ReplayError, ReplayReport,
-    RunError, RunOptions, Runtime, inspect_run, node_failure_class, read_journal, replay_events,
-    replay_journal,
+    JournalError, JournalRead, LiveRunReport, NodeFailureClass, ProgressEvent, ReplayError,
+    ReplayReport, RunError, RunOptions, Runtime, inspect_run, live_run_status, node_failure_class,
+    read_journal, replay_events, replay_journal,
 };
 use schemars::schema_for;
 use serde::Serialize;
@@ -31,7 +31,8 @@ use tokio_util::sync::CancellationToken;
 use toml::{Value as TomlValue, map::Map as TomlMap};
 
 use crate::atomic_write::{write_text_atomic, write_text_no_replace};
-use crate::gui::{self, GuiTarget, Language};
+use crate::gui::{self, GuiTarget};
+use crate::i18n::Language;
 use crate::templates;
 use crate::wizard;
 
@@ -312,6 +313,23 @@ pub(crate) fn apply_model_to_agent_nodes(graph: &mut Graph, model: &str) {
             | NodeKind::Synthesize {
                 model: existing, ..
             } => *existing = Some(model.to_owned()),
+            _ => {}
+        }
+    }
+}
+
+pub(crate) fn clear_model_on_agent_nodes(graph: &mut Graph) {
+    for node in &mut graph.spec.nodes {
+        match &mut node.kind {
+            NodeKind::Agent {
+                model: existing, ..
+            }
+            | NodeKind::Reduce {
+                model: existing, ..
+            }
+            | NodeKind::Synthesize {
+                model: existing, ..
+            } => *existing = None,
             _ => {}
         }
     }
@@ -605,6 +623,7 @@ pub async fn run_foreground(
     max_parallel: Option<usize>,
     trust_project_profiles: bool,
     interactive: bool,
+    run_id: Option<String>,
 ) -> CommandResult {
     let mut generated = false;
     let graph = if let Some(path) = graph_path {
@@ -749,6 +768,30 @@ pub async fn run_foreground(
     };
 
     let artifact_root = repo.join(PROJECT_CONFIG_PATH).with_file_name("runs");
+    let run_id = match run_id {
+        Some(id) => {
+            if id.is_empty()
+                || id == "."
+                || id == ".."
+                || id.contains(['/', '\\'])
+                || id.len() > 128
+            {
+                return CommandResult::failure_json(
+                    ExitCode::InvalidGraph,
+                    "invalid run id",
+                    Some(json!({"run_id": id})),
+                );
+            }
+            id
+        }
+        None => ulid::Ulid::new().to_string().to_ascii_lowercase(),
+    };
+    if !json_mode {
+        eprintln!(
+            "run: {run_id}\nrun dir: {}",
+            artifact_root.join(&run_id).display()
+        );
+    }
     let runtime = Runtime::new(registry, artifact_root);
 
     let show_progress = !json_mode;
@@ -778,6 +821,7 @@ pub async fn run_foreground(
         max_parallel: cli_max_parallel,
         cancellation,
         progress,
+        run_id: Some(run_id),
         ..RunOptions::default()
     };
 
@@ -2536,6 +2580,373 @@ pub async fn run_logs(path: PathBuf, json_mode: bool) -> CommandResult {
                     },
                 )
             }
+        }
+    }
+}
+
+/// Resolve one run directory under `<repo>/.gloop/runs`. Without a run id
+/// the directory with the newest modification time wins. Name order is not
+/// usable: run ids may be user-chosen (`--run-id my-task`) and would sort
+/// against the ULID default ids.
+fn resolve_run_dir(runs_root: &Path, run_id: Option<&str>) -> Result<PathBuf, String> {
+    let Some(id) = run_id else {
+        let entries = std::fs::read_dir(runs_root)
+            .map_err(|error| format!("failed to read {}: {error}", runs_root.display()))?;
+        let newest = entries
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name())
+            .filter_map(|name| {
+                let path = runs_root.join(&name);
+                let metadata = path.symlink_metadata().ok()?;
+                if !metadata.is_dir() {
+                    return None;
+                }
+                let modified = metadata.modified().ok()?;
+                Some((modified, name))
+            })
+            .max();
+        return newest
+            .map(|(_, name)| runs_root.join(name))
+            .ok_or_else(|| format!("no runs found under {}", runs_root.display()));
+    };
+    if id.is_empty() || id == "." || id == ".." || id.contains(['/', '\\']) {
+        return Err(format!("invalid run id: {id}"));
+    }
+    let dir = runs_root.join(id);
+    let is_real_dir = dir
+        .symlink_metadata()
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false);
+    if is_real_dir {
+        Ok(dir)
+    } else {
+        Err(format!(
+            "run '{id}' was not found under {}",
+            runs_root.display()
+        ))
+    }
+}
+
+fn truncate_chars(text: &str, limit: usize) -> String {
+    let count = text.chars().count();
+    if count <= limit {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(limit).collect();
+    format!("{kept}\u{2026}(+{} chars)", count - limit)
+}
+
+fn truncate_json_strings(value: Value, limit: usize) -> Value {
+    match value {
+        Value::String(text) => Value::String(truncate_chars(&text, limit)),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| truncate_json_strings(item, limit))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, item)| (key, truncate_json_strings(item, limit)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn status_payload(report: &LiveRunReport, run_dir: &Path) -> Value {
+    let nodes: Vec<Value> = report
+        .journal
+        .nodes
+        .iter()
+        .map(|(id, outcome)| {
+            json!({
+                "id": id,
+                "status": outcome.status,
+                "attempts": outcome.attempts,
+                "profile": outcome.profile,
+                "model": outcome.model,
+                "error": outcome.error,
+                "duration_ms": outcome.duration_ms,
+                "output": outcome
+                    .output
+                    .as_ref()
+                    .map(|output| truncate_json_strings(output.clone(), 400)),
+                "output_artifact": outcome.output_artifact,
+            })
+        })
+        .collect();
+    let tail: Vec<Value> = report
+        .events_tail
+        .iter()
+        .map(|event| {
+            json!({
+                "sequence": event.sequence,
+                "timestamp": event.timestamp,
+                "kind": event.kind,
+                "node": event.node_id,
+                "attempt": event.attempt,
+                "message": event.message.as_deref().map(|message| truncate_chars(message, 160)),
+            })
+        })
+        .collect();
+    json!({
+        "run_id": report.run_id,
+        "run_dir": run_dir,
+        "phase": report.phase(),
+        "finished": report.finished(),
+        "final_status": report.final_status(),
+        "graph_name": report.graph_name,
+        "goal": report.goal,
+        "started_at": report.started_at,
+        "last_event_at": report.last_event_at,
+        "last_event_age_ms": report.last_event_age_ms,
+        "truncated_tail": report.truncated_tail,
+        "event_count": report.journal.event_count,
+        "nodes": nodes,
+        "events_tail": tail,
+        "summary": report.summary.as_ref().map(|summary| {
+            truncate_json_strings(
+                serde_json::to_value(summary).unwrap_or(Value::Null),
+                400,
+            )
+        }),
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn format_status_text(report: &LiveRunReport, run_dir: &Path, language: Language) -> String {
+    let (phase_label, graph_label, events_label, nodes_label, tail_label, result_label, age_label) =
+        match language {
+            Language::En => (
+                "phase",
+                "graph",
+                "events",
+                "nodes",
+                "tail",
+                "result",
+                "last event",
+            ),
+            Language::Ja => (
+                "\u{9032}\u{884c}",
+                "\u{30b0}\u{30e9}\u{30d5}",
+                "\u{30a4}\u{30d9}\u{30f3}\u{30c8}",
+                "\u{30ce}\u{30fc}\u{30c9}",
+                "\u{76f4}\u{8fd1}",
+                "\u{7d50}\u{679c}",
+                "\u{6700}\u{7d42}\u{30a4}\u{30d9}\u{30f3}\u{30c8}",
+            ),
+        };
+    let phase = if report.finished() {
+        match report.final_status() {
+            Some(status) => format!("finished ({status:?})"),
+            None => "finished".to_owned(),
+        }
+    } else {
+        report.phase().to_owned()
+    };
+    let mut out = String::new();
+    let _ = fmt::Write::write_fmt(
+        &mut out,
+        format_args!(
+            "run:     {}\n{}:   {}\ndir:     {}\n",
+            report.run_id,
+            phase_label,
+            phase,
+            run_dir.display()
+        ),
+    );
+    if let (Some(name), Some(goal)) = (&report.graph_name, &report.goal) {
+        let goal_line = goal.lines().next().unwrap_or_default();
+        let _ = fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "{}:  {} \u{00b7} {}\n",
+                graph_label,
+                name,
+                truncate_chars(goal_line, 80)
+            ),
+        );
+    }
+    let truncated = if report.truncated_tail {
+        match language {
+            Language::En => " (truncated tail)",
+            Language::Ja => " (\u{672b}\u{5c3e}\u{4e0d}\u{5b8c}\u{5168})",
+        }
+    } else {
+        ""
+    };
+    let _ = fmt::Write::write_fmt(
+        &mut out,
+        format_args!(
+            "{}: {}{}\n{}: {}ms ago\n{}:\n",
+            events_label,
+            report.journal.event_count,
+            truncated,
+            age_label,
+            report.last_event_age_ms.unwrap_or(0),
+            nodes_label
+        ),
+    );
+    for (id, outcome) in &report.journal.nodes {
+        let detail = outcome
+            .error
+            .as_deref()
+            .map(|error| format!("  error: {}", truncate_chars(error, 80)))
+            .or_else(|| {
+                outcome
+                    .output
+                    .as_ref()
+                    .map(|output| format!("  output: {}", truncate_chars(&output.to_string(), 80)))
+            })
+            .unwrap_or_default();
+        let _ = fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "  {:<20} {:<10?} attempts={}{}\n",
+                id, outcome.status, outcome.attempts, detail
+            ),
+        );
+    }
+    if !report.events_tail.is_empty() {
+        let _ = fmt::Write::write_fmt(&mut out, format_args!("{tail_label}:\n"));
+        for event in &report.events_tail {
+            let _ = fmt::Write::write_fmt(
+                &mut out,
+                format_args!(
+                    "  {:>4} {:<18} {}\n",
+                    event.sequence,
+                    format!("{:?}", event.kind),
+                    event
+                        .message
+                        .as_deref()
+                        .map(|message| truncate_chars(message, 80))
+                        .unwrap_or_default()
+                ),
+            );
+        }
+    }
+    if let Some(summary) = &report.summary {
+        let _ = fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "{}: {:?} \u{00b7} {}ms \u{00b7} {}\n",
+                result_label, summary.status, summary.duration_ms, summary.summary
+            ),
+        );
+    }
+    out
+}
+
+/// Pollable live status for one run. While the run is in flight the journal
+/// prefix is reduced with the same rules as replay, so node states and
+/// intermediate outputs are visible before `summary.json` exists.
+///
+/// Exit-code contract: a successful query exits 0 with or without `--wait`
+/// (polling loops must be able to distinguish query errors from run state,
+/// which they read from `phase`/`final_status`). With `--wait`, the command
+/// blocks until the run finishes and then exits with the run's own status
+/// code. `--wait` also retries the run-directory lookup and the first journal
+/// reads for a grace period, so `gloop run --run-id x & gloop status x --wait`
+/// does not race the runtime's directory creation.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_status(
+    run_id: Option<String>,
+    repo: PathBuf,
+    events: usize,
+    wait: bool,
+    interval_ms: u64,
+    json_mode: bool,
+    language: Language,
+) -> CommandResult {
+    let runs_root = repo.join(PROJECT_CONFIG_PATH).with_file_name("runs");
+    let interval = std::time::Duration::from_millis(interval_ms.max(50));
+    let grace = std::time::Duration::from_secs(30);
+    let started = std::time::Instant::now();
+
+    let mut run_dir: Option<PathBuf> = None;
+    let report = loop {
+        if run_dir.is_none() {
+            match resolve_run_dir(&runs_root, run_id.as_deref()) {
+                Ok(dir) => run_dir = Some(dir),
+                Err(message) => {
+                    if wait && started.elapsed() < grace {
+                        tokio::time::sleep(interval).await;
+                        continue;
+                    }
+                    return if json_mode {
+                        CommandResult::failure_json(
+                            ExitCode::InvalidGraph,
+                            "run not found",
+                            Some(json!({"error": message})),
+                        )
+                    } else {
+                        CommandResult::failure_text(ExitCode::InvalidGraph, message)
+                    };
+                }
+            }
+        }
+        let dir = run_dir.clone().expect("resolved above");
+        match live_run_status(&dir, events).await {
+            Ok(report) => {
+                if !wait || report.finished() {
+                    break report;
+                }
+            }
+            Err(error) => {
+                let retryable_startup = wait
+                    && started.elapsed() < grace
+                    && (matches!(&error, ReplayError::EmptyJournal)
+                        || matches!(&error, ReplayError::Io(io_error)
+                            if io_error.kind() == std::io::ErrorKind::NotFound));
+                if retryable_startup {
+                    tokio::time::sleep(interval).await;
+                    continue;
+                }
+                return if json_mode {
+                    CommandResult::failure_json(
+                        ExitCode::InvalidGraph,
+                        "failed to read run status",
+                        Some(json!({"run_dir": dir, "error": error.to_string()})),
+                    )
+                } else {
+                    CommandResult::failure_text(
+                        ExitCode::InvalidGraph,
+                        format!("failed to read run status at {}: {error}", dir.display()),
+                    )
+                };
+            }
+        }
+        tokio::time::sleep(interval).await;
+    };
+    let run_dir = run_dir.expect("run dir resolved before the report loop exits");
+
+    let exit_code = if wait && report.finished() {
+        if let Some(summary) = &report.summary {
+            summary_exit_code(summary)
+        } else {
+            report
+                .final_status()
+                .map_or(ExitCode::Internal, status_exit_code)
+        }
+    } else {
+        ExitCode::Success
+    };
+
+    if json_mode {
+        CommandResult {
+            code: exit_code,
+            output: Some(json!({
+                "success": true,
+                "run": status_payload(&report, &run_dir),
+            })),
+            text: None,
+        }
+    } else {
+        CommandResult {
+            code: exit_code,
+            output: None,
+            text: Some(format_status_text(&report, &run_dir, language)),
         }
     }
 }

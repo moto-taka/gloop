@@ -14,7 +14,8 @@ pub use executor::{
 };
 pub use journal::{Journal, JournalError, JournalRead, JournalRow, read_events, read_journal};
 pub use replay::{
-    ReplayError, ReplayReport, RunInspection, inspect_run, replay_events, replay_journal,
+    LiveRunReport, ReplayError, ReplayReport, RunInspection, inspect_run, live_run_status,
+    replay_events, replay_events_partial, replay_journal, replay_journal_partial,
 };
 pub use worktree::{
     GitWorktreeManager, WorktreeError, WorktreeManifest, WorktreeRecord, WorktreeWorkspace,

@@ -414,3 +414,39 @@ It deliberately leaves the full inspector field matrix, edge-kind condition
 form, saved preset catalog, and model discovery cache for the next slice. Those
 features should reuse the existing wizard/GUI helpers and core schema rather
 than create a second graph format.
+
+## 14. v0.5.0 usability revision
+
+The resident TUI was revised after field feedback (0.4.x):
+
+1. **Localization.** All TUI strings live in one compile-time-checked table
+   per language (`crates/gloop-cli/src/i18n.rs`). The language follows the
+   system locale (`GLOOP_LANG`, `LC_ALL`, `LC_MESSAGES`, `LANG`), is
+   switchable live with `l`, and can be forced with `gloop graph tui --lang`.
+   English and Japanese ship together; adding a language is adding one table.
+2. **Task editor.** The `i` editor is multi-line: `Enter` inserts a newline,
+   `Ctrl+S` (or `Ctrl+D`) commits, `Esc`/`Ctrl+C` cancels, arrow keys move
+   between lines, and bracketed paste inserts text verbatim. The old
+   "save once, then blocked" deadlock is gone: the single dirty flag was
+   split into `dirty` (differs from disk) and `manual_edits` (user node
+   content). With no manual edits, a task change rebuilds the graph from the
+   template; with manual edits, only `spec.goal` changes and the status line
+   says node prompts still carry the old task text.
+3. **Visible bindings.** `t` and `p` open pickers instead of silently cycling:
+   every template row shows its description, node/edge counts, and a shape
+   preview (`plan -> implement -> verify`); every profile row shows kind,
+   source, and default model. Applying with manual edits present warns in the
+   picker and restates the discard in the status line. The Overview screen
+   shows the same shape line plus the full edge list, so the graph is never
+   invisible.
+4. **Beginner guard rails.** `v` opens the validation issue list, `r`
+   auto-saves before running and announces the run directory, `?` opens a
+   help overlay with the six-step first-run flow, and `o` opens a scrollable
+   viewer for the selected node's output (reading the live journal while the
+   run is in flight).
+5. **Agent observability.** New `gloop status [RUN_ID] [--wait] [--json]`
+   command (see README "Watching runs from scripts and agents"). It reduces
+   the run journal with the same rules as replay (`replay_events_partial`),
+   tolerates the in-flight truncated final row, merges `summary.json` when it
+   appears, and truncates large outputs in JSON so a supervisor can poll
+   cheaply. `gloop run --run-id` lets the caller choose the id up front.

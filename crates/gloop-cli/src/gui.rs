@@ -28,6 +28,7 @@ use crate::{
     atomic_write::{
         write_text_atomic_if_unchanged_sync, write_text_atomic_sync, write_text_no_replace_sync,
     },
+    i18n::Language,
     templates,
 };
 
@@ -60,21 +61,6 @@ impl Default for ServerTuning {
             read_timeout: SOCKET_READ_TIMEOUT,
             request_deadline: REQUEST_READ_DEADLINE,
             max_pending_readers: MAX_PENDING_REQUEST_READERS,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum Language {
-    En,
-    Ja,
-}
-
-impl Language {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::En => "en",
-            Self::Ja => "ja",
         }
     }
 }

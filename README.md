@@ -73,7 +73,8 @@ gloop graph new design.yaml --template design-wall-bounce --request "Design the 
 gloop run --graph design.yaml --repo .
 ```
 
-The template is also selectable in the TUI (`t` cycles templates) and in
+The template is also selectable in the TUI (`t` opens a template picker with
+previews) and in
 `gloop graph new --interactive`.
 
 Create a graph interactively, in the style of TAKT's authoring flow:
@@ -87,15 +88,44 @@ profile, model, and task from one keyboard-first workspace:
 
 ```bash
 gloop graph
-# explicit alias:
-gloop graph tui
+# explicit alias, with an explicit language:
+gloop graph tui --lang ja
 ```
 
 The TUI keeps the existing Graph IR and foreground runtime. Use `1/2/3` for
-Overview / Graph Builder / Run Monitor, `i` for the natural-language task,
-`t/p/m` for template/profile/model, `v` to validate, `s` to save, and `r` to
-run. `Ctrl-C` cancels an active run; `q` exits when idle. See
-[docs/TUI_DESIGN.md](docs/TUI_DESIGN.md) for the screen model and next slice.
+Overview / Graph Builder / Run Monitor, `i` for the natural-language task
+(multi-line: `Enter` inserts a newline, `Ctrl+S` saves, `Esc` cancels),
+`t/p/m` to pick template/profile/model from preview pickers, `v` to validate
+(the issue list opens automatically), `s` to save, and `r` to run (auto-saves
+first). During a run, `o` opens the selected node's output, and `?` opens
+help. `Ctrl-C` cancels an active run; `q` exits when idle.
+
+The interface language follows your system locale (`GLOOP_LANG`, `LC_ALL`,
+`LC_MESSAGES`, or `LANG`; Japanese and English are supported) and can be
+switched live with `l` or forced with `--lang`.
+See [docs/TUI_DESIGN.md](docs/TUI_DESIGN.md) for the screen model.
+
+### Watching runs from scripts and agents
+
+`gloop status` reads one run's journal live, so humans and AI agents can poll
+progress and intermediate outputs while the run is still in flight:
+
+```bash
+# start a run in the background with a stable id
+gloop run --graph workflow.yaml --repo . --run-id my-task &
+
+# poll it from another terminal, script, or supervisor agent
+gloop status my-task --json
+gloop status --json            # newest run
+gloop status my-task --wait    # block until finished, exit with the run's code
+```
+
+The JSON payload reports `phase` (`initializing` / `running` / `finished`),
+per-node status, attempts, intermediate outputs, the recent event tail, and
+the merged final `summary` once the run completes. `--json` always exits 0
+when the query succeeds; `--wait` exits with the run's own status code
+(`0` success, `2` blocked/human gate, `3` verification/execution failure,
+`5` budget exhausted, `130` cancelled).
 
 Save a reusable project template interactively (the wizard builds graphs node-by-node and selects providers from your configured profiles) or non-interactively from a built-in base:
 

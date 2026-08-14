@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
+use chrono::{DateTime, Utc};
 use gloop_core::{FinalStatus, Graph, NodeOutcome, NodeStatus, RunEvent, RunEventKind, RunSummary};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -54,8 +55,26 @@ async fn replay_journal_with_artifacts(
     Ok((report, collect_journal_artifacts(&journal.events)))
 }
 
-#[allow(clippy::too_many_lines)]
+/// Strict replay of a complete journal. Requires the run to have finished
+/// and to carry the start graph hash.
 pub fn replay_events(events: &[RunEvent]) -> Result<ReplayReport, ReplayError> {
+    let report = replay_events_partial(events)?;
+    if report.graph_hash.is_none() {
+        return Err(ReplayError::MissingRunStartedGraphHash);
+    }
+    if !report.finished {
+        return Err(ReplayError::RunDidNotFinish);
+    }
+    Ok(report)
+}
+
+/// Replay that tolerates in-flight runs. Every journal row is still checked
+/// (schema, sequence, run id, transitions, hash chain in the readers), but
+/// the run does not need to have reached `run_finished` yet. The journal is
+/// flushed and synced after every append, so the only structurally incomplete
+/// prefix is a truncated final row, which callers report separately.
+#[allow(clippy::too_many_lines)]
+pub fn replay_events_partial(events: &[RunEvent]) -> Result<ReplayReport, ReplayError> {
     if events.len() > MAX_RUN_EVENT_COUNT {
         return Err(ReplayError::TooManyEvents {
             count: events.len(),
@@ -276,14 +295,6 @@ pub fn replay_events(events: &[RunEvent]) -> Result<ReplayReport, ReplayError> {
         }
     }
 
-    if graph_hash.is_none() {
-        return Err(ReplayError::MissingRunStartedGraphHash);
-    }
-
-    if !finished {
-        return Err(ReplayError::RunDidNotFinish);
-    }
-
     Ok(ReplayReport {
         run_id,
         graph_hash,
@@ -294,6 +305,17 @@ pub fn replay_events(events: &[RunEvent]) -> Result<ReplayReport, ReplayError> {
         final_status,
         nodes,
     })
+}
+
+/// Read one journal for live status polling. A truncated final row is
+/// reported through `ReplayReport::truncated_tail` instead of failing.
+pub async fn replay_journal_partial(path: impl AsRef<Path>) -> Result<ReplayReport, ReplayError> {
+    ensure_file_not_symlink(path.as_ref())?;
+    enforce_file_size_limit(path.as_ref(), MAX_JOURNAL_BYTES).await?;
+    let journal = read_journal(path).await?;
+    let mut report = replay_events_partial(&journal.events)?;
+    report.truncated_tail = journal.truncated_tail;
+    Ok(report)
 }
 
 pub async fn inspect_run(root: impl AsRef<Path>) -> Result<RunInspection, ReplayError> {
@@ -344,6 +366,148 @@ pub async fn inspect_run(root: impl AsRef<Path>) -> Result<RunInspection, Replay
     }
     verify_terminal_states(&summary, &replay)?;
     Ok(RunInspection { summary, replay })
+}
+
+/// Advisory snapshot of one run directory. Unlike [`inspect_run`], this
+/// tolerates unfinished runs so external supervisors (humans or agents) can
+/// poll progress and intermediate node outputs before `summary.json` exists.
+/// Node states come from the same reducer as strict replay
+/// ([`replay_events_partial`]), so live and final views never diverge.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LiveRunReport {
+    pub run_id: String,
+    pub graph_name: Option<String>,
+    pub goal: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub last_event_at: Option<DateTime<Utc>>,
+    pub last_event_age_ms: Option<u64>,
+    pub truncated_tail: bool,
+    pub journal: ReplayReport,
+    pub events_tail: Vec<RunEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<RunSummary>,
+}
+
+impl LiveRunReport {
+    pub fn finished(&self) -> bool {
+        self.journal.finished
+    }
+
+    pub fn final_status(&self) -> Option<FinalStatus> {
+        self.journal.final_status
+    }
+
+    /// Phase label for supervisors: `initializing`, `running`, or `finished`.
+    pub fn phase(&self) -> &'static str {
+        if self.journal.finished {
+            "finished"
+        } else if self.journal.event_count == 0 {
+            "initializing"
+        } else {
+            "running"
+        }
+    }
+}
+
+/// Read one run directory into a [`LiveRunReport`]. The journal hash chain is
+/// verified by [`read_journal`]; a truncated final row is reported through
+/// `truncated_tail` instead of an error so in-flight runs stay pollable.
+/// `tail` bounds how many raw journal events are copied into `events_tail`.
+pub async fn live_run_status(
+    root: impl AsRef<Path>,
+    tail: usize,
+) -> Result<LiveRunReport, ReplayError> {
+    let root = std::fs::canonicalize(root.as_ref())?;
+    let paths = crate::RunPaths::from_root(root.clone());
+    let fallback_run_id = root
+        .file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+
+    ensure_no_inroot_symlink(&paths.journal, &root)?;
+    enforce_file_size_limit(&paths.journal, MAX_JOURNAL_BYTES).await?;
+    let journal = read_journal(&paths.journal).await?;
+    let mut report = match replay_events_partial(&journal.events) {
+        Ok(report) => report,
+        Err(ReplayError::EmptyJournal) => ReplayReport {
+            run_id: fallback_run_id,
+            graph_hash: None,
+            event_count: 0,
+            last_sequence: 0,
+            finished: false,
+            truncated_tail: false,
+            final_status: None,
+            nodes: IndexMap::new(),
+        },
+        Err(error) => return Err(error),
+    };
+    report.truncated_tail = journal.truncated_tail;
+
+    let started_at = journal.events.first().map(|event| event.timestamp);
+    let last_event_at = journal.events.last().map(|event| event.timestamp);
+    let last_event_age_ms = last_event_at
+        .map(|timestamp| u64::try_from((Utc::now() - timestamp).num_milliseconds()).unwrap_or(0));
+    let mut events_tail: Vec<RunEvent> = journal.events.iter().rev().take(tail).cloned().collect();
+    events_tail.reverse();
+
+    let mut live = LiveRunReport {
+        run_id: report.run_id.clone(),
+        graph_name: None,
+        goal: None,
+        started_at,
+        last_event_at,
+        last_event_age_ms,
+        truncated_tail: report.truncated_tail,
+        journal: report,
+        events_tail,
+        summary: None,
+    };
+
+    if fs::try_exists(&paths.graph).await.unwrap_or(false) {
+        ensure_no_inroot_symlink(&paths.graph, &root)?;
+        enforce_file_size_limit(&paths.graph, MAX_GRAPH_BYTES).await?;
+        let bytes = fs::read(&paths.graph).await?;
+        let graph: Graph =
+            serde_json::from_slice(&bytes).map_err(|source| ReplayError::InvalidGraph {
+                path: paths.graph.clone(),
+                source,
+            })?;
+        live.graph_name = Some(graph.metadata.name);
+        live.goal = Some(graph.spec.goal);
+    }
+
+    if fs::try_exists(&paths.summary).await.unwrap_or(false) {
+        ensure_no_inroot_symlink(&paths.summary, &root)?;
+        enforce_file_size_limit(&paths.summary, MAX_SUMMARY_BYTES).await?;
+        let bytes = fs::read(&paths.summary).await?;
+        let summary: RunSummary =
+            serde_json::from_slice(&bytes).map_err(|source| ReplayError::InvalidSummary {
+                path: paths.summary.clone(),
+                source,
+            })?;
+        if summary.schema_version != SUMMARY_SCHEMA_VERSION {
+            return Err(ReplayError::UnsupportedSummarySchemaVersion {
+                summary: summary.schema_version.clone(),
+                supported: SUMMARY_SCHEMA_VERSION.to_owned(),
+            });
+        }
+        if summary.run_id != live.run_id {
+            return Err(ReplayError::SummaryRunMismatch {
+                summary: summary.run_id,
+                journal: live.run_id,
+            });
+        }
+        if let Some(final_status) = live.final_status()
+            && summary.status != final_status
+        {
+            return Err(ReplayError::SummaryStatusMismatch {
+                summary: summary.status,
+                journal: Some(final_status),
+            });
+        }
+        live.summary = Some(summary);
+    }
+
+    Ok(live)
 }
 
 fn outcome_for<'a>(
@@ -1191,5 +1355,195 @@ mod tests {
                 .expect_err("truncated tail must fail replay"),
             ReplayError::Journal(JournalError::IncompleteTail)
         ));
+    }
+
+    #[test]
+    fn partial_replay_reports_in_flight_run_without_error() {
+        let mut started = event(1, RunEventKind::RunStarted, None);
+        started.data = json!({"graph_hash": "h", "nodes": ["a", "b"]});
+        let mut output = event(4, RunEventKind::NodeOutput, Some("a"));
+        output.data = json!({"output": {"partial": true}});
+        let report = replay_events_partial(&[
+            started,
+            event(2, RunEventKind::NodeReady, Some("a")),
+            event(3, RunEventKind::NodeStarted, Some("a")),
+            output,
+        ])
+        .expect("partial replay tolerates unfinished runs");
+        assert!(!report.finished);
+        assert_eq!(report.final_status, None);
+        assert_eq!(report.nodes["a"].status, NodeStatus::Running);
+        assert_eq!(report.nodes["a"].output, Some(json!({"partial": true})));
+        assert_eq!(report.nodes["b"].status, NodeStatus::Pending);
+        assert!(
+            replay_events(&[
+                event(1, RunEventKind::RunStarted, None),
+                event(2, RunEventKind::NodeReady, Some("a")),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn partial_replay_captures_finished_run() {
+        let mut started = event(1, RunEventKind::RunStarted, None);
+        started.data = json!({"graph_hash": "h", "nodes": ["a"]});
+        let mut finished = event(5, RunEventKind::RunFinished, None);
+        finished.data = json!({"status": "ready_for_human"});
+        let report = replay_events_partial(&[
+            started,
+            event(2, RunEventKind::NodeReady, Some("a")),
+            event(3, RunEventKind::NodeStarted, Some("a")),
+            event(4, RunEventKind::NodeSucceeded, Some("a")),
+            finished,
+        ])
+        .expect("finished run reduces");
+        assert!(report.finished);
+        assert_eq!(report.final_status, Some(FinalStatus::ReadyForHuman));
+        assert_eq!(report.nodes["a"].status, NodeStatus::Succeeded);
+    }
+
+    #[test]
+    fn partial_replay_marks_active_nodes_cancelled() {
+        let mut started = event(1, RunEventKind::RunStarted, None);
+        started.data = json!({"graph_hash": "h", "nodes": ["a", "b"]});
+        let report = replay_events_partial(&[
+            started,
+            event(2, RunEventKind::NodeReady, Some("a")),
+            event(3, RunEventKind::NodeStarted, Some("a")),
+            event(4, RunEventKind::RunCancelled, None),
+        ])
+        .expect("cancelled run reduces");
+        assert!(!report.finished);
+        assert_eq!(report.nodes["a"].status, NodeStatus::Cancelled);
+        assert_eq!(report.nodes["b"].status, NodeStatus::Cancelled);
+    }
+
+    #[test]
+    fn partial_replay_still_rejects_corrupt_sequences() {
+        let error = replay_events_partial(&[
+            event(1, RunEventKind::RunStarted, None),
+            event(7, RunEventKind::NodeReady, Some("a")),
+        ])
+        .expect_err("sequence gap rejected even live");
+        assert!(matches!(error, ReplayError::Sequence { expected: 2, .. }));
+    }
+
+    #[tokio::test]
+    async fn live_run_status_polls_in_flight_run_and_merges_summary_when_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_root = dir.path().join("test-run");
+        fs::create_dir_all(&run_root).await.expect("create run dir");
+        let paths = crate::RunPaths::from_root(run_root.clone());
+
+        let graph = Graph::new("status-graph", "status goal", vec![]);
+        fs::write(
+            &paths.graph,
+            serde_json::to_vec(&graph).expect("graph json"),
+        )
+        .await
+        .expect("write graph.json");
+
+        let journal = Journal::create(&paths.journal, "test-run")
+            .await
+            .expect("create journal");
+        journal
+            .append(
+                RunEventKind::RunStarted,
+                None,
+                None,
+                None,
+                json!({"graph_hash": "h", "nodes": ["a"]}),
+            )
+            .await
+            .expect("append start");
+        journal
+            .append(RunEventKind::NodeReady, Some("a"), None, None, Value::Null)
+            .await
+            .expect("append ready");
+
+        let live = live_run_status(&run_root, 10)
+            .await
+            .expect("live status while running");
+        assert_eq!(live.phase(), "running");
+        assert_eq!(live.graph_name.as_deref(), Some("status-graph"));
+        assert_eq!(live.goal.as_deref(), Some("status goal"));
+        assert_eq!(live.journal.nodes["a"].status, NodeStatus::Ready);
+        assert_eq!(live.events_tail.len(), 2);
+        assert!(live.summary.is_none());
+        assert!(live.last_event_age_ms.is_some());
+
+        // finish the run and add the summary; status must merge both.
+        journal
+            .append(
+                RunEventKind::NodeStarted,
+                Some("a"),
+                Some(1),
+                None,
+                Value::Null,
+            )
+            .await
+            .expect("append started");
+        journal
+            .append(
+                RunEventKind::NodeSucceeded,
+                Some("a"),
+                Some(1),
+                None,
+                Value::Null,
+            )
+            .await
+            .expect("append succeeded");
+        journal
+            .append(
+                RunEventKind::RunFinished,
+                None,
+                None,
+                None,
+                json!({"status": "ready_for_human"}),
+            )
+            .await
+            .expect("append finish");
+        drop(journal);
+
+        let finished = live_run_status(&run_root, 1)
+            .await
+            .expect("live status after finish");
+        assert_eq!(finished.phase(), "finished");
+        assert_eq!(finished.final_status(), Some(FinalStatus::ReadyForHuman));
+        assert_eq!(finished.events_tail.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn live_run_status_tolerates_truncated_tail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run_root = dir.path().join("crash-run");
+        fs::create_dir_all(&run_root).await.expect("create run dir");
+        let paths = crate::RunPaths::from_root(run_root.clone());
+        let journal = Journal::create(&paths.journal, "crash-run")
+            .await
+            .expect("create journal");
+        journal
+            .append(
+                RunEventKind::RunStarted,
+                None,
+                None,
+                None,
+                json!({"graph_hash": "h", "nodes": ["a"]}),
+            )
+            .await
+            .expect("append start");
+        drop(journal);
+        let mut bytes = fs::read(&paths.journal).await.expect("read journal");
+        bytes.extend_from_slice(b"{\"incomplete\":");
+        fs::write(&paths.journal, bytes)
+            .await
+            .expect("append truncated tail");
+
+        let live = live_run_status(&run_root, 10)
+            .await
+            .expect("truncated tail stays pollable");
+        assert!(live.truncated_tail);
+        assert_eq!(live.phase(), "running");
     }
 }

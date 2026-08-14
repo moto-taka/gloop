@@ -7,8 +7,9 @@ use crate::commands::{
     CommandResult, RenderFormat, graph_edit, graph_explain, graph_init, graph_list, graph_new,
     graph_render, graph_schema, graph_validate, inspect_run_at, present, provider_add,
     provider_doctor, provider_list, provider_probe, replay_run, run_foreground, run_logs,
+    run_status,
 };
-use crate::gui::Language;
+use crate::i18n::Language;
 use crate::tui;
 
 #[derive(Parser)]
@@ -34,6 +35,8 @@ enum Command {
     /// Configure and diagnose model/harness profiles.
     #[command(subcommand)]
     Provider(ProviderCommand),
+    /// Show live or final status of one run; pollable while the run is in flight.
+    Status(StatusCommand),
     /// Inspect a completed run directory.
     Inspect(InspectCommand),
     /// Print journal events from a run directory.
@@ -94,6 +97,13 @@ struct RunCommand {
 
     #[arg(long = "max-parallel")]
     max_parallel: Option<usize>,
+
+    #[arg(
+        long = "run-id",
+        value_name = "ID",
+        help = "Run id to use instead of a fresh ULID; supervisors can poll 'gloop status <id>'"
+    )]
+    run_id: Option<String>,
 }
 
 #[derive(Args)]
@@ -110,6 +120,14 @@ struct GraphCommand {
         help = "Project directory for graph commands"
     )]
     repo: PathBuf,
+
+    #[arg(
+        long = "lang",
+        alias = "language",
+        value_enum,
+        help = "Display language; defaults to the system locale"
+    )]
+    language: Option<Language>,
 }
 
 #[derive(Subcommand)]
@@ -137,12 +155,25 @@ enum GraphSubcommand {
 }
 
 #[derive(Args)]
-struct GraphTui {}
+struct GraphTui {
+    #[arg(
+        long = "lang",
+        alias = "language",
+        value_enum,
+        help = "Display language; defaults to the system locale (GLOOP_LANG, LC_ALL, LC_MESSAGES, LANG)"
+    )]
+    language: Option<Language>,
+}
 
 #[derive(Args)]
 struct GraphList {
-    #[arg(long = "lang", alias = "language", value_enum, default_value = "en")]
-    language: Language,
+    #[arg(
+        long = "lang",
+        alias = "language",
+        value_enum,
+        help = "Display language; defaults to the system locale"
+    )]
+    language: Option<Language>,
 
     #[arg(long, help = "Print one JSON object for scripts and assistants")]
     json: bool,
@@ -224,8 +255,13 @@ struct GraphInit {
     )]
     gui: bool,
 
-    #[arg(long = "lang", alias = "language", value_enum, default_value = "en")]
-    language: Language,
+    #[arg(
+        long = "lang",
+        alias = "language",
+        value_enum,
+        help = "Display language; defaults to the system locale"
+    )]
+    language: Option<Language>,
 
     #[arg(long)]
     force: bool,
@@ -245,8 +281,13 @@ struct GraphEdit {
     #[arg(long, help = "Open the local browser editor")]
     gui: bool,
 
-    #[arg(long = "lang", alias = "language", value_enum, default_value = "en")]
-    language: Language,
+    #[arg(
+        long = "lang",
+        alias = "language",
+        value_enum,
+        help = "Display language; defaults to the system locale"
+    )]
+    language: Option<Language>,
 
     #[arg(long)]
     json: bool,
@@ -302,6 +343,41 @@ struct ProviderAdd {
 }
 
 #[derive(Args)]
+struct StatusCommand {
+    #[arg(
+        value_name = "RUN_ID",
+        help = "Run id under <repo>/.gloop/runs; defaults to the newest run"
+    )]
+    run_id: Option<String>,
+
+    #[arg(long = "repo", value_name = "PATH", default_value = ".")]
+    repo: PathBuf,
+
+    #[arg(
+        long,
+        default_value_t = 10,
+        help = "How many recent journal events to include"
+    )]
+    events: usize,
+
+    #[arg(
+        long,
+        help = "Wait until the run finishes, then exit with the run's status code"
+    )]
+    wait: bool,
+
+    #[arg(
+        long = "interval-ms",
+        default_value_t = 1000,
+        help = "Polling interval in milliseconds for --wait"
+    )]
+    interval_ms: u64,
+
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
 struct InspectCommand {
     #[arg(default_value = ".", value_name = "PATH")]
     path: PathBuf,
@@ -345,6 +421,7 @@ impl Command {
             Self::Provider(ProviderCommand::List(c) | ProviderCommand::Doctor(c)) => c.json,
             Self::Provider(ProviderCommand::Probe(c)) => c.json,
             Self::Provider(ProviderCommand::Add(c)) => c.json,
+            Self::Status(c) => c.json,
             Self::Inspect(c) => c.json,
             Self::Logs(c) => c.json,
             Self::Replay(c) => c.json,
@@ -371,25 +448,22 @@ pub async fn run() -> Result<()> {
                 cmd.max_parallel,
                 cli.trust_project_profiles,
                 cmd.interactive,
+                cmd.run_id,
             )
             .await
         }
         Command::Graph(cmd) => {
             let repo = cmd.repo;
+            let cmd_lang = cmd.language;
             match cmd.command {
-                None => match tui::launch(repo, cli.trust_project_profiles).await {
-                    Ok(()) => CommandResult {
-                        code: crate::commands::ExitCode::Success,
-                        output: None,
-                        text: None,
-                    },
-                    Err(error) => CommandResult::failure_text(
-                        crate::commands::ExitCode::Internal,
-                        format!("graph TUI failed: {error}"),
-                    ),
-                },
-                Some(GraphSubcommand::Tui(_)) => {
-                    match tui::launch(repo, cli.trust_project_profiles).await {
+                None => {
+                    match tui::launch(
+                        repo,
+                        cli.trust_project_profiles,
+                        cmd_lang.unwrap_or_else(Language::detect),
+                    )
+                    .await
+                    {
                         Ok(()) => CommandResult {
                             code: crate::commands::ExitCode::Success,
                             output: None,
@@ -401,7 +475,28 @@ pub async fn run() -> Result<()> {
                         ),
                     }
                 }
-                Some(GraphSubcommand::List(c)) => graph_list(repo, c.language, c.json).await,
+                Some(GraphSubcommand::Tui(c)) => {
+                    match tui::launch(
+                        repo,
+                        cli.trust_project_profiles,
+                        c.language.or(cmd_lang).unwrap_or_else(Language::detect),
+                    )
+                    .await
+                    {
+                        Ok(()) => CommandResult {
+                            code: crate::commands::ExitCode::Success,
+                            output: None,
+                            text: None,
+                        },
+                        Err(error) => CommandResult::failure_text(
+                            crate::commands::ExitCode::Internal,
+                            format!("graph TUI failed: {error}"),
+                        ),
+                    }
+                }
+                Some(GraphSubcommand::List(c)) => {
+                    graph_list(repo, c.language.unwrap_or_else(Language::detect), c.json).await
+                }
                 Some(GraphSubcommand::New(c)) => {
                     graph_new(
                         c.name,
@@ -433,7 +528,7 @@ pub async fn run() -> Result<()> {
                         c.json,
                         cli.trust_project_profiles,
                         c.gui,
-                        c.language,
+                        c.language.unwrap_or_else(Language::detect),
                     )
                     .await
                 }
@@ -442,7 +537,7 @@ pub async fn run() -> Result<()> {
                         c.target,
                         repo,
                         c.gui,
-                        c.language,
+                        c.language.unwrap_or_else(Language::detect),
                         c.json,
                         false,
                         cli.trust_project_profiles,
@@ -454,7 +549,7 @@ pub async fn run() -> Result<()> {
                         c.target,
                         repo,
                         c.gui,
-                        c.language,
+                        c.language.unwrap_or_else(Language::detect),
                         c.json,
                         true,
                         cli.trust_project_profiles,
@@ -477,6 +572,18 @@ pub async fn run() -> Result<()> {
             }
             ProviderCommand::Doctor(c) => provider_doctor(c.json, cli.trust_project_profiles).await,
         },
+        Command::Status(c) => {
+            run_status(
+                c.run_id,
+                c.repo,
+                c.events,
+                c.wait,
+                c.interval_ms,
+                c.json,
+                Language::detect(),
+            )
+            .await
+        }
         Command::Inspect(c) => inspect_run_at(c.path, c.json).await,
         Command::Logs(c) => run_logs(c.path, c.json).await,
         Command::Replay(c) => replay_run(c.path, c.json).await,

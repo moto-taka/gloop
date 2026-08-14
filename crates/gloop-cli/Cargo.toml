@@ -20,9 +20,9 @@ console.workspace = true
 crossterm.workspace = true
 dialoguer.workspace = true
 directories.workspace = true
-gloop-core = { path = "../gloop-core", version = "0.4.5" }
-gloop-provider = { path = "../gloop-provider", version = "0.4.5" }
-gloop-runtime = { path = "../gloop-runtime", version = "0.4.5" }
+gloop-core = { path = "../gloop-core", version = "0.5.0" }
+gloop-provider = { path = "../gloop-provider", version = "0.5.0" }
+gloop-runtime = { path = "../gloop-runtime", version = "0.5.0" }
 indicatif.workspace = true
 ratatui.workspace = true
 schemars.workspace = true
@@ -36,6 +36,7 @@ toml.workspace = true
 ulid.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+unicode-width.workspace = true
 
 [dev-dependencies]
 assert_cmd = "2.0"

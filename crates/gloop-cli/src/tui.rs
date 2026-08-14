@@ -16,20 +16,25 @@ use std::{
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use gloop_core::{Edge, Graph, Node, NodeKind, NodeStatus, PromptSpec, RunEventKind, RunSummary};
 use gloop_provider::{PROJECT_CONFIG_PATH, ProfileStore, ProviderRegistry};
-use gloop_runtime::{GateDecision, GateRequest, HumanGate, ProgressEvent, RunOptions, Runtime};
+use gloop_runtime::{
+    GateDecision, GateRequest, HumanGate, ProgressEvent, RunOptions, Runtime,
+    replay_journal_partial,
+};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs},
 };
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -37,10 +42,12 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
+use unicode_width::UnicodeWidthChar;
 
 use crate::{
     atomic_write::{self, write_text_atomic_if_unchanged_sync},
-    commands::{apply_model_to_agent_nodes, build_profile_choices},
+    commands::{apply_model_to_agent_nodes, build_profile_choices, clear_model_on_agent_nodes},
+    i18n::{Language, Strings, fill},
     templates,
     wizard::{self, EditorState, GraphTemplate, ProfileChoice},
 };
@@ -65,11 +72,11 @@ enum Screen {
 impl Screen {
     const ALL: [Self; 3] = [Self::Overview, Self::Builder, Self::Run];
 
-    const fn title(self) -> &'static str {
+    fn title(self, strings: &Strings) -> &'static str {
         match self {
-            Self::Overview => "Overview",
-            Self::Builder => "Graph Builder",
-            Self::Run => "Run Monitor",
+            Self::Overview => strings.screen_overview,
+            Self::Builder => strings.screen_builder,
+            Self::Run => strings.screen_run,
         }
     }
 
@@ -89,11 +96,53 @@ enum InputTarget {
     NodePrompt,
 }
 
+impl InputTarget {
+    const fn multiline(self) -> bool {
+        !matches!(self, Self::Model)
+    }
+}
+
+/// Multi-line text editor state. `cursor` is a byte offset on a character
+/// boundary; `preferred_col` keeps the horizontal position across vertical
+/// moves. Rendering derives the visible window from the cursor position.
 #[derive(Debug)]
 struct InputState {
     target: InputTarget,
     value: String,
     cursor: usize,
+    preferred_col: Option<usize>,
+}
+
+#[derive(Debug)]
+struct TemplatePreview {
+    template: GraphTemplate,
+    shape: String,
+    nodes: usize,
+    edges: usize,
+}
+
+#[derive(Debug)]
+enum Modal {
+    Input(InputState),
+    TemplatePicker {
+        selected: usize,
+        previews: Vec<TemplatePreview>,
+    },
+    ProfilePicker {
+        selected: usize,
+    },
+    Issues {
+        lines: Vec<String>,
+        offset: usize,
+    },
+    Help {
+        offset: usize,
+    },
+    Output {
+        node: String,
+        lines: Vec<String>,
+        offset: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -136,15 +185,19 @@ enum Action {
     Continue,
     Quit,
     Save,
+    Run,
+    OpenOutput,
 }
 
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 struct App {
     repo: PathBuf,
     graph_path: PathBuf,
     expected_sha256: Option<String>,
     create_only: bool,
     trust_project_profiles: bool,
+    lang: Language,
     screen: Screen,
     graph: Graph,
     template: GraphTemplate,
@@ -155,20 +208,34 @@ struct App {
     profile_index: Option<usize>,
     selected_node: usize,
     connect_from: Option<String>,
-    input: Option<InputState>,
+    modal: Option<Modal>,
     active_run: Option<ActiveRun>,
     pending_gates: VecDeque<GateEnvelope>,
     node_status: HashMap<String, NodeStatus>,
     last_summary: Option<RunSummary>,
+    last_run_id: Option<String>,
+    announced_run: bool,
     events: VecDeque<String>,
     status: String,
+    /// Graph differs from what is saved on disk.
     dirty: bool,
+    /// The node list was edited manually (or loaded from disk), so rebuilding
+    /// from a template would replace user content. Task edits then update the
+    /// goal only instead of rebuilding.
+    manual_edits: bool,
 }
 
 impl App {
-    fn new(repo: PathBuf, trust_project_profiles: bool) -> Result<Self> {
-        let profiles = build_profile_choices(&repo, trust_project_profiles)
-            .map_err(|error| anyhow!("failed to load provider profiles: {error}"))?;
+    fn new(repo: PathBuf, trust_project_profiles: bool, lang: Language) -> Result<Self> {
+        let profiles = build_profile_choices(&repo, trust_project_profiles).map_err(|error| {
+            anyhow!(
+                "{}",
+                fill(
+                    lang.strings().status_load_profiles_failed,
+                    &[("error", &error.to_string())]
+                )
+            )
+        })?;
         let graph_path = templates::graph_path(&repo, "work");
         templates::ensure_managed_directory(&repo, Path::new(templates::GRAPHS_DIR))
             .map_err(|error| anyhow!("managed graph directory is unsafe: {error}"))?;
@@ -225,6 +292,9 @@ impl App {
             .find_map(Node::model)
             .map(str::to_owned);
         let template = GraphTemplate::Direct;
+        // A graph loaded from disk is treated as user content: applying a
+        // template replaces it, so the pickers warn about it.
+        let manual_edits = expected_sha256.is_some();
 
         Ok(Self {
             repo,
@@ -232,6 +302,7 @@ impl App {
             expected_sha256,
             create_only,
             trust_project_profiles,
+            lang,
             screen: Screen::Overview,
             graph,
             template,
@@ -242,15 +313,22 @@ impl App {
             profile_index,
             selected_node: 0,
             connect_from: None,
-            input: None,
+            modal: None,
             active_run: None,
             pending_gates: VecDeque::new(),
             node_status: HashMap::new(),
             last_summary: None,
+            last_run_id: None,
+            announced_run: false,
             events: VecDeque::new(),
-            status: "Ready. Press i to enter a task, then r to run.".to_owned(),
+            status: lang.strings().status_ready.to_owned(),
             dirty: false,
+            manual_edits,
         })
+    }
+
+    fn strings(&self) -> &'static Strings {
+        self.lang.strings()
     }
 
     fn build_graph(
@@ -281,13 +359,10 @@ impl App {
         self.status = status.into();
     }
 
-    fn rebuild_from_choices(&mut self) -> bool {
-        if self.dirty {
-            self.set_status(
-                "Graph has unsaved edits; save it before changing the template bindings.",
-            );
-            return false;
-        }
+    /// Rebuild the draft from the current template/task/profile/model.
+    /// Manual node edits are replaced; callers surface that through the
+    /// picker warning and the post-apply status message.
+    fn rebuild_from_choices(&mut self) {
         self.graph = Self::build_graph(
             self.template,
             &self.task,
@@ -297,51 +372,143 @@ impl App {
         self.selected_node = 0;
         self.connect_from = None;
         self.dirty = true;
-        true
+        self.manual_edits = false;
     }
 
-    fn cycle_template(&mut self) {
-        if self.dirty {
-            self.set_status("Graph has unsaved edits; save it before changing the template.");
-            return;
-        }
-        self.template_index = (self.template_index + 1) % TEMPLATE_CHOICES.len();
-        self.template = TEMPLATE_CHOICES[self.template_index];
-        let _ = self.rebuild_from_choices();
-        self.status = format!(
-            "Template: {}. Existing node edits were reset from the template.",
-            template_label(self.template)
+    fn apply_template(&mut self, index: usize) {
+        let had_edits = self.manual_edits;
+        self.template_index = index;
+        self.template = TEMPLATE_CHOICES[index];
+        self.rebuild_from_choices();
+        let strings = self.strings();
+        let template = match self.template {
+            GraphTemplate::Direct => strings.template_desc_direct,
+            GraphTemplate::PlanImplementVerify => strings.template_desc_plan_implement_verify,
+            GraphTemplate::ParallelResearchReduce => strings.template_desc_parallel_research_reduce,
+            GraphTemplate::ReviewFixLoop => strings.template_desc_review_fix_loop,
+            GraphTemplate::DesignWallBounce => strings.template_desc_design_wall_bounce,
+        };
+        let shape = graph_shape(&self.graph);
+        let key = if had_edits {
+            strings.status_template_edits_discarded
+        } else {
+            strings.status_template_applied
+        };
+        self.status = fill(
+            key,
+            &[
+                ("name", template_label(self.template)),
+                ("shape", &format!("{shape} ({template})")),
+            ],
         );
     }
 
-    fn cycle_profile(&mut self) {
-        if self.dirty {
-            self.set_status("Graph has unsaved edits; save it before changing the profile.");
+    fn apply_profile(&mut self, index: usize) {
+        let Some(profile) = self.profiles.get(index) else {
+            return;
+        };
+        if !profile.enabled {
             return;
         }
-        let enabled: Vec<usize> = self
-            .profiles
+        let had_edits = self.manual_edits;
+        self.profile_index = Some(index);
+        self.rebuild_from_choices();
+        let strings = self.strings();
+        let mut status = fill(
+            strings.status_profile_applied,
+            &[("name", self.selected_profile().unwrap_or_default())],
+        );
+        if had_edits {
+            status.push(' ');
+            status.push_str(strings.status_edits_discarded_note);
+        }
+        self.status = status;
+    }
+
+    fn open_template_picker(&mut self) {
+        let previews = TEMPLATE_CHOICES
             .iter()
-            .enumerate()
-            .filter_map(|(index, profile)| profile.enabled.then_some(index))
+            .map(|template| {
+                let graph = Self::build_graph(
+                    *template,
+                    &self.task,
+                    self.selected_profile(),
+                    self.model.as_deref(),
+                );
+                TemplatePreview {
+                    template: *template,
+                    shape: graph_shape(&graph),
+                    nodes: graph.spec.nodes.len(),
+                    edges: graph.spec.edges.len(),
+                }
+            })
             .collect();
-        if enabled.is_empty() {
-            self.set_status(
-                "No enabled provider profiles were found; runtime default routing remains active.",
-            );
-            return;
-        }
-        let next = self
+        self.modal = Some(Modal::TemplatePicker {
+            selected: self.template_index,
+            previews,
+        });
+    }
+
+    fn open_profile_picker(&mut self) {
+        let selected = self
             .profile_index
-            .and_then(|current| enabled.iter().position(|index| *index == current))
-            .map_or(0, |position| (position + 1) % enabled.len());
-        self.profile_index = Some(enabled[next]);
-        if !self.rebuild_from_choices() {
-            return;
-        }
-        self.status = format!(
-            "Profile: {}. Applied to agent-like nodes.",
-            self.selected_profile().unwrap_or("runtime default")
+            .unwrap_or(0)
+            .min(self.profiles.len().saturating_sub(1));
+        self.modal = Some(Modal::ProfilePicker { selected });
+    }
+
+    fn validate_and_show_issues(&mut self) {
+        let issues = self.graph.validate();
+        let strings = self.strings();
+        let errors = issues
+            .iter()
+            .filter(|issue| issue.severity == gloop_core::IssueSeverity::Error)
+            .count();
+        let warnings = issues.len() - errors;
+        self.status = if errors == 0 {
+            fill(
+                strings.status_graph_valid,
+                &[("warnings", &warnings.to_string())],
+            )
+        } else {
+            fill(
+                strings.status_graph_invalid,
+                &[
+                    ("errors", &errors.to_string()),
+                    ("warnings", &warnings.to_string()),
+                ],
+            )
+        };
+        let lines = if issues.is_empty() {
+            vec![strings.issues_none.to_owned()]
+        } else {
+            issues
+                .iter()
+                .map(|issue| {
+                    let severity = if issue.severity == gloop_core::IssueSeverity::Error {
+                        strings.issue_error
+                    } else {
+                        strings.issue_warning
+                    };
+                    format!("[{severity}] {} — {}", issue.path, issue.message)
+                })
+                .collect()
+        };
+        self.modal = Some(Modal::Issues { lines, offset: 0 });
+    }
+
+    fn open_help(&mut self) {
+        self.modal = Some(Modal::Help { offset: 0 });
+    }
+
+    fn toggle_language(&mut self) {
+        self.lang = match self.lang {
+            Language::En => Language::Ja,
+            Language::Ja => Language::En,
+        };
+        self.status = fill(
+            self.strings().status_language,
+            &[("lang", self.lang.as_str())],
         );
     }
 
@@ -351,68 +518,68 @@ impl App {
             InputTarget::Model => self.model.clone().unwrap_or_default(),
             InputTarget::NodePrompt => {
                 let Some(node) = self.graph.spec.nodes.get(self.selected_node) else {
-                    self.set_status("No node is selected.");
+                    self.set_status(self.strings().status_no_node);
                     return;
                 };
                 let Some(prompt) = node_prompt(node) else {
-                    self.set_status("The selected node does not have an inline prompt.");
+                    self.set_status(self.strings().status_not_prompt_node);
                     return;
                 };
                 prompt.to_owned()
             }
         };
         let cursor = value.len();
-        self.input = Some(InputState {
+        self.modal = Some(Modal::Input(InputState {
             target,
             value,
             cursor,
-        });
+            preferred_col: None,
+        }));
     }
 
     fn commit_input(&mut self) {
-        let Some(input) = self.input.take() else {
+        let Some(Modal::Input(input)) = self.modal.take() else {
             return;
         };
         let value = input.value.trim().to_owned();
-        if value.is_empty() && matches!(input.target, InputTarget::Task) {
-            self.set_status("Task cannot be empty.");
-            return;
-        }
         match input.target {
             InputTarget::Task => {
-                if self.dirty {
-                    self.set_status("Graph has unsaved edits; save it before changing the task.");
+                if value.is_empty() {
+                    self.set_status(self.strings().status_task_empty);
                     return;
                 }
-                self.task = value;
-                let _ = self.rebuild_from_choices();
-                self.set_status("Task updated. Review the graph, then press r to run.");
+                self.task.clone_from(&value);
+                if self.manual_edits {
+                    self.graph.spec.goal.clone_from(&value);
+                    self.dirty = true;
+                    self.set_status(self.strings().status_task_goal_only);
+                } else {
+                    self.rebuild_from_choices();
+                    self.set_status(self.strings().status_task_updated);
+                }
             }
             InputTarget::Model => {
                 if value.is_empty() {
-                    if self.dirty {
-                        self.set_status(
-                            "Graph has unsaved edits; save it before clearing the model override.",
-                        );
-                        return;
-                    }
                     self.model = None;
-                    let _ = self.rebuild_from_choices();
+                    clear_model_on_agent_nodes(&mut self.graph);
                 } else {
-                    self.model = Some(value);
-                    if let Some(model) = self.model.as_deref() {
-                        apply_model_to_agent_nodes(&mut self.graph, model);
-                    }
+                    self.model = Some(value.clone());
+                    apply_model_to_agent_nodes(&mut self.graph, &value);
                 }
                 self.dirty = true;
-                self.status = format!(
-                    "Model override: {}.",
-                    self.model.as_deref().unwrap_or("provider default")
+                self.status = fill(
+                    self.strings().status_model_override,
+                    &[(
+                        "model",
+                        self.model
+                            .as_deref()
+                            .unwrap_or_else(|| self.strings().provider_default),
+                    )],
                 );
             }
             InputTarget::NodePrompt => {
                 let Some(node) = self.graph.spec.nodes.get_mut(self.selected_node) else {
-                    self.set_status("No node is selected.");
+                    self.set_status(self.strings().status_no_node);
                     return;
                 };
                 match &mut node.kind {
@@ -421,100 +588,369 @@ impl App {
                     | NodeKind::Synthesize { prompt, .. } => {
                         *prompt = PromptSpec::Inline(value);
                         self.dirty = true;
-                        self.set_status("Node prompt updated.");
+                        self.manual_edits = true;
+                        self.set_status(self.strings().status_node_prompt_updated);
                     }
-                    _ => self.set_status("The selected node is not prompt-based."),
+                    _ => self.set_status(self.strings().status_not_prompt_node),
                 }
             }
         }
     }
 
-    fn cancel_input(&mut self) {
-        self.input = None;
-        self.set_status("Edit cancelled.");
-    }
-
-    fn handle_input_key(&mut self, key: KeyEvent) {
-        let Some(input) = self.input.as_mut() else {
+    fn handle_paste(&mut self, text: &str) {
+        let Some(Modal::Input(input)) = self.modal.as_mut() else {
             return;
         };
+        input.value.insert_str(input.cursor, text);
+        input.cursor += text.len();
+        input.preferred_col = None;
+    }
+}
+
+/// Byte offset of the character preceding `cursor` (character-boundary safe).
+fn char_prev(value: &str, cursor: usize) -> usize {
+    value[..cursor]
+        .char_indices()
+        .next_back()
+        .map_or(0, |(index, _)| index)
+}
+
+/// Byte offset of the character following `cursor` (character-boundary safe).
+fn char_next(value: &str, cursor: usize) -> usize {
+    value[cursor..]
+        .char_indices()
+        .nth(1)
+        .map_or(value.len(), |(index, _)| cursor + index)
+}
+
+/// Byte offsets of every logical line start.
+fn line_starts(value: &str) -> Vec<usize> {
+    let mut starts = vec![0usize];
+    for (index, character) in value.char_indices() {
+        if character == '\n' {
+            starts.push(index + 1);
+        }
+    }
+    starts
+}
+
+/// `(line, column)` of a byte offset, column counted in characters.
+fn line_col_at(value: &str, cursor: usize) -> (usize, usize) {
+    let starts = line_starts(value);
+    let line = starts
+        .iter()
+        .rposition(|start| *start <= cursor)
+        .unwrap_or(0);
+    let col = value[starts[line]..cursor].chars().count();
+    (line, col)
+}
+
+/// Move the cursor one logical line up or down, keeping the preferred column.
+fn move_vertical(
+    value: &str,
+    cursor: usize,
+    delta: isize,
+    preferred_col: &mut Option<usize>,
+) -> usize {
+    let starts = line_starts(value);
+    let (line, col) = line_col_at(value, cursor);
+    let target_col = preferred_col.unwrap_or(col);
+    let next_line = if delta.is_negative() {
+        let Some(next) = line.checked_sub(delta.unsigned_abs()) else {
+            return cursor;
+        };
+        next
+    } else {
+        (line + delta.unsigned_abs()).min(starts.len() - 1)
+    };
+    let line_start = starts[next_line];
+    let line_end = if next_line + 1 < starts.len() {
+        starts[next_line + 1] - 1
+    } else {
+        value.len()
+    };
+    let mut offset = line_start;
+    let mut column = 0usize;
+    for (index, _) in value[line_start..line_end].char_indices() {
+        if column == target_col {
+            offset = line_start + index;
+            break;
+        }
+        column += 1;
+        offset = line_start
+            + index
+            + value[line_start + index..]
+                .chars()
+                .next()
+                .map_or(1, char::len_utf8);
+    }
+    if column < target_col {
+        offset = line_end;
+    }
+    *preferred_col = Some(target_col);
+    offset
+}
+
+/// One soft-wrapped display row.
+#[derive(Debug)]
+struct DisplayRow {
+    text: String,
+}
+
+/// Soft-wrap one logical line into display rows of at most `width` columns,
+/// using terminal character widths (CJK characters count as two columns).
+fn wrap_line(line: &str, width: usize) -> Vec<DisplayRow> {
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    let limit = width.max(1);
+    for character in line.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0).max(1);
+        if current_width + character_width > limit && !current.is_empty() {
+            rows.push(DisplayRow { text: current });
+            current = String::new();
+            current_width = 0;
+        }
+        current.push(character);
+        current_width += character_width;
+    }
+    rows.push(DisplayRow { text: current });
+    rows
+}
+
+impl App {
+    fn handle_input_key(&mut self, key: KeyEvent) {
+        let Some(Modal::Input(input)) = self.modal.as_mut() else {
+            return;
+        };
+        let multiline = input.target.multiline();
         match key.code {
-            KeyCode::Esc => self.cancel_input(),
-            KeyCode::Enter => self.commit_input(),
+            KeyCode::Esc => {
+                self.modal = None;
+                self.set_status(self.strings().status_edit_cancelled);
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.modal = None;
+                self.set_status(self.strings().status_edit_cancelled);
+            }
+            KeyCode::Char('s' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.commit_input();
+            }
+            KeyCode::Enter => {
+                if multiline {
+                    input.value.insert(input.cursor, '\n');
+                    input.cursor += 1;
+                    input.preferred_col = Some(0);
+                } else {
+                    self.commit_input();
+                }
+            }
             KeyCode::Backspace => {
                 if input.cursor > 0 {
-                    let previous = input.value[..input.cursor]
-                        .char_indices()
-                        .next_back()
-                        .map_or(0, |(index, _)| index);
+                    let previous = char_prev(&input.value, input.cursor);
                     input.value.drain(previous..input.cursor);
                     input.cursor = previous;
+                    input.preferred_col = None;
                 }
             }
             KeyCode::Delete => {
                 if input.cursor < input.value.len() {
-                    let next = input.value[input.cursor..]
-                        .char_indices()
-                        .nth(1)
-                        .map_or(input.value.len(), |(index, _)| input.cursor + index);
+                    let next = char_next(&input.value, input.cursor);
                     input.value.drain(input.cursor..next);
+                    input.preferred_col = None;
                 }
             }
             KeyCode::Left => {
-                input.cursor = input.value[..input.cursor]
-                    .char_indices()
-                    .next_back()
-                    .map_or(0, |(index, _)| index);
+                input.cursor = char_prev(&input.value, input.cursor);
+                input.preferred_col = None;
             }
             KeyCode::Right => {
-                input.cursor = input.value[input.cursor..]
-                    .char_indices()
-                    .nth(1)
-                    .map_or(input.value.len(), |(index, _)| input.cursor + index);
+                input.cursor = char_next(&input.value, input.cursor);
+                input.preferred_col = None;
             }
-            KeyCode::Home => input.cursor = 0,
-            KeyCode::End => input.cursor = input.value.len(),
+            KeyCode::Up if multiline => {
+                input.cursor =
+                    move_vertical(&input.value, input.cursor, -1, &mut input.preferred_col);
+            }
+            KeyCode::Down if multiline => {
+                input.cursor =
+                    move_vertical(&input.value, input.cursor, 1, &mut input.preferred_col);
+            }
+            KeyCode::Home => {
+                input.cursor = 0;
+                input.preferred_col = None;
+            }
+            KeyCode::End => {
+                input.cursor = input.value.len();
+                input.preferred_col = None;
+            }
             KeyCode::Char(character)
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
             {
                 input.value.insert(input.cursor, character);
                 input.cursor += character.len_utf8();
+                input.preferred_col = None;
             }
             _ => {}
         }
     }
 
+    fn scroll_modal(&mut self, delta: isize) {
+        let Some(modal) = self.modal.as_mut() else {
+            return;
+        };
+        let (offset, len) = match modal {
+            Modal::Issues { lines, offset } | Modal::Output { lines, offset, .. } => {
+                (offset, lines.len())
+            }
+            Modal::Help { offset } => (offset, help_line_count(self.lang)),
+            _ => return,
+        };
+        let magnitude = delta.unsigned_abs();
+        let next = if delta.is_negative() {
+            offset.saturating_sub(magnitude)
+        } else {
+            (*offset + magnitude).min(len.saturating_sub(1))
+        };
+        *offset = next;
+    }
+
+    fn handle_modal_key(&mut self, key: KeyEvent) -> Action {
+        match self.modal.as_mut() {
+            Some(Modal::Input(_)) => {
+                self.handle_input_key(key);
+                Action::Continue
+            }
+            Some(Modal::TemplatePicker { selected, previews }) => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.modal = None;
+                    Action::Continue
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.modal = None;
+                    Action::Continue
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    *selected = selected.saturating_sub(1);
+                    Action::Continue
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *selected = (*selected + 1).min(previews.len().saturating_sub(1));
+                    Action::Continue
+                }
+                KeyCode::Enter => {
+                    let index = *selected;
+                    self.modal = None;
+                    self.apply_template(index);
+                    Action::Continue
+                }
+                _ => Action::Continue,
+            },
+            Some(Modal::ProfilePicker { selected }) => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.modal = None;
+                    Action::Continue
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.modal = None;
+                    Action::Continue
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    *selected = selected.saturating_sub(1);
+                    Action::Continue
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *selected = (*selected + 1).min(self.profiles.len().saturating_sub(1));
+                    Action::Continue
+                }
+                KeyCode::Enter => {
+                    let index = *selected;
+                    self.modal = None;
+                    if self
+                        .profiles
+                        .get(index)
+                        .is_some_and(|profile| profile.enabled)
+                    {
+                        self.apply_profile(index);
+                    } else {
+                        self.set_status(self.strings().status_profile_none);
+                    }
+                    Action::Continue
+                }
+                _ => Action::Continue,
+            },
+            Some(Modal::Issues { .. } | Modal::Help { .. } | Modal::Output { .. }) => {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.modal = None;
+                        Action::Continue
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.modal = None;
+                        Action::Continue
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.scroll_modal(-1);
+                        Action::Continue
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.scroll_modal(1);
+                        Action::Continue
+                    }
+                    KeyCode::PageUp => {
+                        self.scroll_modal(-10);
+                        Action::Continue
+                    }
+                    KeyCode::PageDown => {
+                        self.scroll_modal(10);
+                        Action::Continue
+                    }
+                    _ => Action::Continue,
+                }
+            }
+            None => Action::Continue,
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn handle_key(&mut self, key: KeyEvent) -> Action {
-        if self.input.is_some() {
-            self.handle_input_key(key);
-            return Action::Continue;
+        if matches!(self.modal, Some(Modal::Input(_))) {
+            return self.handle_modal_key(key);
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if self.modal.is_some() {
+                self.modal = None;
+                return Action::Continue;
+            }
             if let Some(active) = &self.active_run {
                 active.cancellation.cancel();
                 self.pending_gates.clear();
-                self.set_status("Cancellation requested; waiting for the runtime to finish...");
+                self.set_status(self.strings().status_cancel_requested);
             } else {
                 return Action::Quit;
             }
             return Action::Continue;
         }
-        if self.active_run.is_some() {
-            if !self.pending_gates.is_empty() {
-                match key.code {
-                    KeyCode::Char('y') => self.resolve_gate(GateDecision::Approve),
-                    KeyCode::Char('n') | KeyCode::Esc => self.resolve_gate(GateDecision::Reject),
-                    KeyCode::Enter => {
-                        let default = self
-                            .pending_gates
-                            .front()
-                            .map_or(GateDecision::Reject, |gate| gate.request.default);
-                        self.resolve_gate(default);
-                    }
-                    _ => {}
+        if self.active_run.is_some() && !self.pending_gates.is_empty() {
+            self.modal = None;
+            match key.code {
+                KeyCode::Char('y') => self.resolve_gate(GateDecision::Approve),
+                KeyCode::Char('n') | KeyCode::Esc => self.resolve_gate(GateDecision::Reject),
+                KeyCode::Enter => {
+                    let default = self
+                        .pending_gates
+                        .front()
+                        .map_or(GateDecision::Reject, |gate| gate.request.default);
+                    self.resolve_gate(default);
                 }
-                return Action::Continue;
+                _ => {}
             }
+            return Action::Continue;
+        }
+        if self.modal.is_some() {
+            return self.handle_modal_key(key);
+        }
+        if self.active_run.is_some() {
             match key.code {
                 KeyCode::Char('1') => self.screen = Screen::Overview,
                 KeyCode::Char('2') => self.screen = Screen::Builder,
@@ -522,6 +958,9 @@ impl App {
                 KeyCode::Tab => self.next_screen(),
                 KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
                 KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+                KeyCode::Char('o') => return Action::OpenOutput,
+                KeyCode::Char('?') => self.open_help(),
+                KeyCode::Char('l') => self.toggle_language(),
                 _ => {}
             }
             return Action::Continue;
@@ -545,11 +984,11 @@ impl App {
                 Action::Continue
             }
             KeyCode::Char('t') => {
-                self.cycle_template();
+                self.open_template_picker();
                 Action::Continue
             }
             KeyCode::Char('p') => {
-                self.cycle_profile();
+                self.open_profile_picker();
                 Action::Continue
             }
             KeyCode::Char('m') => {
@@ -560,13 +999,19 @@ impl App {
                 self.begin_input(InputTarget::Task);
                 Action::Continue
             }
-            KeyCode::Char('r') => {
-                self.start_run();
-                Action::Continue
-            }
+            KeyCode::Char('r') => Action::Run,
             KeyCode::Char('s') => Action::Save,
             KeyCode::Char('v') => {
-                self.validate_graph();
+                self.validate_and_show_issues();
+                Action::Continue
+            }
+            KeyCode::Char('o') => Action::OpenOutput,
+            KeyCode::Char('?') => {
+                self.open_help();
+                Action::Continue
+            }
+            KeyCode::Char('l') => {
+                self.toggle_language();
                 Action::Continue
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -598,7 +1043,7 @@ impl App {
                 Action::Continue
             }
             KeyCode::Esc if self.connect_from.take().is_some() => {
-                self.set_status("Connection cancelled.");
+                self.set_status(self.strings().status_connect_cancelled);
                 Action::Continue
             }
             _ => Action::Continue,
@@ -649,7 +1094,10 @@ impl App {
         let mut state = match wizard::add_node_to_editor(&state, node, &[], &[], &[]) {
             Ok(state) => state,
             Err(error) => {
-                self.status = format!("Could not add node: {error}");
+                self.status = fill(
+                    self.strings().status_add_node_failed,
+                    &[("error", &error.to_string())],
+                );
                 return;
             }
         };
@@ -657,7 +1105,10 @@ impl App {
             state = match wizard::add_edge_to_editor(&state, Edge::data(&previous.id, &id)) {
                 Ok(state) => state,
                 Err(error) => {
-                    self.status = format!("Could not connect new node: {error}");
+                    self.status = fill(
+                        self.strings().status_connect_new_failed,
+                        &[("error", &error.to_string())],
+                    );
                     return;
                 }
             };
@@ -665,12 +1116,13 @@ impl App {
         self.graph = state.graph;
         self.selected_node = self.graph.spec.nodes.len() - 1;
         self.dirty = true;
-        self.status = format!("Added {id}. Press e to edit its prompt or c to connect it.");
+        self.manual_edits = true;
+        self.status = fill(self.strings().status_added_node, &[("id", &id)]);
     }
 
     fn remove_node(&mut self) {
         if self.graph.spec.nodes.len() <= 1 {
-            self.set_status("Keep at least one node in the graph.");
+            self.set_status(self.strings().status_keep_one_node);
             return;
         }
         let removed = self.graph.spec.nodes[self.selected_node].id.clone();
@@ -678,7 +1130,10 @@ impl App {
         let state = match wizard::remove_node_from_editor(&state, &removed) {
             Ok(state) => state,
             Err(error) => {
-                self.status = format!("Could not remove {removed}: {error}");
+                self.status = fill(
+                    self.strings().status_remove_failed,
+                    &[("id", &removed), ("error", &error.to_string())],
+                );
                 return;
             }
         };
@@ -687,7 +1142,8 @@ impl App {
             .selected_node
             .min(self.graph.spec.nodes.len().saturating_sub(1));
         self.dirty = true;
-        self.status = format!("Removed {removed} and its incident edges.");
+        self.manual_edits = true;
+        self.status = fill(self.strings().status_removed_node, &[("id", &removed)]);
     }
 
     fn begin_connection(&mut self) {
@@ -695,10 +1151,7 @@ impl App {
             return;
         };
         self.connect_from = Some(node.id.clone());
-        self.status = format!(
-            "Connecting from {}. Move to a target and press Enter.",
-            node.id
-        );
+        self.status = fill(self.strings().status_connecting, &[("id", &node.id)]);
     }
 
     fn connect_selected_node(&mut self) {
@@ -710,42 +1163,32 @@ impl App {
         };
         let to = target.id.clone();
         if from == to {
-            self.set_status("A node cannot connect to itself.");
+            self.set_status(self.strings().status_self_connect);
             return;
         }
         let state = EditorState::from_graph(self.graph.clone(), 0);
         let state = match wizard::add_edge_to_editor(&state, Edge::data(&from, &to)) {
             Ok(state) => state,
             Err(error) => {
-                self.status = format!("Connection rejected: {error}");
+                self.status = fill(
+                    self.strings().status_connect_rejected,
+                    &[("error", &error.to_string())],
+                );
                 return;
             }
         };
         self.graph = state.graph;
         self.dirty = true;
-        self.status = format!("Added data edge {from} -> {to}.");
-    }
-
-    fn validate_graph(&mut self) {
-        let issues = self.graph.validate();
-        let errors = issues
-            .iter()
-            .filter(|issue| issue.severity == gloop_core::IssueSeverity::Error)
-            .count();
-        let warnings = issues
-            .iter()
-            .filter(|issue| issue.severity == gloop_core::IssueSeverity::Warning)
-            .count();
-        self.status = if errors == 0 {
-            format!("Graph valid ({warnings} warning(s)).")
-        } else {
-            format!("Graph invalid: {errors} error(s), {warnings} warning(s).")
-        };
+        self.manual_edits = true;
+        self.status = fill(
+            self.strings().status_edge_added,
+            &[("from", &from), ("to", &to)],
+        );
     }
 
     fn start_run(&mut self) {
         if self.active_run.is_some() {
-            self.set_status("A run is already active.");
+            self.set_status(self.strings().status_run_active);
             return;
         }
         let issues = self.graph.validate();
@@ -753,9 +1196,7 @@ impl App {
             .iter()
             .any(|issue| issue.severity == gloop_core::IssueSeverity::Error)
         {
-            self.set_status(
-                "Run blocked: fix graph validation errors first (press v for a count).",
-            );
+            self.set_status(self.strings().status_run_blocked_invalid);
             return;
         }
         let graph = self.graph.clone();
@@ -803,6 +1244,8 @@ impl App {
             .collect();
         self.events.clear();
         self.last_summary = None;
+        self.last_run_id = None;
+        self.announced_run = false;
         self.active_run = Some(ActiveRun {
             cancellation,
             gates,
@@ -810,9 +1253,7 @@ impl App {
             task,
         });
         self.screen = Screen::Run;
-        self.set_status(
-            "Run started. The runtime owns scheduling; this screen only observes events.",
-        );
+        self.set_status(self.strings().status_run_started);
     }
 
     async fn drain_run_events(&mut self) {
@@ -842,9 +1283,7 @@ impl App {
         if cancelled {
             self.pending_gates.clear();
         } else if !self.pending_gates.is_empty() {
-            self.set_status(
-                "Human gate waiting: press y to approve, n to reject, Enter for default.",
-            );
+            self.set_status(self.strings().status_gate_waiting);
         }
         if !finished {
             return;
@@ -863,13 +1302,24 @@ impl App {
         let mut gates = gates;
         while gates.try_recv().is_ok() {}
         self.pending_gates.clear();
+        let strings = self.strings();
         match result {
             Ok(Ok(summary)) => {
-                self.status = format!("Run finished: {:?}.", summary.status);
+                self.status = fill(
+                    strings.status_run_finished,
+                    &[("status", &format!("{:?}", summary.status))],
+                );
                 self.last_summary = Some(summary);
             }
-            Ok(Err(error)) => self.status = format!("Run failed: {error}"),
-            Err(error) => self.status = format!("Run task stopped unexpectedly: {error}"),
+            Ok(Err(error)) => {
+                self.status = fill(strings.status_run_failed, &[("error", &error)]);
+            }
+            Err(error) => {
+                self.status = fill(
+                    strings.status_run_task_stopped,
+                    &[("error", &error.to_string())],
+                );
+            }
         }
     }
 
@@ -879,16 +1329,26 @@ impl App {
         };
         let node = gate.request.node_id;
         let _ = gate.reply.send(decision);
-        self.status = format!(
-            "Gate {node}: {}.",
+        let strings = self.strings();
+        self.status = fill(
             match decision {
-                GateDecision::Approve => "approved",
-                GateDecision::Reject => "rejected",
-            }
+                GateDecision::Approve => strings.status_gate_approved,
+                GateDecision::Reject => strings.status_gate_rejected,
+            },
+            &[("node", &node)],
         );
     }
 
     fn apply_progress(&mut self, event: &ProgressEvent) {
+        if self.last_run_id.is_none() {
+            self.last_run_id = Some(event.run_id.clone());
+        }
+        if !self.announced_run {
+            self.announced_run = true;
+            if let Some(run_id) = self.last_run_id.clone() {
+                self.status = fill(self.strings().status_run_dir, &[("run_id", &run_id)]);
+            }
+        }
         if let Some(node) = event.node_id.as_deref()
             && let Some(status) = status_for_event(event.kind)
         {
@@ -900,7 +1360,7 @@ impl App {
             "{:>4} {:<22} {:<18} {}",
             event.sequence,
             node,
-            event_kind_label(event.kind),
+            event_kind_label(event.kind, self.lang),
             message
         );
         self.events.push_back(line);
@@ -909,13 +1369,67 @@ impl App {
         }
     }
 
+    async fn prepare_output(&mut self) {
+        let Some(node) = self.graph.spec.nodes.get(self.selected_node) else {
+            self.set_status(self.strings().status_no_node);
+            return;
+        };
+        let node_id = node.id.clone();
+        let mut lines: Vec<String> = Vec::new();
+        if let Some(summary) = &self.last_summary
+            && let Some(outcome) = summary.nodes.get(&node_id)
+        {
+            if let Some(output) = &outcome.output {
+                lines.push(
+                    serde_json::to_string_pretty(output).unwrap_or_else(|_| output.to_string()),
+                );
+            }
+            if let Some(error) = &outcome.error {
+                lines.push(format!("error: {error}"));
+            }
+        }
+        if lines.is_empty()
+            && self.active_run.is_some()
+            && let Some(run_id) = self.last_run_id.clone()
+        {
+            let journal_path = self
+                .repo
+                .join(PROJECT_CONFIG_PATH)
+                .with_file_name("runs")
+                .join(&run_id)
+                .join("journal.jsonl");
+            if let Ok(report) = replay_journal_partial(&journal_path).await
+                && let Some(outcome) = report.nodes.get(&node_id)
+                && let Some(output) = &outcome.output
+            {
+                lines.push(
+                    serde_json::to_string_pretty(output).unwrap_or_else(|_| output.to_string()),
+                );
+            }
+            if lines.is_empty() {
+                lines.push(fill(
+                    self.strings().output_live_hint,
+                    &[("run_id", &run_id)],
+                ));
+            }
+        }
+        if lines.is_empty() {
+            lines.push(self.strings().output_unavailable.to_owned());
+        }
+        self.modal = Some(Modal::Output {
+            node: node_id,
+            lines,
+            offset: 0,
+        });
+    }
+
     async fn save(&mut self) -> Result<()> {
         let issues = self.graph.validate();
         if issues
             .iter()
             .any(|issue| issue.severity == gloop_core::IssueSeverity::Error)
         {
-            self.set_status("Save blocked: graph is invalid.");
+            self.set_status(self.strings().status_save_blocked);
             return Ok(());
         }
         templates::ensure_managed_directory(&self.repo, Path::new(templates::GRAPHS_DIR))
@@ -942,7 +1456,10 @@ impl App {
         self.expected_sha256 = Some(format!("{:x}", Sha256::digest(yaml.as_bytes())));
         self.create_only = false;
         self.dirty = false;
-        self.status = format!("Saved {}.", path.display());
+        self.status = fill(
+            self.strings().status_saved,
+            &[("path", &path.display().to_string())],
+        );
         Ok(())
     }
 }
@@ -987,23 +1504,82 @@ fn template_label(template: GraphTemplate) -> &'static str {
     }
 }
 
-fn event_kind_label(kind: RunEventKind) -> &'static str {
+fn template_desc(strings: &Strings, template: GraphTemplate) -> &'static str {
+    match template {
+        GraphTemplate::Direct => strings.template_desc_direct,
+        GraphTemplate::PlanImplementVerify => strings.template_desc_plan_implement_verify,
+        GraphTemplate::ParallelResearchReduce => strings.template_desc_parallel_research_reduce,
+        GraphTemplate::ReviewFixLoop => strings.template_desc_review_fix_loop,
+        GraphTemplate::DesignWallBounce => strings.template_desc_design_wall_bounce,
+    }
+}
+
+/// One-line description of what the graph actually is: a `a -> b -> c` chain
+/// when the edges form one, otherwise the explicit edge list. This is the
+/// answer to "what am I about to run?" for both pickers and the Overview.
+fn graph_shape(graph: &Graph) -> String {
+    let nodes = &graph.spec.nodes;
+    let edges = &graph.spec.edges;
+    if nodes.is_empty() {
+        return "-".to_owned();
+    }
+    let ids: std::collections::HashSet<&str> = nodes.iter().map(|node| node.id.as_str()).collect();
+    let mut indegree: HashMap<&str, usize> = HashMap::new();
+    let mut next: HashMap<&str, Vec<&str>> = HashMap::new();
+    for edge in edges {
+        if ids.contains(edge.from.as_str()) && ids.contains(edge.to.as_str()) {
+            *indegree.entry(edge.to.as_str()).or_insert(0) += 1;
+            next.entry(edge.from.as_str())
+                .or_default()
+                .push(edge.to.as_str());
+        }
+    }
+    let chain_candidate = edges.len() + 1 == nodes.len()
+        && indegree.values().all(|degree| *degree <= 1)
+        && next.values().all(|targets| targets.len() <= 1);
+    if chain_candidate {
+        let heads: Vec<&str> = nodes
+            .iter()
+            .filter(|node| indegree.get(node.id.as_str()).copied().unwrap_or(0) == 0)
+            .map(|node| node.id.as_str())
+            .collect();
+        if heads.len() == 1 {
+            let mut chain = vec![heads[0]];
+            let mut current = heads[0];
+            while let Some(target) = next.get(current).and_then(|targets| targets.first()) {
+                chain.push(target);
+                current = target;
+            }
+            if chain.len() == nodes.len() {
+                return chain.join(" -> ");
+            }
+        }
+    }
+    edges
+        .iter()
+        .map(|edge| format!("{} -> {}", edge.from, edge.to))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn event_kind_label(kind: RunEventKind, lang: Language) -> &'static str {
+    let strings = lang.strings();
     match kind {
-        RunEventKind::RunStarted => "run started",
-        RunEventKind::NodeReady => "ready",
-        RunEventKind::NodeStarted => "running",
-        RunEventKind::NodeOutput => "output",
-        RunEventKind::NodeSucceeded => "succeeded",
-        RunEventKind::NodeFailed => "failed",
-        RunEventKind::NodeSkipped => "skipped",
-        RunEventKind::NodeBlocked => "blocked",
-        RunEventKind::RetryScheduled => "retry",
-        RunEventKind::LoopStarted => "loop started",
-        RunEventKind::LoopIterationStarted => "iteration",
-        RunEventKind::LoopIterationFinished => "iteration done",
-        RunEventKind::LoopFinished => "loop done",
-        RunEventKind::RunCancelled => "cancelled",
-        RunEventKind::RunFinished => "run finished",
+        RunEventKind::RunStarted => strings.event_run_started,
+        RunEventKind::NodeReady => strings.event_ready,
+        RunEventKind::NodeStarted => strings.event_running,
+        RunEventKind::NodeOutput => strings.event_output,
+        RunEventKind::NodeSucceeded => strings.event_succeeded,
+        RunEventKind::NodeFailed => strings.event_failed,
+        RunEventKind::NodeSkipped => strings.event_skipped,
+        RunEventKind::NodeBlocked => strings.event_blocked,
+        RunEventKind::RetryScheduled => strings.event_retry,
+        RunEventKind::LoopStarted => strings.event_loop_started,
+        RunEventKind::LoopIterationStarted => strings.event_iteration,
+        RunEventKind::LoopIterationFinished => strings.event_iteration_done,
+        RunEventKind::LoopFinished => strings.event_loop_done,
+        RunEventKind::RunCancelled => strings.event_cancelled,
+        RunEventKind::RunFinished => strings.event_run_finished,
     }
 }
 
@@ -1032,6 +1608,20 @@ fn status_symbol(status: NodeStatus) -> (&'static str, Color) {
     }
 }
 
+fn node_status_label(status: NodeStatus, lang: Language) -> &'static str {
+    let strings = lang.strings();
+    match status {
+        NodeStatus::Pending => strings.node_pending,
+        NodeStatus::Ready => strings.node_ready,
+        NodeStatus::Running => strings.node_running,
+        NodeStatus::Succeeded => strings.node_succeeded,
+        NodeStatus::Failed => strings.node_failed,
+        NodeStatus::Skipped => strings.node_skipped,
+        NodeStatus::Blocked => strings.node_blocked,
+        NodeStatus::Cancelled => strings.node_cancelled,
+    }
+}
+
 fn node_kind_label(node: &Node) -> &'static str {
     match &node.kind {
         NodeKind::Agent { .. } => "agent",
@@ -1045,8 +1635,39 @@ fn node_kind_label(node: &Node) -> &'static str {
     }
 }
 
+fn help_lines(lang: Language) -> Vec<String> {
+    let s = lang.strings();
+    vec![
+        s.help_intro.to_owned(),
+        String::new(),
+        s.help_step_task.to_owned(),
+        s.help_step_bindings.to_owned(),
+        s.help_step_builder.to_owned(),
+        s.help_step_validate.to_owned(),
+        s.help_step_run.to_owned(),
+        s.help_step_monitor.to_owned(),
+        String::new(),
+        s.help_step_status.to_owned(),
+        String::new(),
+        format!("{}:", s.help_keys_title),
+        format!("1/2/3 — {}", s.key_screens),
+        format!("i — {}  ·  m — {}", s.key_task, s.key_model),
+        format!("t — {}  ·  p — {}", s.key_template, s.key_profile),
+        format!("v — {}  ·  s — {}", s.key_validate, s.key_save),
+        format!("r — {}  ·  o — output", s.key_run),
+        format!("? — {}  ·  l — {}", s.key_help, s.key_lang),
+        format!("q — {}", s.key_quit),
+    ]
+}
+
+fn help_line_count(lang: Language) -> usize {
+    help_lines(lang).len()
+}
+
+#[allow(clippy::too_many_lines)]
 fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    let strings = app.strings();
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1058,7 +1679,7 @@ fn render(frame: &mut Frame, app: &App) {
 
     let titles: Vec<Line> = Screen::ALL
         .iter()
-        .map(|screen| Line::from(format!(" {} ", screen.title())))
+        .map(|screen| Line::from(format!(" {} ", screen.title(strings))))
         .collect();
     let tabs = Tabs::new(titles)
         .select(app.screen.index())
@@ -1080,98 +1701,169 @@ fn render(frame: &mut Frame, app: &App) {
         Screen::Run => render_run(frame, app, root[1]),
     }
 
+    let footer_keys = vec![
+        Span::styled("1/2/3", Style::default().fg(Color::Cyan)),
+        Span::raw(format!(" {}  ", strings.key_screens)),
+        Span::styled("i", Style::default().fg(Color::Cyan)),
+        Span::raw(format!(" {}  ", strings.key_task)),
+        Span::styled("t", Style::default().fg(Color::Cyan)),
+        Span::raw(format!(" {}  ", strings.key_template)),
+        Span::styled("p", Style::default().fg(Color::Cyan)),
+        Span::raw(format!(" {}  ", strings.key_profile)),
+        Span::styled("m", Style::default().fg(Color::Cyan)),
+        Span::raw(format!(" {}  ", strings.key_model)),
+        Span::styled("v", Style::default().fg(Color::Cyan)),
+        Span::raw(format!(" {}  ", strings.key_validate)),
+        Span::styled("r", Style::default().fg(Color::Green)),
+        Span::raw(format!(" {}  ", strings.key_run)),
+        Span::styled("s", Style::default().fg(Color::Yellow)),
+        Span::raw(format!(" {}  ", strings.key_save)),
+        Span::styled("?", Style::default().fg(Color::Cyan)),
+        Span::raw(format!(" {}  ", strings.key_help)),
+        Span::styled("l", Style::default().fg(Color::Cyan)),
+        Span::raw(format!(" {}  ", strings.key_lang)),
+        Span::styled("q", Style::default().fg(Color::Red)),
+        Span::raw(format!(" {}", strings.key_quit)),
+    ];
     let footer = Paragraph::new(Text::from(vec![
         Line::from(vec![
             Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
             Span::raw(&app.status),
         ]),
-        Line::from(vec![
-            Span::styled("1/2/3", Style::default().fg(Color::Cyan)),
-            Span::raw(" screens  "),
-            Span::styled("i", Style::default().fg(Color::Cyan)),
-            Span::raw(" task  "),
-            Span::styled("t", Style::default().fg(Color::Cyan)),
-            Span::raw(" template  "),
-            Span::styled("p", Style::default().fg(Color::Cyan)),
-            Span::raw(" profile  "),
-            Span::styled("m", Style::default().fg(Color::Cyan)),
-            Span::raw(" model  "),
-            Span::styled("r", Style::default().fg(Color::Green)),
-            Span::raw(" run  "),
-            Span::styled("s", Style::default().fg(Color::Yellow)),
-            Span::raw(" save  "),
-            Span::styled("q", Style::default().fg(Color::Red)),
-            Span::raw(" quit"),
-        ]),
+        Line::from(footer_keys),
     ]))
     .block(Block::default().borders(Borders::TOP));
     frame.render_widget(footer, root[2]);
 
-    if let Some(input) = &app.input {
-        render_input(frame, input, centered_rect(90, 7, area));
+    match &app.modal {
+        Some(Modal::Input(input)) => {
+            let height = input_height(input, area);
+            render_input(frame, input, strings, centered_rect(90, height, area));
+        }
+        Some(Modal::TemplatePicker { selected, previews }) => {
+            render_template_picker(frame, app, *selected, previews, centered_rect(84, 17, area));
+        }
+        Some(Modal::ProfilePicker { selected }) => {
+            render_profile_picker(frame, app, *selected, centered_rect(70, 15, area));
+        }
+        Some(Modal::Issues { lines, offset }) => {
+            render_scroll_overlay(
+                frame,
+                strings.issues_title,
+                lines,
+                *offset,
+                centered_rect(84, 15, area),
+                Color::Red,
+            );
+        }
+        Some(Modal::Help { offset }) => {
+            let lines = help_lines(app.lang);
+            render_scroll_overlay(
+                frame,
+                strings.help_title,
+                &lines,
+                *offset,
+                centered_rect(84, 21, area),
+                Color::Cyan,
+            );
+        }
+        Some(Modal::Output {
+            node,
+            lines,
+            offset,
+        }) => {
+            let title = fill(strings.output_title, &[("node", node)]);
+            render_scroll_overlay(
+                frame,
+                &title,
+                lines,
+                *offset,
+                centered_rect(84, 21, area),
+                Color::Green,
+            );
+        }
+        None => {}
     }
     if let Some(gate) = app.pending_gates.front() {
-        render_gate(frame, gate, centered_rect(70, 9, area));
+        render_gate(frame, gate, strings, centered_rect(70, 9, area));
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
+    let strings = app.strings();
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
         .split(area);
-    let selected_profile = app.selected_profile().unwrap_or("runtime default");
-    let model = app.model.as_deref().unwrap_or("provider default");
+    let selected_profile = app.selected_profile().unwrap_or(strings.runtime_default);
+    let model = app.model.as_deref().unwrap_or(strings.provider_default);
+    let save_line = if app.dirty {
+        format!("{} ({})", app.graph_path.display(), strings.label_dirty)
+    } else {
+        app.graph_path.display().to_string()
+    };
+    let label_style = Style::default().fg(Color::DarkGray);
     let summary = vec![
         Line::from(Span::styled(
-            "START HERE",
+            strings.start_here,
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled("Task       ", Style::default().fg(Color::DarkGray)),
-            Span::raw(&app.task),
+            Span::styled(format!("{:<10} ", strings.label_task), label_style),
+            Span::raw(app.task.lines().next().unwrap_or_default().to_owned()),
         ]),
         Line::from(vec![
-            Span::styled("Template   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{:<10} ", strings.label_template), label_style),
             Span::raw(template_label(app.template)),
         ]),
         Line::from(vec![
-            Span::styled("Profile    ", Style::default().fg(Color::DarkGray)),
-            Span::raw(selected_profile),
+            Span::styled(format!("{:<10} ", strings.label_profile), label_style),
+            Span::raw(selected_profile.to_owned()),
         ]),
         Line::from(vec![
-            Span::styled("Model      ", Style::default().fg(Color::DarkGray)),
-            Span::raw(model),
+            Span::styled(format!("{:<10} ", strings.label_model), label_style),
+            Span::raw(model.to_owned()),
         ]),
         Line::from(vec![
-            Span::styled("Graph      ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!(
-                "{} nodes / {} edges",
-                app.graph.spec.nodes.len(),
-                app.graph.spec.edges.len()
+            Span::styled(format!("{:<10} ", strings.label_graph), label_style),
+            Span::raw(fill(
+                strings.nodes_edges,
+                &[
+                    ("nodes", &app.graph.spec.nodes.len().to_string()),
+                    ("edges", &app.graph.spec.edges.len().to_string()),
+                ],
             )),
         ]),
         Line::from(vec![
-            Span::styled("Save       ", Style::default().fg(Color::DarkGray)),
-            Span::raw(app.graph_path.display().to_string()),
+            Span::styled(format!("{:<10} ", strings.label_shape), label_style),
+            Span::styled(
+                graph_shape(&app.graph),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(format!("{:<10} ", strings.label_save), label_style),
+            Span::raw(save_line),
         ]),
         Line::from(""),
-        Line::from("Press i to type the natural-language task."),
-        Line::from("Press t/p/m to change the graph bindings."),
-        Line::from("Press 2 to inspect and edit the node list."),
-        Line::from("Press r only after the graph is valid."),
+        Line::from(strings.guide_task),
+        Line::from(strings.guide_bindings),
+        Line::from(strings.guide_builder),
+        Line::from(strings.guide_run),
+        Line::from(strings.guide_help),
     ];
     frame.render_widget(
         Paragraph::new(Text::from(summary))
             .block(Block::default().borders(Borders::ALL).title(" Selection "))
-            .wrap(Wrap { trim: false }),
+            .wrap(ratatui::widgets::Wrap { trim: false }),
         columns[0],
     );
 
-    let flow = app
+    let mut flow = app
         .graph
         .spec
         .nodes
@@ -1201,15 +1893,31 @@ fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
             ]))
         })
         .collect::<Vec<_>>();
+    if !app.graph.spec.edges.is_empty() {
+        flow.push(ListItem::new(Line::from(Span::styled(
+            format!(" {}", strings.edges_header),
+            Style::default().fg(Color::DarkGray),
+        ))));
+        for edge in &app.graph.spec.edges {
+            flow.push(ListItem::new(Line::from(Span::styled(
+                format!("   {} -> {}", edge.from, edge.to),
+                Style::default().fg(Color::DarkGray),
+            ))));
+        }
+    }
     frame.render_widget(
-        List::new(flow)
-            .block(Block::default().borders(Borders::ALL).title(" Graph flow "))
-            .highlight_style(Style::default().fg(Color::Cyan)),
+        List::new(flow).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(strings.graph_flow_title),
+        ),
         columns[1],
     );
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_builder(frame: &mut Frame, app: &App, area: Rect) {
+    let strings = app.strings();
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
@@ -1233,9 +1941,9 @@ fn render_builder(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect::<Vec<_>>();
     let title = if let Some(from) = &app.connect_from {
-        format!(" Nodes · connecting from {from} ")
+        fill(strings.builder_connecting, &[("id", from)])
     } else {
-        " Nodes · j/k select ".to_owned()
+        strings.builder_nodes_title.to_owned()
     };
     frame.render_widget(
         List::new(items).block(Block::default().borders(Borders::ALL).title(title)),
@@ -1244,7 +1952,7 @@ fn render_builder(frame: &mut Frame, app: &App, area: Rect) {
 
     let Some(node) = app.graph.spec.nodes.get(app.selected_node) else {
         frame.render_widget(
-            Paragraph::new("No node selected.").block(Block::default().borders(Borders::ALL)),
+            Paragraph::new(strings.builder_no_node).block(Block::default().borders(Borders::ALL)),
             columns[1],
         );
         return;
@@ -1256,7 +1964,7 @@ fn render_builder(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|edge| format!("{} -{:?}-> {}", edge.from, edge.kind, edge.to))
         .collect::<Vec<_>>();
-    let prompt = node_prompt(node).unwrap_or("(not a prompt node)");
+    let prompt = node_prompt(node).unwrap_or(strings.builder_not_prompt);
     let detail = vec![
         Line::from(vec![
             Span::styled(
@@ -1267,20 +1975,33 @@ fn render_builder(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Span::raw(&node.id),
         ]),
-        Line::from(format!("kind: {}", node_kind_label(node))),
         Line::from(format!(
-            "profile: {}",
-            node.profile().unwrap_or("runtime default")
+            "{}: {}",
+            strings.builder_label_kind,
+            node_kind_label(node)
         )),
         Line::from(format!(
-            "model: {}",
-            node.model().unwrap_or("provider default")
+            "{}: {}",
+            strings.builder_label_profile,
+            node.profile().unwrap_or(strings.runtime_default)
         )),
-        Line::from(format!("retry attempts: {}", node.retry.max_attempts)),
-        Line::from(format!("fan-out: {}", node.fan_out())),
+        Line::from(format!(
+            "{}: {}",
+            strings.builder_label_model,
+            node.model().unwrap_or(strings.provider_default)
+        )),
+        Line::from(format!(
+            "{}: {}",
+            strings.builder_label_retry, node.retry.max_attempts
+        )),
+        Line::from(format!(
+            "{}: {}",
+            strings.builder_label_fanout,
+            node.fan_out()
+        )),
         Line::from(""),
         Line::from(Span::styled(
-            "PROMPT",
+            strings.builder_label_prompt,
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
@@ -1288,7 +2009,7 @@ fn render_builder(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(prompt),
         Line::from(""),
         Line::from(Span::styled(
-            "EDGES",
+            strings.builder_label_edges,
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
@@ -1297,22 +2018,22 @@ fn render_builder(frame: &mut Frame, app: &App, area: Rect) {
     let mut text = detail;
     text.extend(edges.into_iter().map(Line::from));
     text.push(Line::from(""));
-    text.push(Line::from(
-        "a add agent  e edit prompt  x remove  c connect  Enter finish",
-    ));
+    text.push(Line::from(strings.builder_keys));
     frame.render_widget(
         Paragraph::new(Text::from(text))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" Node editor "),
+                    .title(strings.builder_editor_title),
             )
-            .wrap(Wrap { trim: false }),
+            .wrap(ratatui::widgets::Wrap { trim: false }),
         columns[1],
     );
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_run(frame: &mut Frame, app: &App, area: Rect) {
+    let strings = app.strings();
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
@@ -1338,57 +2059,86 @@ fn render_run(frame: &mut Frame, app: &App, area: Rect) {
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{marker} {symbol} "), Style::default().fg(color)),
                 Span::raw(format!("{:<18} ", node.id)),
-                Span::styled(format!("{status:?}"), Style::default().fg(color)),
+                Span::styled(
+                    node_status_label(status, app.lang),
+                    Style::default().fg(color),
+                ),
             ]))
         })
         .collect::<Vec<_>>();
-    let graph_status = if app.active_run.is_some() {
-        "RUNNING"
+    let title = if app.active_run.is_some() {
+        strings.run_nodes_running
     } else {
-        "IDLE"
+        strings.run_nodes_idle
     };
     frame.render_widget(
-        List::new(nodes).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" Nodes · {graph_status} ")),
-        ),
+        List::new(nodes).block(Block::default().borders(Borders::ALL).title(title)),
         columns[0],
     );
 
     let mut lines = vec![Line::from(Span::styled(
-        "EVENT STREAM",
+        strings.run_events,
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     ))];
     lines.extend(app.events.iter().cloned().map(Line::from));
+    if let Some(run_id) = &app.last_run_id {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{}: ", strings.run_dir_label),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw(format!(".gloop/runs/{run_id}")),
+        ]));
+    }
     if let Some(summary) = &app.last_summary {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "RESULT",
+            strings.run_result,
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         )));
-        lines.push(Line::from(format!("status: {:?}", summary.status)));
-        lines.push(Line::from(format!(
-            "run: {} · {}ms",
-            summary.run_id, summary.duration_ms
+        lines.push(Line::from(fill(
+            strings.run_status_label,
+            &[("status", &format!("{:?}", summary.status))],
+        )));
+        lines.push(Line::from(fill(
+            strings.run_meta,
+            &[
+                ("id", &summary.run_id),
+                ("ms", &summary.duration_ms.to_string()),
+            ],
         )));
         if let Some(node) = app.graph.spec.nodes.get(app.selected_node)
             && let Some(outcome) = summary.nodes.get(&node.id)
         {
-            lines.push(Line::from(format!(
-                "selected: {} → {:?}",
-                node.id, outcome.status
+            lines.push(Line::from(fill(
+                strings.run_selected,
+                &[
+                    ("id", &node.id),
+                    ("status", &format!("{:?}", outcome.status)),
+                ],
             )));
             if let Some(output) = &outcome.output {
-                lines.push(Line::from(format!("output: {output}")));
+                let rendered = serde_json::to_string(output).unwrap_or_else(|_| output.to_string());
+                lines.push(Line::from(fill(
+                    strings.run_output,
+                    &[("output", &truncate_rendered(&rendered, 240))],
+                )));
             }
             if let Some(error) = &outcome.error {
-                lines.push(Line::from(format!("error: {error}")));
+                lines.push(Line::from(fill(
+                    strings.run_error,
+                    &[("error", &truncate_rendered(error, 240))],
+                )));
             }
+            lines.push(Line::from(Span::styled(
+                strings.run_open_output,
+                Style::default().fg(Color::DarkGray),
+            )));
         }
     }
     frame.render_widget(
@@ -1398,24 +2148,33 @@ fn render_run(frame: &mut Frame, app: &App, area: Rect) {
                     .borders(Borders::ALL)
                     .title(" Runtime / results "),
             )
-            .wrap(Wrap { trim: false }),
+            .wrap(ratatui::widgets::Wrap { trim: false }),
         columns[1],
     );
 }
 
-fn render_input(frame: &mut Frame, input: &InputState, area: Rect) {
+fn truncate_rendered(text: &str, limit: usize) -> String {
+    let count = text.chars().count();
+    if count <= limit {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(limit).collect();
+    format!("{kept}\u{2026}(+{} chars)", count - limit)
+}
+
+fn input_height(input: &InputState, area: Rect) -> u16 {
+    let logical_lines = u16::try_from(input.value.split('\n').count()).unwrap_or(u16::MAX);
+    let height = logical_lines.saturating_add(2);
+    height.clamp(5, (area.height / 2).max(6))
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_input(frame: &mut Frame, input: &InputState, strings: &Strings, area: Rect) {
     let title = match input.target {
-        InputTarget::Task => " Task · Enter save / Esc cancel ",
-        InputTarget::Model => " Model override · Enter save / blank clears ",
-        InputTarget::NodePrompt => " Node prompt · Enter save / Esc cancel ",
+        InputTarget::Task => strings.input_task,
+        InputTarget::Model => strings.input_model,
+        InputTarget::NodePrompt => strings.input_prompt,
     };
-    let cursor = input.cursor.min(input.value.len());
-    let (before, after) = input.value.split_at(cursor);
-    let line = Line::from(vec![
-        Span::raw(before),
-        Span::styled("▏", Style::default().fg(Color::Cyan)),
-        Span::raw(after),
-    ]);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
@@ -1423,39 +2182,270 @@ fn render_input(frame: &mut Frame, input: &InputState, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: false }), inner);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let width = inner.width as usize;
+    let (cursor_line, cursor_col) = line_col_at(&input.value, input.cursor);
+
+    // Soft-wrap every logical line and remember which wrapped row carries the
+    // cursor plus the cursor column within that row.
+    let mut rows: Vec<(String, Option<usize>)> = Vec::new();
+    for (line_index, line) in input.value.split('\n').enumerate() {
+        let wrapped = wrap_line(line, width);
+        let mut column = 0usize;
+        for row in wrapped {
+            let row_chars = row.text.chars().count();
+            let cursor_here = line_index == cursor_line
+                && cursor_col >= column
+                && cursor_col <= column + row_chars;
+            rows.push((row.text, cursor_here.then(|| cursor_col - column)));
+            column += row_chars;
+        }
+    }
+    if rows.is_empty() {
+        rows.push((String::new(), Some(0)));
+    }
+    let cursor_row = rows
+        .iter()
+        .position(|(_, cursor)| cursor.is_some())
+        .unwrap_or(0);
+    let visible = inner.height as usize;
+    let scroll = cursor_row.saturating_sub(visible.saturating_sub(1));
+
+    let lines: Vec<Line> = rows
+        .iter()
+        .skip(scroll)
+        .take(visible)
+        .map(|(text, cursor_offset)| match cursor_offset {
+            Some(offset) => {
+                let mut before = String::new();
+                let mut after = String::new();
+                for (index, character) in text.chars().enumerate() {
+                    if index < *offset {
+                        before.push(character);
+                    } else {
+                        after.push(character);
+                    }
+                }
+                Line::from(vec![
+                    Span::raw(before),
+                    Span::styled("\u{258f}", Style::default().fg(Color::Cyan)),
+                    Span::raw(after),
+                ])
+            }
+            None => Line::from(text.clone()),
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
-fn render_gate(frame: &mut Frame, gate: &GateEnvelope, area: Rect) {
+fn render_scroll_overlay(
+    frame: &mut Frame,
+    title: &str,
+    lines: &[String],
+    offset: usize,
+    area: Rect,
+    border: Color,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .title(title.to_owned());
+    frame.render_widget(Clear, area);
+    let text: Vec<Line> = lines.iter().cloned().map(Line::from).collect();
+    frame.render_widget(block.clone(), area);
+    let inner = block.inner(area);
+    frame.render_widget(
+        Paragraph::new(Text::from(text))
+            .scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0))
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+        inner,
+    );
+}
+
+fn render_template_picker(
+    frame: &mut Frame,
+    app: &App,
+    selected: usize,
+    previews: &[TemplatePreview],
+    area: Rect,
+) {
+    let strings = app.strings();
+    let mut lines: Vec<Line> = Vec::new();
+    for (index, preview) in previews.iter().enumerate() {
+        let is_selected = index == selected;
+        let marker = if is_selected { "\u{25b8}" } else { " " };
+        let current = if preview.template == app.template {
+            format!(" {}", strings.picker_current)
+        } else {
+            String::new()
+        };
+        let name_style = if is_selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!(" {:<24} ", template_label(preview.template)),
+                name_style,
+            ),
+            Span::raw(template_desc(strings, preview.template)),
+            Span::styled(current, Style::default().fg(Color::Green)),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "   {} · {}",
+                fill(
+                    strings.nodes_edges,
+                    &[
+                        ("nodes", &preview.nodes.to_string()),
+                        ("edges", &preview.edges.to_string()),
+                    ],
+                ),
+                preview.shape
+            ),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::from(""));
+    if app.manual_edits {
+        lines.push(Line::from(Span::styled(
+            strings.picker_discard_warning,
+            Style::default().fg(Color::Yellow),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} · {} · {}",
+                strings.key_move, strings.key_apply, strings.key_close
+            ),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(strings.template_picker_title),
+            )
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_profile_picker(frame: &mut Frame, app: &App, selected: usize, area: Rect) {
+    let strings = app.strings();
+    let mut lines: Vec<Line> = Vec::new();
+    if app.profiles.is_empty() {
+        lines.push(Line::from(strings.status_profile_none));
+    }
+    for (index, profile) in app.profiles.iter().enumerate() {
+        let is_selected = index == selected;
+        let marker = if is_selected { "\u{25b8}" } else { " " };
+        let current = if Some(index) == app.profile_index {
+            format!(" {}", strings.picker_current)
+        } else {
+            String::new()
+        };
+        let enabled_note = if profile.enabled {
+            String::new()
+        } else {
+            format!(" {}", strings.picker_disabled)
+        };
+        let source = match profile.source {
+            wizard::ProfileSource::Builtin => strings.picker_source_builtin,
+            wizard::ProfileSource::User => strings.picker_source_user,
+            wizard::ProfileSource::Project => strings.picker_source_project,
+        };
+        let name_style = if is_selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, Style::default().fg(Color::Cyan)),
+            Span::styled(format!(" {:<20} ", profile.name), name_style),
+            Span::raw(format!("[{}] {source}", profile.kind)),
+            Span::raw(
+                profile
+                    .default_model
+                    .as_deref()
+                    .map_or_else(String::new, |model| format!(" · {model}")),
+            ),
+            Span::styled(current, Style::default().fg(Color::Green)),
+            Span::styled(enabled_note, Style::default().fg(Color::Red)),
+        ]));
+    }
+    lines.push(Line::from(""));
+    if app.manual_edits {
+        lines.push(Line::from(Span::styled(
+            strings.picker_discard_warning,
+            Style::default().fg(Color::Yellow),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} · {} · {}",
+                strings.key_move, strings.key_apply, strings.key_close
+            ),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(strings.profile_picker_title),
+            )
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_gate(frame: &mut Frame, gate: &GateEnvelope, strings: &Strings, area: Rect) {
     let default = match gate.request.default {
-        GateDecision::Approve => "approve",
-        GateDecision::Reject => "reject",
+        GateDecision::Approve => strings.gate_approve,
+        GateDecision::Reject => strings.gate_reject,
     };
     let content = vec![
         Line::from(Span::styled(
-            format!("Node: {}", gate.request.node_id),
+            fill(strings.gate_node, &[("node", &gate.request.node_id)]),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(gate.request.message.clone()),
         Line::from(""),
-        Line::from(format!("y approve   n reject   Enter default ({default})")),
+        Line::from(fill(strings.gate_keys, &[("default", default)])),
     ];
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
-        .title(" Human gate ");
+        .title(strings.gate_title);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(Text::from(content))
             .block(block)
-            .wrap(Wrap { trim: false }),
+            .wrap(ratatui::widgets::Wrap { trim: false }),
         area,
     );
 }
 
 fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
+    let height = height.min(area.height.saturating_sub(2).max(3));
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1481,10 +2471,11 @@ async fn run_loop(
     loop {
         app.drain_run_events().await;
         terminal.draw(|frame| render(frame, &app))?;
-        if event::poll(Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()?
-        {
-            match app.handle_key(key) {
+        if !event::poll(Duration::from_millis(50))? {
+            continue;
+        }
+        match event::read()? {
+            Event::Key(key) => match app.handle_key(key) {
                 Action::Continue => {}
                 Action::Quit => break,
                 Action::Save => {
@@ -1492,7 +2483,27 @@ async fn run_loop(
                         app.status = error.to_string();
                     }
                 }
-            }
+                Action::Run => {
+                    let mut started = false;
+                    if app.dirty {
+                        match app.save().await {
+                            Ok(()) => {
+                                app.set_status(app.strings().status_autosave_before_run);
+                                started = true;
+                            }
+                            Err(error) => app.status = error.to_string(),
+                        }
+                    } else {
+                        started = true;
+                    }
+                    if started {
+                        app.start_run();
+                    }
+                }
+                Action::OpenOutput => app.prepare_output().await,
+            },
+            Event::Paste(text) => app.handle_paste(&text),
+            _ => {}
         }
     }
     Ok(())
@@ -1501,7 +2512,7 @@ async fn run_loop(
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -1514,24 +2525,28 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
-        let _ = execute!(stdout, LeaveAlternateScreen);
+        let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen);
     }
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
 
-pub async fn launch(repo: PathBuf, trust_project_profiles: bool) -> Result<()> {
+pub async fn launch(repo: PathBuf, trust_project_profiles: bool, lang: Language) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(anyhow!("graph TUI requires an interactive terminal"));
     }
     let guard = TerminalGuard;
     let mut terminal = setup_terminal()?;
-    let result = match App::new(repo, trust_project_profiles) {
+    let result = match App::new(repo, trust_project_profiles, lang) {
         Ok(app) => run_loop(&mut terminal, app).await,
         Err(error) => Err(error),
     };
@@ -1543,6 +2558,21 @@ pub async fn launch(repo: PathBuf, trust_project_profiles: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    fn temp_app() -> (tempfile::TempDir, App) {
+        let repo = tempfile::tempdir().expect("create tempdir");
+        let app = App::new(repo.path().to_path_buf(), false, Language::En)
+            .expect("create app in temp repo");
+        (repo, app)
+    }
 
     #[test]
     fn template_labels_are_stable_for_help_and_status() {
@@ -1616,8 +2646,10 @@ mod tests {
         )
         .expect("write initial graph");
 
-        let mut app = App::new(repo.path().to_path_buf(), false).expect("load existing graph");
+        let mut app =
+            App::new(repo.path().to_path_buf(), false, Language::En).expect("load existing graph");
         assert_eq!(app.task, "loaded task");
+        assert!(app.manual_edits, "loaded graphs count as user content");
         app.graph.spec.goal = "local edit".to_owned();
         app.dirty = true;
 
@@ -1642,5 +2674,162 @@ mod tests {
             fs::read_to_string(graph_path).expect("read graph"),
             external_yaml
         );
+    }
+
+    #[tokio::test]
+    async fn task_input_is_multiline_and_commits_with_ctrl_s() {
+        let (_repo, mut app) = temp_app();
+        app.task = String::new();
+        app.begin_input(InputTarget::Task);
+        for character in "analyze".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        // Enter inserts a newline instead of committing.
+        app.handle_key(key(KeyCode::Enter));
+        for character in "then fix".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        let Some(Modal::Input(input)) = &app.modal else {
+            panic!("input modal should still be open before commit");
+        };
+        assert_eq!(input.value, "analyze\nthen fix");
+        app.handle_key(ctrl(KeyCode::Char('s')));
+        assert!(app.modal.is_none());
+        assert_eq!(app.task, "analyze\nthen fix");
+        assert_eq!(app.graph.spec.goal, "analyze\nthen fix");
+    }
+
+    #[tokio::test]
+    async fn task_input_paste_inserts_text_without_committing() {
+        let (_repo, mut app) = temp_app();
+        app.task = String::new();
+        app.begin_input(InputTarget::Task);
+        app.handle_paste("line one\nline two");
+        let Some(Modal::Input(input)) = &app.modal else {
+            panic!("paste must keep the modal open");
+        };
+        assert_eq!(input.value, "line one\nline two");
+        assert_eq!(input.cursor, input.value.len());
+    }
+
+    #[tokio::test]
+    async fn task_edit_rebuilds_without_manual_edits_and_keeps_nodes_with_manual_edits() {
+        let (_repo, mut app) = temp_app();
+        // Fresh draft: commit rebuilds from the template.
+        app.task = String::new();
+        app.begin_input(InputTarget::Task);
+        app.handle_paste("first version");
+        app.handle_key(ctrl(KeyCode::Char('s')));
+        assert_eq!(app.graph.spec.nodes.len(), 1);
+        assert!(app.dirty);
+        assert!(!app.manual_edits);
+
+        // Manual edit: the next task commit updates the goal only.
+        app.add_node();
+        assert!(app.manual_edits);
+        assert_eq!(app.graph.spec.nodes.len(), 2);
+        app.begin_input(InputTarget::Task);
+        // Clear the prefilled value and type a new one.
+        if let Some(Modal::Input(input)) = &mut app.modal {
+            input.value.clear();
+            input.cursor = 0;
+        }
+        app.handle_paste("second version");
+        app.handle_key(ctrl(KeyCode::Char('s')));
+        assert_eq!(app.graph.spec.nodes.len(), 2, "manual nodes survive");
+        assert_eq!(app.graph.spec.goal, "second version");
+        assert_eq!(app.task, "second version");
+    }
+
+    #[tokio::test]
+    async fn template_picker_applies_selection_and_rebuilds() {
+        let (_repo, mut app) = temp_app();
+        app.open_template_picker();
+        app.handle_key(key(KeyCode::Char('j')));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.modal.is_none());
+        assert_eq!(app.template, GraphTemplate::PlanImplementVerify);
+        assert!(app.dirty);
+        assert!(!app.manual_edits);
+        assert_eq!(graph_shape(&app.graph), "plan -> implement -> verify");
+        assert!(
+            app.status.contains("plan-implement-verify"),
+            "status explains the applied template: {}",
+            app.status
+        );
+    }
+
+    #[tokio::test]
+    async fn template_picker_esc_cancels_without_changes() {
+        let (_repo, mut app) = temp_app();
+        let before = app.graph.clone();
+        app.open_template_picker();
+        app.handle_key(key(KeyCode::Char('j')));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+        assert_eq!(app.template, GraphTemplate::Direct);
+        assert_eq!(app.graph, before);
+    }
+
+    #[test]
+    fn graph_shape_reports_chains_and_edge_lists() {
+        let direct = wizard::template_graph(
+            "work",
+            "task",
+            GraphTemplate::Direct,
+            Some("task".to_owned()),
+            None,
+            None,
+        );
+        assert_eq!(graph_shape(&direct), "request");
+        let piv = wizard::template_graph(
+            "work",
+            "task",
+            GraphTemplate::PlanImplementVerify,
+            Some("task".to_owned()),
+            None,
+            None,
+        );
+        assert_eq!(graph_shape(&piv), "plan -> implement -> verify");
+        let parallel = wizard::template_graph(
+            "work",
+            "task",
+            GraphTemplate::ParallelResearchReduce,
+            Some("task".to_owned()),
+            None,
+            None,
+        );
+        let shape = graph_shape(&parallel);
+        assert!(shape.contains("->"), "fan-out shape lists edges: {shape}");
+    }
+
+    #[test]
+    fn move_vertical_keeps_column_across_lines() {
+        let value = "ab\ncdef\ngh";
+        let mut preferred = None;
+        let cursor = value.len();
+        let up_once = move_vertical(value, cursor, -1, &mut preferred);
+        assert_eq!(value.chars().nth(up_once), Some('e'));
+        let up_twice = move_vertical(value, up_once, -1, &mut preferred);
+        assert_eq!(up_twice, 2);
+        let down = move_vertical(value, up_twice, 1, &mut preferred);
+        assert_eq!(value.chars().nth(down), Some('e'));
+    }
+
+    #[test]
+    fn wrap_line_counts_cjk_width_as_two_columns() {
+        let rows = wrap_line("日本語", 4);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].text, "日本");
+        assert_eq!(rows[1].text, "語");
+    }
+
+    #[tokio::test]
+    async fn language_toggle_switches_ui_strings() {
+        let (_repo, mut app) = temp_app();
+        assert_eq!(app.strings().screen_run, "Run Monitor");
+        app.toggle_language();
+        assert_eq!(app.lang, Language::Ja);
+        assert_eq!(app.strings().screen_run, "実行モニター");
     }
 }
