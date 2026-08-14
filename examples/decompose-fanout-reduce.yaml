@@ -1,0 +1,161 @@
+apiVersion: gloop.dev/v1alpha1
+kind: Graph
+metadata:
+  name: decompose-fanout-reduce
+  version: 1.0.0
+  description: decompose into packages, fan out to workers, integrate
+spec:
+  goal: Decompose and fan out
+  policies:
+    max_parallel: 4
+    failure: fail_fast
+  budgets: {}
+  nodes:
+  - id: decompose
+    requires: []
+    resources: []
+    retry:
+      max_attempts: 1
+      backoff_seconds: 0
+      rebind_profiles: []
+    workspace:
+      mode: current
+    context:
+      include_dependencies: true
+      files: []
+      max_bytes: 262144
+    continue_on_failure: false
+    kind: agent
+    prompt: |-
+      Decomposer role: split this task into at most 4 independent, parallelizable work packages. Number them 1..N, one paragraph each, no overlap:
+      Refactor the module
+    fan_out: 1
+    output:
+      format: text
+      max_bytes: 1048576
+  - id: worker_one
+    requires: []
+    resources: []
+    retry:
+      max_attempts: 1
+      backoff_seconds: 0
+      rebind_profiles: []
+    workspace:
+      mode: current
+    context:
+      include_dependencies: true
+      files: []
+      max_bytes: 262144
+    continue_on_failure: false
+    kind: agent
+    prompt: Worker lane 1. The upstream decomposition lists numbered work packages. Execute only package 1; if the decomposition has fewer than 1 packages, answer exactly SKIP. Return the package result only.
+    fan_out: 1
+    output:
+      format: text
+      max_bytes: 1048576
+  - id: worker_two
+    requires: []
+    resources: []
+    retry:
+      max_attempts: 1
+      backoff_seconds: 0
+      rebind_profiles: []
+    workspace:
+      mode: current
+    context:
+      include_dependencies: true
+      files: []
+      max_bytes: 262144
+    continue_on_failure: false
+    kind: agent
+    prompt: Worker lane 2. The upstream decomposition lists numbered work packages. Execute only package 2; if the decomposition has fewer than 2 packages, answer exactly SKIP. Return the package result only.
+    fan_out: 1
+    output:
+      format: text
+      max_bytes: 1048576
+  - id: worker_three
+    requires: []
+    resources: []
+    retry:
+      max_attempts: 1
+      backoff_seconds: 0
+      rebind_profiles: []
+    workspace:
+      mode: current
+    context:
+      include_dependencies: true
+      files: []
+      max_bytes: 262144
+    continue_on_failure: false
+    kind: agent
+    prompt: Worker lane 3. The upstream decomposition lists numbered work packages. Execute only package 3; if the decomposition has fewer than 3 packages, answer exactly SKIP. Return the package result only.
+    fan_out: 1
+    output:
+      format: text
+      max_bytes: 1048576
+  - id: worker_four
+    requires: []
+    resources: []
+    retry:
+      max_attempts: 1
+      backoff_seconds: 0
+      rebind_profiles: []
+    workspace:
+      mode: current
+    context:
+      include_dependencies: true
+      files: []
+      max_bytes: 262144
+    continue_on_failure: false
+    kind: agent
+    prompt: Worker lane 4. The upstream decomposition lists numbered work packages. Execute only package 4; if the decomposition has fewer than 4 packages, answer exactly SKIP. Return the package result only.
+    fan_out: 1
+    output:
+      format: text
+      max_bytes: 1048576
+  - id: integrate
+    requires: []
+    resources: []
+    retry:
+      max_attempts: 1
+      backoff_seconds: 0
+      rebind_profiles: []
+    workspace:
+      mode: current
+    context:
+      include_dependencies: true
+      files: []
+      max_bytes: 262144
+    continue_on_failure: false
+    kind: synthesize
+    prompt: |-
+      You receive results from up to four worker lanes (lanes without work answer SKIP). Assemble them into one coherent final deliverable for the original task:
+      Refactor the module
+    output:
+      format: text
+      max_bytes: 1048576
+  edges:
+  - from: decompose
+    to: worker_one
+    kind: data
+  - from: decompose
+    to: worker_two
+    kind: data
+  - from: decompose
+    to: worker_three
+    kind: data
+  - from: decompose
+    to: worker_four
+    kind: data
+  - from: worker_one
+    to: integrate
+    kind: data
+  - from: worker_two
+    to: integrate
+    kind: data
+  - from: worker_three
+    to: integrate
+    kind: data
+  - from: worker_four
+    to: integrate
+    kind: data

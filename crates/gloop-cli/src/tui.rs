@@ -52,12 +52,15 @@ use crate::{
     wizard::{self, EditorState, GraphTemplate, ProfileChoice},
 };
 
-const TEMPLATE_CHOICES: [GraphTemplate; 5] = [
+const TEMPLATE_CHOICES: [GraphTemplate; 8] = [
     GraphTemplate::Direct,
     GraphTemplate::PlanImplementVerify,
     GraphTemplate::ParallelResearchReduce,
     GraphTemplate::ReviewFixLoop,
     GraphTemplate::DesignWallBounce,
+    GraphTemplate::Council,
+    GraphTemplate::DecomposeFanoutReduce,
+    GraphTemplate::ImplementTestLoop,
 ];
 
 const DEFAULT_TASK: &str = "Describe the task for the graph";
@@ -387,6 +390,9 @@ impl App {
             GraphTemplate::ParallelResearchReduce => strings.template_desc_parallel_research_reduce,
             GraphTemplate::ReviewFixLoop => strings.template_desc_review_fix_loop,
             GraphTemplate::DesignWallBounce => strings.template_desc_design_wall_bounce,
+            GraphTemplate::Council => strings.template_desc_council,
+            GraphTemplate::DecomposeFanoutReduce => strings.template_desc_decompose_fanout_reduce,
+            GraphTemplate::ImplementTestLoop => strings.template_desc_implement_test_loop,
         };
         let shape = graph_shape(&self.graph);
         let key = if had_edits {
@@ -737,7 +743,10 @@ impl App {
                 self.commit_input();
             }
             KeyCode::Enter => {
-                if multiline {
+                let newline_modifier = key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT);
+                if multiline && newline_modifier {
                     input.value.insert(input.cursor, '\n');
                     input.cursor += 1;
                     input.preferred_col = Some(0);
@@ -1501,6 +1510,9 @@ fn template_label(template: GraphTemplate) -> &'static str {
         GraphTemplate::ParallelResearchReduce => "parallel-research-reduce",
         GraphTemplate::ReviewFixLoop => "review-fix-loop",
         GraphTemplate::DesignWallBounce => "design-wall-bounce",
+        GraphTemplate::Council => "council",
+        GraphTemplate::DecomposeFanoutReduce => "decompose-fanout-reduce",
+        GraphTemplate::ImplementTestLoop => "implement-test-loop",
     }
 }
 
@@ -1511,6 +1523,9 @@ fn template_desc(strings: &Strings, template: GraphTemplate) -> &'static str {
         GraphTemplate::ParallelResearchReduce => strings.template_desc_parallel_research_reduce,
         GraphTemplate::ReviewFixLoop => strings.template_desc_review_fix_loop,
         GraphTemplate::DesignWallBounce => strings.template_desc_design_wall_bounce,
+        GraphTemplate::Council => strings.template_desc_council,
+        GraphTemplate::DecomposeFanoutReduce => strings.template_desc_decompose_fanout_reduce,
+        GraphTemplate::ImplementTestLoop => strings.template_desc_implement_test_loop,
     }
 }
 
@@ -1741,7 +1756,14 @@ fn render(frame: &mut Frame, app: &App) {
             render_input(frame, input, strings, centered_rect(90, height, area));
         }
         Some(Modal::TemplatePicker { selected, previews }) => {
-            render_template_picker(frame, app, *selected, previews, centered_rect(84, 17, area));
+            let height = u16::try_from(previews.len().saturating_mul(2) + 3).unwrap_or(u16::MAX);
+            render_template_picker(
+                frame,
+                app,
+                *selected,
+                previews,
+                centered_rect(84, height, area),
+            );
         }
         Some(Modal::ProfilePicker { selected }) => {
             render_profile_picker(frame, app, *selected, centered_rect(70, 15, area));
@@ -2581,6 +2603,137 @@ mod tests {
             template_label(GraphTemplate::ReviewFixLoop),
             "review-fix-loop"
         );
+        assert_eq!(template_label(GraphTemplate::Council), "council");
+        assert_eq!(
+            template_label(GraphTemplate::DecomposeFanoutReduce),
+            "decompose-fanout-reduce"
+        );
+        assert_eq!(
+            template_label(GraphTemplate::ImplementTestLoop),
+            "implement-test-loop"
+        );
+    }
+
+    fn assert_valid(graph: &Graph) {
+        let errors = graph
+            .validate()
+            .iter()
+            .filter(|issue| issue.severity == gloop_core::IssueSeverity::Error)
+            .count();
+        assert_eq!(errors, 0, "template graph must validate: {graph:?}");
+    }
+
+    #[test]
+    fn council_template_has_blind_lanes_and_panel_review() {
+        let council = wizard::template_graph(
+            "work",
+            "task",
+            GraphTemplate::Council,
+            Some("task".to_owned()),
+            None,
+            None,
+        );
+        assert_valid(&council);
+        assert_eq!(council.spec.nodes.len(), 8);
+        // Two blind design lanes fan into one design judgment.
+        let into_design = council
+            .spec
+            .edges
+            .iter()
+            .filter(|edge| edge.to == "integrate_design")
+            .count();
+        assert_eq!(into_design, 2);
+        // Three reviewers fan into the reconciled verdict.
+        let into_verdict = council
+            .spec
+            .edges
+            .iter()
+            .filter(|edge| edge.to == "integrate_review")
+            .count();
+        assert_eq!(into_verdict, 3);
+        let implement_inputs = council
+            .spec
+            .edges
+            .iter()
+            .filter(|edge| edge.to == "implement")
+            .count();
+        assert_eq!(implement_inputs, 1);
+    }
+
+    #[test]
+    fn decompose_template_fans_out_to_worker_lanes_and_back() {
+        let graph = wizard::template_graph(
+            "work",
+            "task",
+            GraphTemplate::DecomposeFanoutReduce,
+            Some("task".to_owned()),
+            None,
+            None,
+        );
+        assert_valid(&graph);
+        assert_eq!(graph.spec.nodes.len(), 6);
+        let to_workers = graph
+            .spec
+            .edges
+            .iter()
+            .filter(|edge| edge.from == "decompose")
+            .count();
+        assert_eq!(to_workers, 4);
+        let into_integrate = graph
+            .spec
+            .edges
+            .iter()
+            .filter(|edge| edge.to == "integrate")
+            .count();
+        assert_eq!(into_integrate, 4);
+    }
+
+    #[test]
+    fn implement_test_loop_template_routes_failures_to_the_fixer() {
+        let graph = wizard::template_graph(
+            "work",
+            "task",
+            GraphTemplate::ImplementTestLoop,
+            Some("task".to_owned()),
+            None,
+            Some(5),
+        );
+        assert_valid(&graph);
+        let loop_node = graph
+            .spec
+            .nodes
+            .iter()
+            .find(|node| node.id == "test_fix_loop")
+            .expect("loop node exists");
+        let NodeKind::Loop {
+            graph: nested,
+            until,
+            max_iterations,
+            stagnation_after,
+        } = &loop_node.kind
+        else {
+            panic!("test_fix_loop must be a loop node");
+        };
+        assert_eq!(until.node, "test");
+        assert_eq!(until.status, NodeStatus::Succeeded);
+        assert_eq!(*max_iterations, 5, "--loop-cap flows into the template");
+        assert_eq!(
+            *stagnation_after, *max_iterations,
+            "failed verifies carry no output, so the stagnation guard must not pre-empt the loop cap"
+        );
+        assert!(
+            nested.spec.edges.iter().any(|edge| edge.from == "test"
+                && edge.to == "fix"
+                && edge.kind == gloop_core::EdgeKind::Failure),
+            "failed verification must route to the fixer through a failure edge"
+        );
+        assert!(
+            graph
+                .spec
+                .edges
+                .iter()
+                .any(|edge| edge.from == "implement" && edge.to == "test_fix_loop")
+        );
     }
 
     #[test]
@@ -2677,15 +2830,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_input_is_multiline_and_commits_with_ctrl_s() {
+    async fn task_input_commits_on_enter_and_alt_enter_inserts_newline() {
         let (_repo, mut app) = temp_app();
         app.task = String::new();
         app.begin_input(InputTarget::Task);
         for character in "analyze".chars() {
             app.handle_key(key(KeyCode::Char(character)));
         }
-        // Enter inserts a newline instead of committing.
-        app.handle_key(key(KeyCode::Enter));
+        // Alt+Enter inserts a newline instead of committing.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
         for character in "then fix".chars() {
             app.handle_key(key(KeyCode::Char(character)));
         }
@@ -2693,10 +2846,23 @@ mod tests {
             panic!("input modal should still be open before commit");
         };
         assert_eq!(input.value, "analyze\nthen fix");
-        app.handle_key(ctrl(KeyCode::Char('s')));
+        // Plain Enter commits, like other AI TUIs.
+        app.handle_key(key(KeyCode::Enter));
         assert!(app.modal.is_none());
         assert_eq!(app.task, "analyze\nthen fix");
         assert_eq!(app.graph.spec.goal, "analyze\nthen fix");
+    }
+
+    #[tokio::test]
+    async fn model_input_still_commits_on_plain_enter() {
+        let (_repo, mut app) = temp_app();
+        app.begin_input(InputTarget::Model);
+        for character in "fast-model".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.modal.is_none());
+        assert_eq!(app.model.as_deref(), Some("fast-model"));
     }
 
     #[tokio::test]

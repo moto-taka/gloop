@@ -1,0 +1,144 @@
+apiVersion: gloop.dev/v1alpha1
+kind: Graph
+metadata:
+  name: implement-test-loop
+  version: 1.0.0
+  description: implement, then bounded verify/fix loop until tests pass
+spec:
+  goal: Implement until tests pass
+  policies:
+    max_parallel: 4
+    failure: fail_fast
+  budgets: {}
+  nodes:
+  - id: implement
+    requires: []
+    resources: []
+    retry:
+      max_attempts: 1
+      backoff_seconds: 0
+      rebind_profiles: []
+    workspace:
+      mode: current
+    context:
+      include_dependencies: true
+      files: []
+      max_bytes: 262144
+    continue_on_failure: false
+    kind: agent
+    prompt: |-
+      Implementer role: implement the following so that the verification command passes:
+      Implement the feature and keep the test suite green
+    fan_out: 1
+    output:
+      format: text
+      max_bytes: 1048576
+  - id: test_fix_loop
+    requires: []
+    resources: []
+    retry:
+      max_attempts: 1
+      backoff_seconds: 0
+      rebind_profiles: []
+    workspace:
+      mode: current
+    context:
+      include_dependencies: true
+      files: []
+      max_bytes: 262144
+    continue_on_failure: false
+    kind: loop
+    graph:
+      apiVersion: gloop.dev/v1alpha1
+      kind: Graph
+      metadata:
+        name: test-fix-iteration
+        version: 1.0.0
+        description: bounded verify/fix iteration
+      spec:
+        goal: single verify-fix iteration
+        policies:
+          max_parallel: 4
+          failure: fail_fast
+        budgets: {}
+        nodes:
+        - id: test
+          requires: []
+          resources: []
+          retry:
+            max_attempts: 1
+            backoff_seconds: 0
+            rebind_profiles: []
+          workspace:
+            mode: current
+          context:
+            include_dependencies: true
+            files: []
+            max_bytes: 262144
+          continue_on_failure: false
+          kind: verify
+          argv:
+          - sh
+          - -c
+          - 'echo ''TEMPLATE: replace with your test command, e.g. pnpm run test'''
+          output:
+            format: text
+            max_bytes: 1048576
+        - id: fix
+          requires: []
+          resources: []
+          retry:
+            max_attempts: 1
+            backoff_seconds: 0
+            rebind_profiles: []
+          workspace:
+            mode: current
+          context:
+            include_dependencies: true
+            files: []
+            max_bytes: 262144
+          continue_on_failure: false
+          kind: agent
+          prompt: |-
+            Fixer role: the verification command failed. Upstream you receive failure details: the error, exit code, and artifact paths (stdout_artifact / stderr_artifact). Read those artifact files to see the actual test output, diagnose the root cause, apply the smallest correct fix, and describe exactly what you changed for:
+            Implement the feature and keep the test suite green
+          fan_out: 1
+          output:
+            format: text
+            max_bytes: 1048576
+        edges:
+        - from: test
+          to: fix
+          kind: failure
+    until:
+      node: test
+      status: succeeded
+    max_iterations: 3
+    stagnation_after: 3
+  - id: report
+    requires: []
+    resources: []
+    retry:
+      max_attempts: 1
+      backoff_seconds: 0
+      rebind_profiles: []
+    workspace:
+      mode: current
+    context:
+      include_dependencies: true
+      files: []
+      max_bytes: 262144
+    continue_on_failure: false
+    kind: agent
+    prompt: 'Summarize the loop result: what was implemented, which verification iterations ran, and the final state. Be concise.'
+    fan_out: 1
+    output:
+      format: text
+      max_bytes: 1048576
+  edges:
+  - from: implement
+    to: test_fix_loop
+    kind: data
+  - from: test_fix_loop
+    to: report
+    kind: control
