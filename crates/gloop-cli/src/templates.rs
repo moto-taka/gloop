@@ -13,12 +13,15 @@ pub const GRAPHS_DIR: &str = ".gloop/graphs";
 pub const MAX_TEMPLATE_NAME_LEN: usize = 64;
 pub const DEFAULT_TEMPLATE_GOAL: &str = "work";
 
-pub const BUILTIN_TEMPLATE_NAMES: [&str; 5] = [
+pub const BUILTIN_TEMPLATE_NAMES: [&str; 8] = [
     "direct",
     "plan-implement-verify",
     "parallel-research-reduce",
     "review-fix-loop",
     "design-wall-bounce",
+    "council",
+    "decompose-fanout-reduce",
+    "implement-test-loop",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -413,6 +416,15 @@ pub fn list_builtin_templates() -> Vec<TemplateEntry> {
                     "parallel-research-reduce" => "research in parallel, then reduce",
                     "review-fix-loop" => "bounded review and fix loop",
                     "design-wall-bounce" => "two designers wall-bounce proposals and integrate",
+                    "council" => {
+                        "blind designs, one implementation, panel review, reconciled verdict"
+                    }
+                    "decompose-fanout-reduce" => {
+                        "decompose into packages, fan out to worker lanes, integrate"
+                    }
+                    "implement-test-loop" => {
+                        "implement, then bounded verify/fix loop until the test command passes"
+                    }
                     _ => "built-in graph template",
                 }
                 .to_owned(),

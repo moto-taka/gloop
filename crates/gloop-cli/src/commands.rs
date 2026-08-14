@@ -112,6 +112,9 @@ pub enum GraphTemplateArg {
     ParallelResearchReduce,
     ReviewFixLoop,
     DesignWallBounce,
+    Council,
+    DecomposeFanoutReduce,
+    ImplementTestLoop,
 }
 
 impl GraphTemplateArg {
@@ -122,6 +125,9 @@ impl GraphTemplateArg {
             "parallel-research-reduce" => Some(Self::ParallelResearchReduce),
             "review-fix-loop" => Some(Self::ReviewFixLoop),
             "design-wall-bounce" => Some(Self::DesignWallBounce),
+            "council" => Some(Self::Council),
+            "decompose-fanout-reduce" => Some(Self::DecomposeFanoutReduce),
+            "implement-test-loop" => Some(Self::ImplementTestLoop),
             _ => None,
         }
     }
@@ -133,6 +139,9 @@ impl GraphTemplateArg {
             Self::ParallelResearchReduce => wizard::GraphTemplate::ParallelResearchReduce,
             Self::ReviewFixLoop => wizard::GraphTemplate::ReviewFixLoop,
             Self::DesignWallBounce => wizard::GraphTemplate::DesignWallBounce,
+            Self::Council => wizard::GraphTemplate::Council,
+            Self::DecomposeFanoutReduce => wizard::GraphTemplate::DecomposeFanoutReduce,
+            Self::ImplementTestLoop => wizard::GraphTemplate::ImplementTestLoop,
         }
     }
 }
@@ -1695,6 +1704,9 @@ fn localized_template_description(
             "parallel-research-reduce" => "並列で調べてからまとめる",
             "review-fix-loop" => "レビューと修正を回数制限つきで繰り返す",
             "design-wall-bounce" => "2人の設計者が互いの案を壁打ちして統合する",
+            "council" => "ブラインド設計 → 統合 → 実装 → パネルレビュー → 統合判定",
+            "decompose-fanout-reduce" => "タスク分解 → 軽量ワーカー並列実行 → 統合",
+            "implement-test-loop" => "実装後、テストが通るまで検証/修正を回数限定で反復",
             _ => return entry.description.clone(),
         };
         return Some(description.to_owned());

@@ -518,6 +518,9 @@ pub enum GraphTemplate {
     ParallelResearchReduce,
     ReviewFixLoop,
     DesignWallBounce,
+    Council,
+    DecomposeFanoutReduce,
+    ImplementTestLoop,
 }
 
 pub fn request_graph(
@@ -560,6 +563,13 @@ pub fn template_graph(
         }
         GraphTemplate::DesignWallBounce => {
             design_wall_bounce_template(name, goal, request, &profiles)
+        }
+        GraphTemplate::Council => council_template(name, goal, request, &profiles),
+        GraphTemplate::DecomposeFanoutReduce => {
+            decompose_fanout_reduce_template(name, goal, request, &profiles)
+        }
+        GraphTemplate::ImplementTestLoop => {
+            implement_test_loop_template(name, goal, request, &profiles, loop_cap)
         }
     }
 }
@@ -975,6 +985,9 @@ fn prompt_start_from(theme: &ColorfulTheme) -> Result<StartTemplate> {
         "parallel-research-reduce",
         "review-fix-loop",
         "design-wall-bounce",
+        "council",
+        "decompose-fanout-reduce",
+        "implement-test-loop",
     ];
     let selected = Select::with_theme(theme)
         .with_prompt("Start from")
@@ -989,6 +1002,9 @@ fn prompt_start_from(theme: &ColorfulTheme) -> Result<StartTemplate> {
         3 => StartTemplate::Builtin(GraphTemplate::ParallelResearchReduce),
         4 => StartTemplate::Builtin(GraphTemplate::ReviewFixLoop),
         5 => StartTemplate::Builtin(GraphTemplate::DesignWallBounce),
+        6 => StartTemplate::Builtin(GraphTemplate::Council),
+        7 => StartTemplate::Builtin(GraphTemplate::DecomposeFanoutReduce),
+        8 => StartTemplate::Builtin(GraphTemplate::ImplementTestLoop),
         _ => unreachable!("invalid start template selection"),
     })
 }
@@ -1022,7 +1038,10 @@ fn template_profile_slot_count(template: GraphTemplate) -> usize {
         GraphTemplate::PlanImplementVerify
         | GraphTemplate::ReviewFixLoop
         | GraphTemplate::DesignWallBounce => 2,
+        GraphTemplate::ImplementTestLoop => 3,
         GraphTemplate::ParallelResearchReduce => 4,
+        GraphTemplate::DecomposeFanoutReduce => 6,
+        GraphTemplate::Council => 8,
     }
 }
 
@@ -1034,7 +1053,10 @@ fn prompt_template_knobs(
     let request = prompt_optional_text_with_entry(theme, "Optional request text")?;
     let provider_profiles =
         prompt_template_provider_profiles(theme, profiles, template_profile_slot_count(template))?;
-    let loop_cap = if matches!(template, GraphTemplate::ReviewFixLoop) {
+    let loop_cap = if matches!(
+        template,
+        GraphTemplate::ReviewFixLoop | GraphTemplate::ImplementTestLoop
+    ) {
         prompt_optional_number(
             theme,
             "Optional loop iteration cap",
@@ -3146,6 +3168,260 @@ enum QuoteState {
     Out,
     Single,
     Double,
+}
+
+/// Council pattern: two designers answer the same task blind, an integrator
+/// merges them into one design, an implementer implements it, three reviewers
+/// critique the implementation from independent angles, and a second
+/// integrator reconciles the reviews into the final judgment.
+fn council_template(
+    name: String,
+    goal: String,
+    request: Option<String>,
+    profiles: &[String],
+) -> Graph {
+    let request = request.unwrap_or_else(|| "the requested task".to_owned());
+    let pick = |index: usize| profiles.get(index).cloned();
+    let mut graph = Graph::new(
+        name,
+        goal,
+        vec![
+            agent_node(
+                "design_one",
+                &format!(
+                    "Design lane 1. Answer this task independently and completely:\n{request}"
+                ),
+                pick(0),
+                1,
+            ),
+            agent_node(
+                "design_two",
+                &format!(
+                    "Design lane 2. Answer this task independently and completely:\n{request}"
+                ),
+                pick(1),
+                1,
+            ),
+            synthesize_node(
+                "integrate_design",
+                &format!(
+                    "You receive two independent designs for the same task. Judge their strengths and weaknesses, then merge them into one decisive design:\n{request}"
+                ),
+                pick(2),
+            ),
+            agent_node(
+                "implement",
+                &format!(
+                    "Implementer role: implement the integrated design exactly as specified. Return what was implemented and how to verify it:\n{request}"
+                ),
+                pick(3),
+                1,
+            ),
+            agent_node(
+                "review_one",
+                "Reviewer role: correctness. Find defects, logic errors, and spec violations in the implementation. List concrete findings only.",
+                pick(4),
+                1,
+            ),
+            agent_node(
+                "review_two",
+                "Reviewer role: robustness. Find edge cases, failure modes, and security problems in the implementation. List concrete findings only.",
+                pick(5),
+                1,
+            ),
+            agent_node(
+                "review_three",
+                "Reviewer role: maintainability. Find readability, structure, and testing gaps in the implementation. List concrete findings only.",
+                pick(6),
+                1,
+            ),
+            synthesize_node(
+                "integrate_review",
+                "You receive three independent reviews of the same implementation. Deduplicate findings, judge severity, and produce one reconciled final review with an action list.",
+                pick(7),
+            ),
+        ],
+    );
+    graph.spec.edges = vec![
+        Edge::data("design_one", "integrate_design"),
+        Edge::data("design_two", "integrate_design"),
+        Edge::data("integrate_design", "implement"),
+        Edge::data("implement", "review_one"),
+        Edge::data("implement", "review_two"),
+        Edge::data("implement", "review_three"),
+        Edge::data("review_one", "integrate_review"),
+        Edge::data("review_two", "integrate_review"),
+        Edge::data("review_three", "integrate_review"),
+    ];
+    graph.metadata.description =
+        Some("council: blind designs, one implementation, panel review".to_owned());
+    graph
+}
+
+/// Decompose pattern: one model decomposes the task into up to four
+/// independent work packages, a bank of lightweight workers executes the
+/// package assigned to its lane (idle lanes answer SKIP), and an integrator
+/// assembles the final deliverable. Worker lanes are fixed by the graph, so
+/// decomposers must stay within four packages.
+fn decompose_fanout_reduce_template(
+    name: String,
+    goal: String,
+    request: Option<String>,
+    profiles: &[String],
+) -> Graph {
+    let request = request.unwrap_or_else(|| "the requested task".to_owned());
+    let pick = |index: usize| profiles.get(index).cloned();
+    let worker_prompt = |lane: usize| {
+        format!(
+            "Worker lane {lane}. The upstream decomposition lists numbered work packages. Execute only package {lane}; if the decomposition has fewer than {lane} packages, answer exactly SKIP. Return the package result only."
+        )
+    };
+    let mut graph = Graph::new(
+        name,
+        goal,
+        vec![
+            agent_node(
+                "decompose",
+                &format!(
+                    "Decomposer role: split this task into at most 4 independent, parallelizable work packages. Number them 1..N, one paragraph each, no overlap:\n{request}"
+                ),
+                pick(0),
+                1,
+            ),
+            agent_node("worker_one", &worker_prompt(1), pick(1), 1),
+            agent_node("worker_two", &worker_prompt(2), pick(2), 1),
+            agent_node("worker_three", &worker_prompt(3), pick(3), 1),
+            agent_node("worker_four", &worker_prompt(4), pick(4), 1),
+            synthesize_node(
+                "integrate",
+                &format!(
+                    "You receive results from up to four worker lanes (lanes without work answer SKIP). Assemble them into one coherent final deliverable for the original task:\n{request}"
+                ),
+                pick(5),
+            ),
+        ],
+    );
+    graph.spec.edges = vec![
+        Edge::data("decompose", "worker_one"),
+        Edge::data("decompose", "worker_two"),
+        Edge::data("decompose", "worker_three"),
+        Edge::data("decompose", "worker_four"),
+        Edge::data("worker_one", "integrate"),
+        Edge::data("worker_two", "integrate"),
+        Edge::data("worker_three", "integrate"),
+        Edge::data("worker_four", "integrate"),
+    ];
+    graph.metadata.description =
+        Some("decompose into packages, fan out to workers, integrate".to_owned());
+    graph
+}
+
+/// Implement-test-loop: an implementer works toward the goal, then a bounded
+/// loop runs the verification command; when it fails, a fixer consumes the
+/// failure details (failure edge) and the loop retries the verification.
+/// Replace the placeholder test command with the real suite, e.g.
+/// `pnpm run test` or `cargo test --workspace`.
+fn implement_test_loop_template(
+    name: String,
+    goal: String,
+    request: Option<String>,
+    profiles: &[String],
+    loop_cap: Option<u32>,
+) -> Graph {
+    let request = request.unwrap_or_else(|| "the requested implementation".to_owned());
+    let max_iterations = loop_cap.unwrap_or(3);
+    let implement_profile = profiles.first().cloned();
+    let fix_profile = profiles.get(1).cloned();
+
+    let nested_nodes = vec![
+        verify_node(
+            "test",
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "echo 'TEMPLATE: replace with your test command, e.g. pnpm run test'".into(),
+            ],
+        ),
+        agent_node(
+            "fix",
+            &format!(
+                "Fixer role: the verification command failed. You receive the failure details upstream. Diagnose the root cause, apply the smallest correct fix, and describe exactly what you changed for:\n{request}"
+            ),
+            fix_profile,
+            1,
+        ),
+    ];
+    let mut nested_graph = Graph::new(
+        "test-fix-iteration",
+        "single verify-fix iteration",
+        nested_nodes,
+    );
+    nested_graph.spec.edges = vec![Edge {
+        from: "test".to_owned(),
+        to: "fix".to_owned(),
+        kind: EdgeKind::Failure,
+        when: None,
+    }];
+    nested_graph.metadata.description = Some("bounded verify/fix iteration".to_owned());
+
+    let loop_node = Node {
+        id: "test_fix_loop".to_owned(),
+        label: None,
+        requires: Vec::new(),
+        resources: Vec::new(),
+        retry: RetryPolicy::default(),
+        timeout_seconds: None,
+        workspace: WorkspaceSpec::default(),
+        context: ContextSpec::default(),
+        continue_on_failure: false,
+        kind: NodeKind::Loop {
+            graph: Box::new(nested_graph),
+            until: LoopCondition {
+                node: "test".to_owned(),
+                status: NodeStatus::Succeeded,
+                output_contains: None,
+                json_pointer: None,
+                equals: None,
+            },
+            max_iterations,
+            stagnation_after: 2,
+        },
+    };
+
+    let mut graph = Graph::new(
+        name,
+        goal,
+        vec![
+            agent_node(
+                "implement",
+                &format!(
+                    "Implementer role: implement the following so that the verification command passes:\n{request}"
+                ),
+                implement_profile,
+                1,
+            ),
+            loop_node,
+            agent_node(
+                "report",
+                "Summarize the loop result: what was implemented, which verification iterations ran, and the final state. Be concise.",
+                profiles.get(2).cloned(),
+                1,
+            ),
+        ],
+    );
+    graph
+        .spec
+        .edges
+        .push(Edge::data("implement", "test_fix_loop"));
+    graph.spec.edges.push(Edge {
+        from: "test_fix_loop".to_owned(),
+        to: "report".to_owned(),
+        kind: EdgeKind::Control,
+        when: None,
+    });
+    graph.metadata.description =
+        Some("implement, then bounded verify/fix loop until tests pass".to_owned());
+    graph
 }
 
 fn agent_node(id: &str, prompt: &str, profile: Option<String>, fan_out: usize) -> Node {

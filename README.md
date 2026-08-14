@@ -73,6 +73,31 @@ gloop graph new design.yaml --template design-wall-bounce --request "Design the 
 gloop run --graph design.yaml --repo .
 ```
 
+### Orchestration patterns
+
+Three templates cover the common multi-agent shapes (see `examples/`):
+
+```bash
+# Council: two blind designs -> one integrated design -> implementation ->
+# three reviewer panel -> reconciled verdict (like a /council flow).
+gloop graph new council.yaml --template council --request "Design the rate limiter"
+
+# Decompose: one model splits the task into up to 4 packages, lightweight
+# worker lanes execute them in parallel, an integrator assembles the result.
+gloop graph new decompose.yaml --template decompose-fanout-reduce --request "Refactor the module"
+
+# Implement-test-loop: implement, then a bounded loop runs your test command;
+# on failure a fixer consumes the failure details and the loop retries until
+# the command passes (edit the placeholder test command first).
+gloop graph new work.yaml --template implement-test-loop --loop-cap 3 \
+  --request "Implement the feature and keep the test suite green"
+```
+
+The test-fix loop is a `Loop` node: each iteration runs `test`; a failure
+edge routes the failure details to `fix`, and the loop repeats until `test`
+succeeds, hits `--loop-cap`, or stagnates. This is how gloop combines graphs
+and loops to push toward the goal.
+
 The template is also selectable in the TUI (`t` opens a template picker with
 previews) and in
 `gloop graph new --interactive`.
@@ -94,7 +119,8 @@ gloop graph tui --lang ja
 
 The TUI keeps the existing Graph IR and foreground runtime. Use `1/2/3` for
 Overview / Graph Builder / Run Monitor, `i` for the natural-language task
-(multi-line: `Enter` inserts a newline, `Ctrl+S` saves, `Esc` cancels),
+(multi-line: `Enter` saves, `Alt+Enter` (or `Shift+Enter` where the terminal
+reports it) inserts a newline, `Esc` cancels),
 `t/p/m` to pick template/profile/model from preview pickers, `v` to validate
 (the issue list opens automatically), `s` to save, and `r` to run (auto-saves
 first). During a run, `o` opens the selected node's output, and `?` opens

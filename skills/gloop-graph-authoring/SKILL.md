@@ -29,8 +29,22 @@ checking the list.
    gloop run --graph PATH --repo .
 ~~~
 
-NAME may be a built-in template such as direct or plan-implement-verify, a
-saved project template, or a graph YAML path.
+NAME may be a built-in template such as direct, plan-implement-verify,
+council, decompose-fanout-reduce, or implement-test-loop, a saved project
+template, or a graph YAML path.
+
+Choosing a pattern:
+
+- council — two blind designs -> integrated design -> implementation -> three
+  reviewer panel -> reconciled verdict. Use for high-stakes design/review.
+- decompose-fanout-reduce — one model decomposes the task into up to 4
+  packages, lightweight worker lanes run them in parallel, one integrator
+  assembles the deliverable. Use for wide parallelizable work.
+- implement-test-loop — implement, then a bounded loop runs the test command;
+  on failure a fixer consumes the failure details and the loop retries until
+  the command passes, hits the loop cap, or stagnates. Replace the
+  placeholder test command with the real suite (e.g. pnpm run test) before
+  running.
 
 If the person wants a reusable project template, use the visual initializer:
 

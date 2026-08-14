@@ -1,0 +1,207 @@
+apiVersion: gloop.dev/v1alpha1
+kind: Graph
+metadata:
+  name: council
+  version: 1.0.0
+  description: 'council: blind designs, one implementation, panel review'
+spec:
+  goal: Council-style design and review
+  policies:
+    max_parallel: 4
+    failure: fail_fast
+  budgets: {}
+  nodes:
+  - id: design_one
+    requires: []
+    resources: []
+    retry:
+      max_attempts: 1
+      backoff_seconds: 0
+      rebind_profiles: []
+    workspace:
+      mode: current
+    context:
+      include_dependencies: true
+      files: []
+      max_bytes: 262144
+    continue_on_failure: false
+    kind: agent
+    prompt: |-
+      Design lane 1. Answer this task independently and completely:
+      Design a rate limiter
+    fan_out: 1
+    output:
+      format: text
+      max_bytes: 1048576
+  - id: design_two
+    requires: []
+    resources: []
+    retry:
+      max_attempts: 1
+      backoff_seconds: 0
+      rebind_profiles: []
+    workspace:
+      mode: current
+    context:
+      include_dependencies: true
+      files: []
+      max_bytes: 262144
+    continue_on_failure: false
+    kind: agent
+    prompt: |-
+      Design lane 2. Answer this task independently and completely:
+      Design a rate limiter
+    fan_out: 1
+    output:
+      format: text
+      max_bytes: 1048576
+  - id: integrate_design
+    requires: []
+    resources: []
+    retry:
+      max_attempts: 1
+      backoff_seconds: 0
+      rebind_profiles: []
+    workspace:
+      mode: current
+    context:
+      include_dependencies: true
+      files: []
+      max_bytes: 262144
+    continue_on_failure: false
+    kind: synthesize
+    prompt: |-
+      You receive two independent designs for the same task. Judge their strengths and weaknesses, then merge them into one decisive design:
+      Design a rate limiter
+    output:
+      format: text
+      max_bytes: 1048576
+  - id: implement
+    requires: []
+    resources: []
+    retry:
+      max_attempts: 1
+      backoff_seconds: 0
+      rebind_profiles: []
+    workspace:
+      mode: current
+    context:
+      include_dependencies: true
+      files: []
+      max_bytes: 262144
+    continue_on_failure: false
+    kind: agent
+    prompt: |-
+      Implementer role: implement the integrated design exactly as specified. Return what was implemented and how to verify it:
+      Design a rate limiter
+    fan_out: 1
+    output:
+      format: text
+      max_bytes: 1048576
+  - id: review_one
+    requires: []
+    resources: []
+    retry:
+      max_attempts: 1
+      backoff_seconds: 0
+      rebind_profiles: []
+    workspace:
+      mode: current
+    context:
+      include_dependencies: true
+      files: []
+      max_bytes: 262144
+    continue_on_failure: false
+    kind: agent
+    prompt: 'Reviewer role: correctness. Find defects, logic errors, and spec violations in the implementation. List concrete findings only.'
+    fan_out: 1
+    output:
+      format: text
+      max_bytes: 1048576
+  - id: review_two
+    requires: []
+    resources: []
+    retry:
+      max_attempts: 1
+      backoff_seconds: 0
+      rebind_profiles: []
+    workspace:
+      mode: current
+    context:
+      include_dependencies: true
+      files: []
+      max_bytes: 262144
+    continue_on_failure: false
+    kind: agent
+    prompt: 'Reviewer role: robustness. Find edge cases, failure modes, and security problems in the implementation. List concrete findings only.'
+    fan_out: 1
+    output:
+      format: text
+      max_bytes: 1048576
+  - id: review_three
+    requires: []
+    resources: []
+    retry:
+      max_attempts: 1
+      backoff_seconds: 0
+      rebind_profiles: []
+    workspace:
+      mode: current
+    context:
+      include_dependencies: true
+      files: []
+      max_bytes: 262144
+    continue_on_failure: false
+    kind: agent
+    prompt: 'Reviewer role: maintainability. Find readability, structure, and testing gaps in the implementation. List concrete findings only.'
+    fan_out: 1
+    output:
+      format: text
+      max_bytes: 1048576
+  - id: integrate_review
+    requires: []
+    resources: []
+    retry:
+      max_attempts: 1
+      backoff_seconds: 0
+      rebind_profiles: []
+    workspace:
+      mode: current
+    context:
+      include_dependencies: true
+      files: []
+      max_bytes: 262144
+    continue_on_failure: false
+    kind: synthesize
+    prompt: You receive three independent reviews of the same implementation. Deduplicate findings, judge severity, and produce one reconciled final review with an action list.
+    output:
+      format: text
+      max_bytes: 1048576
+  edges:
+  - from: design_one
+    to: integrate_design
+    kind: data
+  - from: design_two
+    to: integrate_design
+    kind: data
+  - from: integrate_design
+    to: implement
+    kind: data
+  - from: implement
+    to: review_one
+    kind: data
+  - from: implement
+    to: review_two
+    kind: data
+  - from: implement
+    to: review_three
+    kind: data
+  - from: review_one
+    to: integrate_review
+    kind: data
+  - from: review_two
+    to: integrate_review
+    kind: data
+  - from: review_three
+    to: integrate_review
+    kind: data

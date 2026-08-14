@@ -450,3 +450,26 @@ The resident TUI was revised after field feedback (0.4.x):
    tolerates the in-flight truncated final row, merges `summary.json` when it
    appears, and truncates large outputs in JSON so a supervisor can poll
    cheaply. `gloop run --run-id` lets the caller choose the id up front.
+
+## 15. v0.6.0 orchestration templates and AI-TUI key model
+
+1. **Key model aligned with other AI TUIs.** In the task/prompt editors,
+   `Enter` commits, `Alt+Enter` (and `Shift+Enter` where the terminal reports
+   the modifier) inserts a newline, `Esc` cancels, and multi-line paste keeps
+   working through bracketed paste. `Ctrl+S`/`Ctrl+D` remain as commit
+   fallbacks.
+2. **Council template** (`council`): two blind design lanes fan into one
+   design judgment, an implementer implements it, three role-separated
+   reviewers critique the implementation in parallel, and a second integrator
+   reconciles the panel into a final verdict (9 edges, 8 nodes).
+3. **Decompose template** (`decompose-fanout-reduce`): one decomposer splits
+   the task into up to four numbered packages; four worker lanes execute the
+   package assigned to their lane (idle lanes answer SKIP); one integrator
+   assembles the final deliverable. Worker lanes are fixed by the graph —
+   gloop graphs stay deterministic, so runtime-decided fan-out width is not
+   part of the IR; four lanes is the documented cap.
+4. **Implement-test-loop template** (`implement-test-loop`): implement →
+   bounded `Loop` node whose iteration graph is `test` (verify command,
+   placeholder by default) with a failure edge to `fix`. The loop repeats
+   until `test` succeeds, reaches `--loop-cap` (default 3), or stagnates —
+   the graph+loop combination that drives a run toward the goal.
