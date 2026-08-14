@@ -856,7 +856,7 @@ fn status_reports_live_progress_then_final_result() {
 }
 
 #[test]
-fn status_wait_returns_run_exit_code_and_newest_run_is_default() {
+fn status_query_exits_zero_and_wait_returns_run_exit_code() {
     let dir = tempdir().expect("create tempdir");
     let repo = dir.path();
     let script = write_script(&repo.join("fail.sh"), "printf \"boom\\n\" >&2\nexit 1");
@@ -876,6 +876,15 @@ fn status_wait_returns_run_exit_code_and_newest_run_is_default() {
         .assert()
         .failure();
 
+    // A successful query exits 0 even when the run itself failed: polling
+    // loops must distinguish query errors from run state via phase/final_status.
+    gloop_cmd()
+        .args(["status", "--repo", repo_arg, "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"phase\": \"finished\""))
+        .stdout(predicate::str::contains("\"final_status\": \"failed\""));
+
     // --wait on an already finished run returns the run's exit code.
     gloop_cmd()
         .args(["status", "--wait", "--repo", repo_arg, "--json"])
@@ -883,12 +892,107 @@ fn status_wait_returns_run_exit_code_and_newest_run_is_default() {
         .code(3)
         .stdout(predicate::str::contains("\"phase\": \"finished\""));
 
-    // Text mode works and stays human readable.
+    // Text mode keeps the same contract.
     gloop_cmd()
         .args(["status", "--repo", repo_arg])
         .assert()
-        .code(3)
+        .success()
         .stdout(predicate::str::contains("phase"));
+}
+
+#[test]
+fn status_wait_survives_the_startup_race() {
+    let dir = tempdir().expect("create tempdir");
+    let repo = dir.path();
+    let script = write_script(&repo.join("racy.sh"), "sleep 1\nprintf \"racy-ok\\n\"");
+    let graph = write_graph(&repo.join("run.yml"), &script, "status-race");
+    let repo_arg = repo.to_str().expect("repo path");
+    let run_id = "status-race-run";
+
+    let mut child = gloop_cmd()
+        .args([
+            "run",
+            "--non-interactive",
+            "--graph",
+            graph.as_str(),
+            "--repo",
+            repo_arg,
+            "--run-id",
+            run_id,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn run");
+
+    // Immediately after spawn the run directory may not exist yet; --wait
+    // must retry instead of failing.
+    gloop_cmd()
+        .args([
+            "status",
+            run_id,
+            "--repo",
+            repo_arg,
+            "--wait",
+            "--json",
+            "--interval-ms",
+            "100",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"phase\": \"finished\""));
+
+    let exit = child.wait().expect("wait for run");
+    assert!(exit.success());
+}
+
+#[test]
+fn status_newest_run_is_chosen_by_mtime_not_name() {
+    let dir = tempdir().expect("create tempdir");
+    let repo = dir.path();
+    let script = write_script(&repo.join("ok.sh"), "printf \"ok\\n\"");
+    let graph = write_graph(&repo.join("run.yml"), &script, "status-mtime");
+    let repo_arg = repo.to_str().expect("repo path");
+
+    // First run uses a named id that sorts after any ULID ("zzz..." > "0...").
+    gloop_cmd()
+        .args([
+            "run",
+            "--json",
+            "--non-interactive",
+            "--graph",
+            graph.as_str(),
+            "--repo",
+            repo_arg,
+            "--run-id",
+            "zzz-named-run",
+        ])
+        .assert()
+        .success();
+    // Second run uses an id that sorts before the named one.
+    gloop_cmd()
+        .args([
+            "run",
+            "--json",
+            "--non-interactive",
+            "--graph",
+            graph.as_str(),
+            "--repo",
+            repo_arg,
+            "--run-id",
+            "01aaaa-second-run",
+        ])
+        .assert()
+        .success();
+
+    // The id-less query must pick the newest by mtime, not by name.
+    gloop_cmd()
+        .args(["status", "--repo", repo_arg, "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"run_id\": \"01aaaa-second-run\"",
+        ));
 }
 
 #[test]

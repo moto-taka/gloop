@@ -2585,8 +2585,9 @@ pub async fn run_logs(path: PathBuf, json_mode: bool) -> CommandResult {
 }
 
 /// Resolve one run directory under `<repo>/.gloop/runs`. Without a run id
-/// the newest directory wins: run ids are ULIDs, so lexicographic order is
-/// chronological order.
+/// the directory with the newest modification time wins. Name order is not
+/// usable: run ids may be user-chosen (`--run-id my-task`) and would sort
+/// against the ULID default ids.
 fn resolve_run_dir(runs_root: &Path, run_id: Option<&str>) -> Result<PathBuf, String> {
     let Some(id) = run_id else {
         let entries = std::fs::read_dir(runs_root)
@@ -2594,16 +2595,18 @@ fn resolve_run_dir(runs_root: &Path, run_id: Option<&str>) -> Result<PathBuf, St
         let newest = entries
             .filter_map(std::result::Result::ok)
             .map(|entry| entry.file_name())
-            .filter(|name| {
-                runs_root
-                    .join(name)
-                    .symlink_metadata()
-                    .map(|metadata| metadata.is_dir())
-                    .unwrap_or(false)
+            .filter_map(|name| {
+                let path = runs_root.join(&name);
+                let metadata = path.symlink_metadata().ok()?;
+                if !metadata.is_dir() {
+                    return None;
+                }
+                let modified = metadata.modified().ok()?;
+                Some((modified, name))
             })
             .max();
         return newest
-            .map(|name| runs_root.join(name))
+            .map(|(_, name)| runs_root.join(name))
             .ok_or_else(|| format!("no runs found under {}", runs_root.display()));
     };
     if id.is_empty() || id == "." || id == ".." || id.contains(['/', '\\']) {
@@ -2837,8 +2840,15 @@ fn format_status_text(report: &LiveRunReport, run_dir: &Path, language: Language
 
 /// Pollable live status for one run. While the run is in flight the journal
 /// prefix is reduced with the same rules as replay, so node states and
-/// intermediate outputs are visible before `summary.json` exists. `--wait`
-/// blocks until the run finishes and then exits with the run's status code.
+/// intermediate outputs are visible before `summary.json` exists.
+///
+/// Exit-code contract: a successful query exits 0 with or without `--wait`
+/// (polling loops must be able to distinguish query errors from run state,
+/// which they read from `phase`/`final_status`). With `--wait`, the command
+/// blocks until the run finishes and then exits with the run's own status
+/// code. `--wait` also retries the run-directory lookup and the first journal
+/// reads for a grace period, so `gloop run --run-id x & gloop status x --wait`
+/// does not race the runtime's directory creation.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_status(
     run_id: Option<String>,
@@ -2850,51 +2860,68 @@ pub async fn run_status(
     language: Language,
 ) -> CommandResult {
     let runs_root = repo.join(PROJECT_CONFIG_PATH).with_file_name("runs");
-    let run_dir = match resolve_run_dir(&runs_root, run_id.as_deref()) {
-        Ok(dir) => dir,
-        Err(message) => {
-            return if json_mode {
-                CommandResult::failure_json(
-                    ExitCode::InvalidGraph,
-                    "run not found",
-                    Some(json!({"error": message})),
-                )
-            } else {
-                CommandResult::failure_text(ExitCode::InvalidGraph, message)
-            };
-        }
-    };
-
     let interval = std::time::Duration::from_millis(interval_ms.max(50));
+    let grace = std::time::Duration::from_secs(30);
+    let started = std::time::Instant::now();
+
+    let mut run_dir: Option<PathBuf> = None;
     let report = loop {
-        match live_run_status(&run_dir, events).await {
+        if run_dir.is_none() {
+            match resolve_run_dir(&runs_root, run_id.as_deref()) {
+                Ok(dir) => run_dir = Some(dir),
+                Err(message) => {
+                    if wait && started.elapsed() < grace {
+                        tokio::time::sleep(interval).await;
+                        continue;
+                    }
+                    return if json_mode {
+                        CommandResult::failure_json(
+                            ExitCode::InvalidGraph,
+                            "run not found",
+                            Some(json!({"error": message})),
+                        )
+                    } else {
+                        CommandResult::failure_text(ExitCode::InvalidGraph, message)
+                    };
+                }
+            }
+        }
+        let dir = run_dir.clone().expect("resolved above");
+        match live_run_status(&dir, events).await {
             Ok(report) => {
                 if !wait || report.finished() {
                     break report;
                 }
             }
             Err(error) => {
+                let retryable_startup = wait
+                    && started.elapsed() < grace
+                    && (matches!(&error, ReplayError::EmptyJournal)
+                        || matches!(&error, ReplayError::Io(io_error)
+                            if io_error.kind() == std::io::ErrorKind::NotFound));
+                if retryable_startup {
+                    tokio::time::sleep(interval).await;
+                    continue;
+                }
                 return if json_mode {
                     CommandResult::failure_json(
                         ExitCode::InvalidGraph,
                         "failed to read run status",
-                        Some(json!({"run_dir": run_dir, "error": error.to_string()})),
+                        Some(json!({"run_dir": dir, "error": error.to_string()})),
                     )
                 } else {
                     CommandResult::failure_text(
                         ExitCode::InvalidGraph,
-                        format!(
-                            "failed to read run status at {}: {error}",
-                            run_dir.display()
-                        ),
+                        format!("failed to read run status at {}: {error}", dir.display()),
                     )
                 };
             }
         }
         tokio::time::sleep(interval).await;
     };
+    let run_dir = run_dir.expect("run dir resolved before the report loop exits");
 
-    let exit_code = if report.finished() {
+    let exit_code = if wait && report.finished() {
         if let Some(summary) = &report.summary {
             summary_exit_code(summary)
         } else {

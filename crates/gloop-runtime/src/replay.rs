@@ -496,6 +496,14 @@ pub async fn live_run_status(
                 journal: live.run_id,
             });
         }
+        if let Some(final_status) = live.final_status()
+            && summary.status != final_status
+        {
+            return Err(ReplayError::SummaryStatusMismatch {
+                summary: summary.status,
+                journal: Some(final_status),
+            });
+        }
         live.summary = Some(summary);
     }
 
