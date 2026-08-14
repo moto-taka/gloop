@@ -6,6 +6,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    fs,
     io::{self, IsTerminal},
     path::{Path, PathBuf},
     sync::Arc,
@@ -30,6 +31,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap},
 };
+use sha2::{Digest, Sha256};
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
@@ -37,7 +39,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    atomic_write,
+    atomic_write::{self, write_text_atomic_if_unchanged_sync},
     commands::{apply_model_to_agent_nodes, build_profile_choices},
     templates,
     wizard::{self, EditorState, GraphTemplate, ProfileChoice},
@@ -110,6 +112,7 @@ struct GateEnvelope {
 #[derive(Debug, Clone)]
 struct TuiGate {
     requests: mpsc::UnboundedSender<GateEnvelope>,
+    cancellation: CancellationToken,
 }
 
 #[async_trait]
@@ -119,9 +122,11 @@ impl HumanGate for TuiGate {
         self.requests
             .send(GateEnvelope { request, reply })
             .map_err(|_| "TUI gate closed".to_owned())?;
-        decision
-            .await
-            .map_err(|_| "TUI gate response was closed".to_owned())
+        tokio::select! {
+            biased;
+            result = decision => result.map_err(|_| "TUI gate response was closed".to_owned()),
+            () = self.cancellation.cancelled() => Err("TUI gate cancelled".to_owned()),
+        }
     }
 }
 
@@ -135,6 +140,9 @@ enum Action {
 #[derive(Debug)]
 struct App {
     repo: PathBuf,
+    graph_path: PathBuf,
+    expected_sha256: Option<String>,
+    create_only: bool,
     trust_project_profiles: bool,
     screen: Screen,
     graph: Graph,
@@ -160,27 +168,75 @@ impl App {
     fn new(repo: PathBuf, trust_project_profiles: bool) -> Result<Self> {
         let profiles = build_profile_choices(&repo, trust_project_profiles)
             .map_err(|error| anyhow!("failed to load provider profiles: {error}"))?;
-        let profile_index = profiles.iter().position(|profile| profile.enabled);
+        let graph_path = templates::graph_path(&repo, "work");
+        templates::ensure_managed_directory(&repo, Path::new(templates::GRAPHS_DIR))
+            .map_err(|error| anyhow!("managed graph directory is unsafe: {error}"))?;
+        let (graph, expected_sha256, create_only) = match fs::symlink_metadata(&graph_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(anyhow!(
+                    "graph save target is a symlink: {}",
+                    graph_path.display()
+                ));
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(anyhow!(
+                    "graph save target is not a regular file: {}",
+                    graph_path.display()
+                ));
+            }
+            Ok(_) => {
+                let graph = Graph::from_path(&graph_path)
+                    .map_err(|error| anyhow!("failed to load {}: {error}", graph_path.display()))?;
+                let expected_sha256 = file_sha256(&graph_path)?;
+                (graph, Some(expected_sha256), false)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let template = GraphTemplate::Direct;
+                let task = DEFAULT_TASK.to_owned();
+                let mut graph = Self::build_graph(template, &task, None, None);
+                graph.metadata.name = String::from("work");
+                graph.spec.goal.clone_from(&task);
+                (graph, None, true)
+            }
+            Err(error) => {
+                return Err(anyhow!(
+                    "failed to inspect graph save target {}: {error}",
+                    graph_path.display()
+                ));
+            }
+        };
+        let task = graph.spec.goal.clone();
+        let profile_index = graph
+            .spec
+            .nodes
+            .iter()
+            .find_map(Node::profile)
+            .and_then(|name| {
+                profiles
+                    .iter()
+                    .position(|profile| profile.enabled && profile.name == name)
+            })
+            .or_else(|| profiles.iter().position(|profile| profile.enabled));
+        let model = graph
+            .spec
+            .nodes
+            .iter()
+            .find_map(Node::model)
+            .map(str::to_owned);
         let template = GraphTemplate::Direct;
-        let task = DEFAULT_TASK.to_owned();
-        let mut graph = Self::build_graph(
-            template,
-            &task,
-            profile_name(&profiles, profile_index),
-            None,
-        );
-        graph.metadata.name = String::from("work");
-        graph.spec.goal.clone_from(&task);
 
         Ok(Self {
             repo,
+            graph_path,
+            expected_sha256,
+            create_only,
             trust_project_profiles,
             screen: Screen::Overview,
             graph,
             template,
             template_index: 0,
             task,
-            model: None,
+            model,
             profiles,
             profile_index,
             selected_node: 0,
@@ -224,7 +280,13 @@ impl App {
         self.status = status.into();
     }
 
-    fn rebuild_from_choices(&mut self) {
+    fn rebuild_from_choices(&mut self) -> bool {
+        if self.dirty {
+            self.set_status(
+                "Graph has unsaved edits; save it before changing the template bindings.",
+            );
+            return false;
+        }
         self.graph = Self::build_graph(
             self.template,
             &self.task,
@@ -234,12 +296,17 @@ impl App {
         self.selected_node = 0;
         self.connect_from = None;
         self.dirty = true;
+        true
     }
 
     fn cycle_template(&mut self) {
+        if self.dirty {
+            self.set_status("Graph has unsaved edits; save it before changing the template.");
+            return;
+        }
         self.template_index = (self.template_index + 1) % TEMPLATE_CHOICES.len();
         self.template = TEMPLATE_CHOICES[self.template_index];
-        self.rebuild_from_choices();
+        let _ = self.rebuild_from_choices();
         self.status = format!(
             "Template: {}. Existing node edits were reset from the template.",
             template_label(self.template)
@@ -247,6 +314,10 @@ impl App {
     }
 
     fn cycle_profile(&mut self) {
+        if self.dirty {
+            self.set_status("Graph has unsaved edits; save it before changing the profile.");
+            return;
+        }
         let enabled: Vec<usize> = self
             .profiles
             .iter()
@@ -264,7 +335,9 @@ impl App {
             .and_then(|current| enabled.iter().position(|index| *index == current))
             .map_or(0, |position| (position + 1) % enabled.len());
         self.profile_index = Some(enabled[next]);
-        self.rebuild_from_choices();
+        if !self.rebuild_from_choices() {
+            return;
+        }
         self.status = format!(
             "Profile: {}. Applied to agent-like nodes.",
             self.selected_profile().unwrap_or("runtime default")
@@ -306,16 +379,29 @@ impl App {
         }
         match input.target {
             InputTarget::Task => {
+                if self.dirty {
+                    self.set_status("Graph has unsaved edits; save it before changing the task.");
+                    return;
+                }
                 self.task = value;
-                self.rebuild_from_choices();
+                let _ = self.rebuild_from_choices();
                 self.set_status("Task updated. Review the graph, then press r to run.");
             }
             InputTarget::Model => {
-                self.model = (!value.is_empty()).then_some(value);
-                if let Some(model) = self.model.as_deref() {
-                    apply_model_to_agent_nodes(&mut self.graph, model);
+                if value.is_empty() {
+                    if self.dirty {
+                        self.set_status(
+                            "Graph has unsaved edits; save it before clearing the model override.",
+                        );
+                        return;
+                    }
+                    self.model = None;
+                    let _ = self.rebuild_from_choices();
                 } else {
-                    self.rebuild_from_choices();
+                    self.model = Some(value);
+                    if let Some(model) = self.model.as_deref() {
+                        apply_model_to_agent_nodes(&mut self.graph, model);
+                    }
                 }
                 self.dirty = true;
                 self.status = format!(
@@ -405,6 +491,7 @@ impl App {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             if let Some(active) = &self.active_run {
                 active.cancellation.cancel();
+                self.pending_gates.clear();
                 self.set_status("Cancellation requested; waiting for the runtime to finish...");
             } else {
                 return Action::Quit;
@@ -675,6 +762,7 @@ impl App {
         let trust_project_profiles = self.trust_project_profiles;
         let cancellation = CancellationToken::new();
         let task_cancellation = cancellation.clone();
+        let gate_cancellation = cancellation.clone();
         let (progress_tx, progress) = mpsc::unbounded_channel();
         let (gate_tx, gates) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
@@ -688,7 +776,10 @@ impl App {
                 ProviderRegistry::new(store),
                 repo.join(PROJECT_CONFIG_PATH).with_file_name("runs"),
             )
-            .with_human_gate(Arc::new(TuiGate { requests: gate_tx }));
+            .with_human_gate(Arc::new(TuiGate {
+                requests: gate_tx,
+                cancellation: gate_cancellation,
+            }));
             runtime
                 .run(
                     &graph,
@@ -726,7 +817,7 @@ impl App {
     async fn drain_run_events(&mut self) {
         let mut pending = Vec::new();
         let mut gates = Vec::new();
-        let finished = {
+        let (finished, cancelled) = {
             let Some(active) = self.active_run.as_mut() else {
                 return;
             };
@@ -736,7 +827,10 @@ impl App {
             while let Ok(gate) = active.gates.try_recv() {
                 gates.push(gate);
             }
-            active.task.is_finished()
+            (
+                active.task.is_finished(),
+                active.cancellation.is_cancelled(),
+            )
         };
         for event in pending {
             self.apply_progress(&event);
@@ -744,7 +838,9 @@ impl App {
         for gate in gates {
             self.pending_gates.push_back(gate);
         }
-        if !self.pending_gates.is_empty() {
+        if cancelled {
+            self.pending_gates.clear();
+        } else if !self.pending_gates.is_empty() {
             self.set_status(
                 "Human gate waiting: press y to approve, n to reject, Enter for default.",
             );
@@ -752,8 +848,21 @@ impl App {
         if !finished {
             return;
         }
-        let active = self.active_run.take().expect("active run exists");
-        match active.task.await {
+        let ActiveRun {
+            progress,
+            gates,
+            task,
+            ..
+        } = self.active_run.take().expect("active run exists");
+        let result = task.await;
+        let mut progress = progress;
+        while let Ok(event) = progress.try_recv() {
+            self.apply_progress(&event);
+        }
+        let mut gates = gates;
+        while gates.try_recv().is_ok() {}
+        self.pending_gates.clear();
+        match result {
             Ok(Ok(summary)) => {
                 self.status = format!("Run finished: {:?}.", summary.status);
                 self.last_summary = Some(summary);
@@ -810,14 +919,27 @@ impl App {
         }
         templates::ensure_managed_directory(&self.repo, Path::new(templates::GRAPHS_DIR))
             .map_err(|error| anyhow!("managed graph directory is unsafe: {error}"))?;
-        let path = templates::graph_path(&self.repo, &self.graph.metadata.name);
+        let path = self.graph_path.clone();
         let yaml = self
             .graph
             .to_yaml()
             .map_err(|error| anyhow!(error.to_string()))?;
-        atomic_write::write_text_atomic(&path, &yaml)
+        let write_result = if let Some(expected_sha256) = self.expected_sha256.clone() {
+            let path = path.clone();
+            let yaml = yaml.clone();
+            tokio::task::spawn_blocking(move || {
+                write_text_atomic_if_unchanged_sync(&path, &expected_sha256, &yaml)
+            })
             .await
-            .map_err(|error| anyhow!("failed to save graph: {error}"))?;
+            .map_err(|error| anyhow!("graph save task stopped: {error}"))?
+        } else if self.create_only {
+            atomic_write::write_text_no_replace(&path, &yaml).await
+        } else {
+            atomic_write::write_text_atomic(&path, &yaml).await
+        };
+        write_result.map_err(|error| anyhow!("failed to save graph: {error}"))?;
+        self.expected_sha256 = Some(format!("{:x}", Sha256::digest(yaml.as_bytes())));
+        self.create_only = false;
         self.dirty = false;
         self.status = format!("Saved {}.", path.display());
         Ok(())
@@ -829,6 +951,17 @@ fn profile_name(profiles: &[ProfileChoice], index: Option<usize>) -> Option<&str
         .and_then(|index| profiles.get(index))
         .filter(|profile| profile.enabled)
         .map(|profile| profile.name.as_str())
+}
+
+fn file_sha256(path: &Path) -> Result<String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| anyhow!("failed to inspect graph before save: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(anyhow!("graph save target is not a regular file"));
+    }
+    let bytes =
+        fs::read(path).map_err(|error| anyhow!("failed to read graph before save: {error}"))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 fn node_prompt(node: &Node) -> Option<&str> {
@@ -1021,7 +1154,7 @@ fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("Save       ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!(".gloop/graphs/{}.yaml", app.graph.metadata.name)),
+            Span::raw(app.graph_path.display().to_string()),
         ]),
         Line::from(""),
         Line::from("Press i to type the natural-language task."),
@@ -1439,5 +1572,73 @@ mod tests {
                 .any(|issue| issue.severity == gloop_core::IssueSeverity::Error)
         );
         assert_eq!(graph.spec.edges.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn gate_wait_unblocks_when_run_is_cancelled() {
+        let (requests, mut received) = mpsc::unbounded_channel();
+        let cancellation = CancellationToken::new();
+        let gate = TuiGate {
+            requests,
+            cancellation: cancellation.clone(),
+        };
+        let waiting = tokio::spawn(async move {
+            gate.decide(GateRequest {
+                run_id: "run".to_owned(),
+                node_id: "approval".to_owned(),
+                message: "continue?".to_owned(),
+                default: GateDecision::Reject,
+            })
+            .await
+        });
+        let _envelope = received.recv().await.expect("gate request");
+        cancellation.cancel();
+        assert_eq!(
+            waiting
+                .await
+                .expect("gate task")
+                .expect_err("gate should cancel"),
+            "TUI gate cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_work_graph_is_loaded_and_external_changes_are_not_overwritten() {
+        let repo = tempfile::tempdir().expect("create tempdir");
+        let graph_path = templates::graph_path(repo.path(), "work");
+        fs::create_dir_all(graph_path.parent().expect("graph parent")).expect("create graph dir");
+        let graph = Graph::new("work", "loaded task", vec![Node::agent("request", "do it")]);
+        fs::write(
+            &graph_path,
+            graph.to_yaml().expect("serialize initial graph"),
+        )
+        .expect("write initial graph");
+
+        let mut app = App::new(repo.path().to_path_buf(), false).expect("load existing graph");
+        assert_eq!(app.task, "loaded task");
+        app.graph.spec.goal = "local edit".to_owned();
+        app.dirty = true;
+
+        let external = Graph::new(
+            "work",
+            "external edit",
+            vec![Node::agent("request", "external")],
+        );
+        let external_yaml = external.to_yaml().expect("serialize external graph");
+        fs::write(&graph_path, &external_yaml).expect("change graph on disk");
+
+        let error = app
+            .save()
+            .await
+            .expect_err("save must detect external change");
+        assert!(
+            error
+                .to_string()
+                .contains("output changed while it was being edited")
+        );
+        assert_eq!(
+            fs::read_to_string(graph_path).expect("read graph"),
+            external_yaml
+        );
     }
 }

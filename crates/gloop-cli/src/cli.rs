@@ -102,7 +102,13 @@ struct GraphCommand {
     #[command(subcommand)]
     command: Option<GraphSubcommand>,
 
-    #[arg(long = "repo", value_name = "PATH", default_value = ".")]
+    #[arg(
+        long = "repo",
+        value_name = "PATH",
+        default_value = ".",
+        global = true,
+        help = "Project directory for graph commands"
+    )]
     repo: PathBuf,
 }
 
@@ -131,21 +137,10 @@ enum GraphSubcommand {
 }
 
 #[derive(Args)]
-struct GraphTui {
-    #[arg(long = "repo", value_name = "PATH", default_value = ".")]
-    repo: PathBuf,
-}
+struct GraphTui {}
 
 #[derive(Args)]
 struct GraphList {
-    #[arg(
-        long = "repo",
-        value_name = "PATH",
-        default_value = ".",
-        help = "Project directory to search"
-    )]
-    repo: PathBuf,
-
     #[arg(long = "lang", alias = "language", value_enum, default_value = "en")]
     language: Language,
 
@@ -175,9 +170,6 @@ struct GraphNew {
 
     #[arg(long, default_value = "direct", conflicts_with = "interactive")]
     template: String,
-
-    #[arg(long = "repo", value_name = "PATH", default_value = ".")]
-    repo: PathBuf,
 
     #[arg(long, conflicts_with = "interactive")]
     request: Option<String>,
@@ -238,9 +230,6 @@ struct GraphInit {
     #[arg(long)]
     force: bool,
 
-    #[arg(long = "repo", value_name = "PATH", default_value = ".")]
-    repo: PathBuf,
-
     #[arg(long)]
     json: bool,
 }
@@ -252,9 +241,6 @@ struct GraphEdit {
         help = "Graph YAML path or a name shown by 'gloop graph list'"
     )]
     target: PathBuf,
-
-    #[arg(long = "repo", value_name = "PATH", default_value = ".")]
-    repo: PathBuf,
 
     #[arg(long, help = "Open the local browser editor")]
     gui: bool,
@@ -388,20 +374,10 @@ pub async fn run() -> Result<()> {
             )
             .await
         }
-        Command::Graph(cmd) => match cmd.command {
-            None => match tui::launch(cmd.repo, cli.trust_project_profiles).await {
-                Ok(()) => CommandResult {
-                    code: crate::commands::ExitCode::Success,
-                    output: None,
-                    text: None,
-                },
-                Err(error) => CommandResult::failure_text(
-                    crate::commands::ExitCode::Internal,
-                    format!("graph TUI failed: {error}"),
-                ),
-            },
-            Some(GraphSubcommand::Tui(c)) => {
-                match tui::launch(c.repo, cli.trust_project_profiles).await {
+        Command::Graph(cmd) => {
+            let repo = cmd.repo;
+            match cmd.command {
+                None => match tui::launch(repo, cli.trust_project_profiles).await {
                     Ok(()) => CommandResult {
                         code: crate::commands::ExitCode::Success,
                         output: None,
@@ -411,73 +387,86 @@ pub async fn run() -> Result<()> {
                         crate::commands::ExitCode::Internal,
                         format!("graph TUI failed: {error}"),
                     ),
+                },
+                Some(GraphSubcommand::Tui(_)) => {
+                    match tui::launch(repo, cli.trust_project_profiles).await {
+                        Ok(()) => CommandResult {
+                            code: crate::commands::ExitCode::Success,
+                            output: None,
+                            text: None,
+                        },
+                        Err(error) => CommandResult::failure_text(
+                            crate::commands::ExitCode::Internal,
+                            format!("graph TUI failed: {error}"),
+                        ),
+                    }
                 }
+                Some(GraphSubcommand::List(c)) => graph_list(repo, c.language, c.json).await,
+                Some(GraphSubcommand::New(c)) => {
+                    graph_new(
+                        c.name,
+                        c.goal,
+                        c.template,
+                        repo,
+                        c.request,
+                        c.provider_profiles,
+                        c.loop_cap,
+                        c.interactive,
+                        c.path,
+                        c.force,
+                        c.json,
+                        cli.trust_project_profiles,
+                    )
+                    .await
+                }
+                Some(GraphSubcommand::Init(c)) => {
+                    graph_init(
+                        c.name,
+                        c.from,
+                        c.description,
+                        c.request,
+                        c.provider_profiles,
+                        c.loop_cap,
+                        c.list,
+                        c.force,
+                        repo,
+                        c.json,
+                        cli.trust_project_profiles,
+                        c.gui,
+                        c.language,
+                    )
+                    .await
+                }
+                Some(GraphSubcommand::Edit(c)) => {
+                    graph_edit(
+                        c.target,
+                        repo,
+                        c.gui,
+                        c.language,
+                        c.json,
+                        false,
+                        cli.trust_project_profiles,
+                    )
+                    .await
+                }
+                Some(GraphSubcommand::Update(c)) => {
+                    graph_edit(
+                        c.target,
+                        repo,
+                        c.gui,
+                        c.language,
+                        c.json,
+                        true,
+                        cli.trust_project_profiles,
+                    )
+                    .await
+                }
+                Some(GraphSubcommand::Validate(c)) => graph_validate(c.path, c.json).await,
+                Some(GraphSubcommand::Explain(c)) => graph_explain(c.path, c.json).await,
+                Some(GraphSubcommand::Render(c)) => graph_render(c.path, c.format, c.json).await,
+                Some(GraphSubcommand::Schema(c)) => graph_schema(c.json),
             }
-            Some(GraphSubcommand::List(c)) => graph_list(c.repo, c.language, c.json).await,
-            Some(GraphSubcommand::New(c)) => {
-                graph_new(
-                    c.name,
-                    c.goal,
-                    c.template,
-                    c.repo,
-                    c.request,
-                    c.provider_profiles,
-                    c.loop_cap,
-                    c.interactive,
-                    c.path,
-                    c.force,
-                    c.json,
-                    cli.trust_project_profiles,
-                )
-                .await
-            }
-            Some(GraphSubcommand::Init(c)) => {
-                graph_init(
-                    c.name,
-                    c.from,
-                    c.description,
-                    c.request,
-                    c.provider_profiles,
-                    c.loop_cap,
-                    c.list,
-                    c.force,
-                    c.repo,
-                    c.json,
-                    cli.trust_project_profiles,
-                    c.gui,
-                    c.language,
-                )
-                .await
-            }
-            Some(GraphSubcommand::Edit(c)) => {
-                graph_edit(
-                    c.target,
-                    c.repo,
-                    c.gui,
-                    c.language,
-                    c.json,
-                    false,
-                    cli.trust_project_profiles,
-                )
-                .await
-            }
-            Some(GraphSubcommand::Update(c)) => {
-                graph_edit(
-                    c.target,
-                    c.repo,
-                    c.gui,
-                    c.language,
-                    c.json,
-                    true,
-                    cli.trust_project_profiles,
-                )
-                .await
-            }
-            Some(GraphSubcommand::Validate(c)) => graph_validate(c.path, c.json).await,
-            Some(GraphSubcommand::Explain(c)) => graph_explain(c.path, c.json).await,
-            Some(GraphSubcommand::Render(c)) => graph_render(c.path, c.format, c.json).await,
-            Some(GraphSubcommand::Schema(c)) => graph_schema(c.json),
-        },
+        }
         Command::Provider(cmd) => match cmd {
             ProviderCommand::List(c) => provider_list(c.json, cli.trust_project_profiles).await,
             ProviderCommand::Probe(c) => {

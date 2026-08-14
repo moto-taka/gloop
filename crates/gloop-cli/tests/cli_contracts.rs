@@ -1,6 +1,7 @@
 use assert_cmd::prelude::*;
 use predicates::prelude::predicate;
 use std::process::Command;
+use tempfile::tempdir;
 
 fn gloop_cmd() -> Command {
     Command::cargo_bin("gloop").expect("gloop binary build is available")
@@ -81,5 +82,22 @@ fn graph_new_interactive_rejects_template_shaping_flags() {
             .failure()
             .code(2)
             .stderr(predicate::str::contains("cannot be used with"));
+    }
+}
+
+#[test]
+fn graph_repo_is_shared_by_parent_and_subcommand_positions() {
+    let dir = tempdir().expect("create tempdir");
+    let repo = dir.path().to_str().expect("temp path");
+
+    for args in [
+        vec!["graph", "--repo", repo, "list", "--json"],
+        vec!["graph", "list", "--repo", repo, "--json"],
+    ] {
+        gloop_cmd()
+            .args(args)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("\"success\": true"));
     }
 }
