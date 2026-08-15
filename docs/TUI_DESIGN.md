@@ -512,7 +512,6 @@ harness choice appeared to apply to everything, no model was visible, and
    labels line up. Picker rows are clipped to one line each, because wrapped
    rows silently pushed entries out of a height-computed overlay: with eight
    templates the last two and the key hints were unreachable.
-
 4. **Per-node bindings.** `p` and `m` bind the whole graph from the Overview and
    the selected node from the Builder, so sibling lanes keep the bindings they
    already have; `Backspace` in the picker clears a binding back to the default.
@@ -525,7 +524,6 @@ harness choice appeared to apply to everything, no model was visible, and
    several lanes can be bound in one pass. "Parallel" is derived from the graph —
    two provider nodes with no directed path between them — not from a list of
    template names, so project templates behave the same.
-
 6. **Project templates.** `S` saves the current graph to
    `.gloop/templates/<name>.yaml` after the same name and strict-template
    validation `graph init` uses, refusing to replace an existing file so a name
@@ -538,45 +536,8 @@ harness choice appeared to apply to everything, no model was visible, and
    graph instead of rebuilding from the template — matching what `m` already did
    and what the "applied to agent-like nodes" status line always claimed.
 
-## 16. v0.7.0 localization completeness, real bindings, arrow navigation
-
-Field feedback on 0.6.0: "fan out" and other strings were still English, the
-harness choice appeared to apply to everything, no model was visible, and
-`1`/`2`/`3` was an unintuitive way to change screens.
-
-1. **Localization is enforced, not just declared.** The 0.5.0 table made a
-   *missing* translation a compile error but let an *untranslated* one ship
-   (`builder_label_fanout` was literally `"fan-out"` in the Japanese table).
-   `japanese_table_never_ships_the_english_string` now fails when any field is
-   byte-identical across languages, and its field list uses an exhaustive
-   `let Strings { .. }` destructure, so adding a field without listing it is a
-   compile error. Strings that had bypassed the table entirely (panel titles,
-   the status prefix, the default task, `{:?}` status renderings) now go
-   through it. Graph IR spellings stay English and are annotated rather than
-   translated: `並列実行数 (fan_out)`, `種類: agent`, `a -data-> b`.
-2. **Bindings show what will actually run.** `Node::profile()` returns `None`
-   both for "unset on an agent" and for "a command node has no such field", and
-   the runtime resolves an unset profile to the highest-priority enabled
-   profile — which is not the profile the picker happens to point at. The
-   Overview therefore showed `Profile claude` while `codex` was what would run.
-   The TUI now reuses the GUI's `resolve_profile_options` (renamed from
-   `gui_profile_options`) to learn the runtime default and each profile's
-   default model, resolving each node into `Explicit` / `Inherited` /
-   `Unresolved`. Inherited values render with `*` plus a legend; values gloop
-   cannot know stay descriptive. A command profile's own default model is not
-   discoverable, so it is reported as "provider default" rather than guessed
-   from the discovery catalog. Discovery shells out to every provider CLI, so
-   it runs on a spawned task and the draw loop polls for the result. The
-   Overview's Profile/Model rows summarise every distinct value, so a graph
-   where only lane 1 is bound reads `claude · codex*` instead of hiding the
-   split.
-3. **Navigation and layout.** `Left`/`Right` and `Shift+Tab` (`KeyCode::BackTab`)
-   move between screens alongside `Tab` and `1`/`2`/`3`; the footer leads with
-   `←/→`. Overview labels and node/kind columns pad by display width, so CJK
-   labels line up. Picker rows are clipped to one line each, because wrapped
-   rows silently pushed entries out of a height-computed overlay: with eight
-   templates the last two and the key hints were unreachable.
-
-Still open after 0.7.0: per-node profile/model editing, a lane-assignment step
-after applying a parallel template, and saving the current graph as a project
-template (see §5 and §7, still unimplemented).
+The full loop is now available without leaving the TUI: pick or assemble a
+graph, bind each lane, run it, and save the result as a project template for
+next time. Node kind changes and edge-kind condition forms remain out of scope
+for the resident TUI; `gloop graph edit --gui` and the YAML stay the place for
+those.
