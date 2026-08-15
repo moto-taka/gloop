@@ -46,13 +46,50 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::{
     atomic_write::{self, write_text_atomic_if_unchanged_sync},
-    commands::{apply_model_to_agent_nodes, build_profile_choices, clear_model_on_agent_nodes},
+    commands::{
+        apply_model_to_agent_nodes, apply_profile_to_agent_nodes, build_profile_choices,
+        clear_model_on_agent_nodes, resolve_profile_options,
+    },
+    gui::ProfileOption,
     i18n::{Language, Strings, fill},
     templates,
     wizard::{self, EditorState, GraphTemplate, ProfileChoice},
 };
 
-const TEMPLATE_CHOICES: [GraphTemplate; 8] = [
+/// A template the picker can offer: a code-generated builtin or a YAML file
+/// under `.gloop/templates`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TemplateChoice {
+    Builtin(GraphTemplate),
+    Project(String),
+}
+
+impl TemplateChoice {
+    fn label(&self) -> &str {
+        match self {
+            Self::Builtin(template) => template_label(*template),
+            Self::Project(name) => name,
+        }
+    }
+}
+
+fn template_choices(repo: &Path) -> Vec<TemplateChoice> {
+    let mut choices: Vec<TemplateChoice> = BUILTIN_TEMPLATES
+        .iter()
+        .copied()
+        .map(TemplateChoice::Builtin)
+        .collect();
+    if let Ok(entries) = templates::list_project_templates(repo) {
+        choices.extend(
+            entries
+                .into_iter()
+                .map(|entry| TemplateChoice::Project(entry.name)),
+        );
+    }
+    choices
+}
+
+const BUILTIN_TEMPLATES: [GraphTemplate; 8] = [
     GraphTemplate::Direct,
     GraphTemplate::PlanImplementVerify,
     GraphTemplate::ParallelResearchReduce,
@@ -62,8 +99,6 @@ const TEMPLATE_CHOICES: [GraphTemplate; 8] = [
     GraphTemplate::DecomposeFanoutReduce,
     GraphTemplate::ImplementTestLoop,
 ];
-
-const DEFAULT_TASK: &str = "Describe the task for the graph";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -92,16 +127,24 @@ impl Screen {
     }
 }
 
+/// Whether a binding edit addresses the whole graph or just the selected node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindingTarget {
+    Graph,
+    Node,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputTarget {
     Task,
-    Model,
+    Model(BindingTarget),
     NodePrompt,
+    TemplateName,
 }
 
 impl InputTarget {
     const fn multiline(self) -> bool {
-        !matches!(self, Self::Model)
+        !matches!(self, Self::Model(_) | Self::TemplateName)
     }
 }
 
@@ -118,7 +161,8 @@ struct InputState {
 
 #[derive(Debug)]
 struct TemplatePreview {
-    template: GraphTemplate,
+    template: TemplateChoice,
+    description: String,
     shape: String,
     nodes: usize,
     edges: usize,
@@ -132,6 +176,10 @@ enum Modal {
         previews: Vec<TemplatePreview>,
     },
     ProfilePicker {
+        selected: usize,
+        target: BindingTarget,
+    },
+    LaneBinding {
         selected: usize,
     },
     Issues {
@@ -203,7 +251,8 @@ struct App {
     lang: Language,
     screen: Screen,
     graph: Graph,
-    template: GraphTemplate,
+    templates: Vec<TemplateChoice>,
+    template: TemplateChoice,
     template_index: usize,
     task: String,
     model: Option<String>,
@@ -219,6 +268,13 @@ struct App {
     last_run_id: Option<String>,
     announced_run: bool,
     events: VecDeque<String>,
+    /// Inside the lane-assignment flow, so closing a per-node editor returns
+    /// to the lane list instead of dropping the user back to the graph.
+    lane_flow: bool,
+    /// Provider capability/model data resolved off the draw loop, because
+    /// discovery shells out to every configured provider CLI.
+    binding_options: Option<Vec<ProfileOption>>,
+    binding_rx: Option<oneshot::Receiver<Vec<ProfileOption>>>,
     status: String,
     /// Graph differs from what is saved on disk.
     dirty: bool,
@@ -263,7 +319,7 @@ impl App {
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let template = GraphTemplate::Direct;
-                let task = DEFAULT_TASK.to_owned();
+                let task = lang.strings().default_task.to_owned();
                 let mut graph = Self::build_graph(template, &task, None, None);
                 graph.metadata.name = String::from("work");
                 graph.spec.goal.clone_from(&task);
@@ -294,7 +350,8 @@ impl App {
             .iter()
             .find_map(Node::model)
             .map(str::to_owned);
-        let template = GraphTemplate::Direct;
+        let templates = template_choices(&repo);
+        let template = TemplateChoice::Builtin(GraphTemplate::Direct);
         // A graph loaded from disk is treated as user content: applying a
         // template replaces it, so the pickers warn about it.
         let manual_edits = expected_sha256.is_some();
@@ -308,6 +365,7 @@ impl App {
             lang,
             screen: Screen::Overview,
             graph,
+            templates,
             template,
             template_index: 0,
             task,
@@ -324,6 +382,9 @@ impl App {
             last_run_id: None,
             announced_run: false,
             events: VecDeque::new(),
+            lane_flow: false,
+            binding_options: None,
+            binding_rx: None,
             status: lang.strings().status_ready.to_owned(),
             dirty: false,
             manual_edits,
@@ -332,6 +393,77 @@ impl App {
 
     fn strings(&self) -> &'static Strings {
         self.lang.strings()
+    }
+
+    /// Kick off provider model discovery without blocking startup. Until it
+    /// lands, bindings render from the graph alone.
+    fn start_binding_discovery(&mut self) {
+        let (sender, receiver) = oneshot::channel();
+        let repo = self.repo.clone();
+        let trust_project_profiles = self.trust_project_profiles;
+        let profiles = self.profiles.clone();
+        tokio::spawn(async move {
+            if let Ok(options) =
+                resolve_profile_options(&repo, trust_project_profiles, &profiles).await
+            {
+                let _ = sender.send(options);
+            }
+        });
+        self.binding_rx = Some(receiver);
+    }
+
+    fn poll_binding_options(&mut self) {
+        let Some(receiver) = self.binding_rx.as_mut() else {
+            return;
+        };
+        if let Ok(options) = receiver.try_recv() {
+            self.binding_options = Some(options);
+            self.binding_rx = None;
+        }
+    }
+
+    /// Resolve what a node will actually run with. `None` for nodes that never
+    /// call a provider, so a `command` node is not labelled with a harness it
+    /// will never use.
+    fn effective_binding(&self, node: &Node) -> Option<EffectiveBinding> {
+        if !binds_provider(node) {
+            return None;
+        }
+        let strings = self.strings();
+        let profile = match (node.profile(), self.runtime_default_profile()) {
+            (Some(explicit), _) => BindingValue::Explicit(explicit.to_owned()),
+            (None, Some(resolved)) => BindingValue::Inherited(resolved.to_owned()),
+            (None, None) => BindingValue::Unresolved(strings.runtime_default),
+        };
+        let model = match node.model() {
+            Some(explicit) => BindingValue::Explicit(explicit.to_owned()),
+            None => profile
+                .name()
+                .and_then(|name| self.binding_option(name))
+                .and_then(|option| option.default_model.clone())
+                .map_or(
+                    BindingValue::Unresolved(strings.provider_default),
+                    BindingValue::Inherited,
+                ),
+        };
+        Some(EffectiveBinding { profile, model })
+    }
+
+    fn binding_option(&self, profile: &str) -> Option<&ProfileOption> {
+        self.binding_options
+            .as_ref()?
+            .iter()
+            .find(|option| option.name == profile)
+    }
+
+    /// The profile the runtime picks when a node leaves `profile` unset:
+    /// highest-priority enabled profile with text output.
+    fn runtime_default_profile(&self) -> Option<&str> {
+        self.binding_options
+            .as_ref()?
+            .iter()
+            .find(|option| option.runtime_default)
+            .map(|option| option.name.as_str())
     }
 
     fn build_graph(
@@ -348,6 +480,9 @@ impl App {
             profile.map(|value| vec![value.to_owned()]),
             None,
         );
+        if let Some(profile) = profile {
+            apply_profile_to_agent_nodes(&mut graph, profile);
+        }
         if let Some(model) = model {
             apply_model_to_agent_nodes(&mut graph, model);
         }
@@ -366,34 +501,47 @@ impl App {
     /// Manual node edits are replaced; callers surface that through the
     /// picker warning and the post-apply status message.
     fn rebuild_from_choices(&mut self) {
-        self.graph = Self::build_graph(
-            self.template,
-            &self.task,
-            self.selected_profile(),
-            self.model.as_deref(),
-        );
+        match self.template.clone() {
+            TemplateChoice::Builtin(template) => {
+                self.graph = Self::build_graph(
+                    template,
+                    &self.task,
+                    self.selected_profile(),
+                    self.model.as_deref(),
+                );
+                self.manual_edits = false;
+            }
+            TemplateChoice::Project(name) => {
+                let resolved = templates::resolve_template(&name, &self.repo);
+                let Ok(templates::ResolvedTemplate::Project(graph)) = resolved else {
+                    self.status = fill(
+                        self.strings().template_save_failed,
+                        &[("error", self.strings().template_load_failed)],
+                    );
+                    return;
+                };
+                self.graph = *graph;
+                templates::apply_new_overrides(&mut self.graph, "work", &self.task);
+                // A saved template carries its own per-node bindings; the
+                // graph-wide selection must not overwrite them on load.
+                self.manual_edits = true;
+            }
+        }
         self.selected_node = 0;
         self.connect_from = None;
         self.dirty = true;
-        self.manual_edits = false;
     }
 
     fn apply_template(&mut self, index: usize) {
+        let Some(choice) = self.templates.get(index).cloned() else {
+            return;
+        };
         let had_edits = self.manual_edits;
         self.template_index = index;
-        self.template = TEMPLATE_CHOICES[index];
+        self.template = choice;
         self.rebuild_from_choices();
         let strings = self.strings();
-        let template = match self.template {
-            GraphTemplate::Direct => strings.template_desc_direct,
-            GraphTemplate::PlanImplementVerify => strings.template_desc_plan_implement_verify,
-            GraphTemplate::ParallelResearchReduce => strings.template_desc_parallel_research_reduce,
-            GraphTemplate::ReviewFixLoop => strings.template_desc_review_fix_loop,
-            GraphTemplate::DesignWallBounce => strings.template_desc_design_wall_bounce,
-            GraphTemplate::Council => strings.template_desc_council,
-            GraphTemplate::DecomposeFanoutReduce => strings.template_desc_decompose_fanout_reduce,
-            GraphTemplate::ImplementTestLoop => strings.template_desc_implement_test_loop,
-        };
+        let description = self.template_description(&self.template);
         let shape = graph_shape(&self.graph);
         let key = if had_edits {
             strings.status_template_edits_discarded
@@ -403,12 +551,35 @@ impl App {
         self.status = fill(
             key,
             &[
-                ("name", template_label(self.template)),
-                ("shape", &format!("{shape} ({template})")),
+                ("name", self.template.label()),
+                ("shape", &format!("{shape} ({description})")),
             ],
         );
+        if has_parallel_lanes(&self.graph) {
+            self.open_lane_binding();
+        }
     }
 
+    fn template_description(&self, choice: &TemplateChoice) -> String {
+        match choice {
+            TemplateChoice::Builtin(template) => {
+                template_desc(self.strings(), *template).to_owned()
+            }
+            TemplateChoice::Project(name) => templates::list_project_templates(&self.repo)
+                .ok()
+                .and_then(|entries| {
+                    entries
+                        .into_iter()
+                        .find(|entry| entry.name == *name)
+                        .and_then(|entry| entry.description)
+                })
+                .unwrap_or_else(|| self.strings().picker_source_project.to_owned()),
+        }
+    }
+
+    /// Bind every provider node at once. This edits the current graph in place
+    /// rather than rebuilding from the template, so prompts and topology the
+    /// user already has survive, and a loaded project template keeps its shape.
     fn apply_profile(&mut self, index: usize) {
         let Some(profile) = self.profiles.get(index) else {
             return;
@@ -416,36 +587,56 @@ impl App {
         if !profile.enabled {
             return;
         }
-        let had_edits = self.manual_edits;
+        let name = profile.name.clone();
         self.profile_index = Some(index);
-        self.rebuild_from_choices();
-        let strings = self.strings();
-        let mut status = fill(
-            strings.status_profile_applied,
-            &[("name", self.selected_profile().unwrap_or_default())],
-        );
-        if had_edits {
-            status.push(' ');
-            status.push_str(strings.status_edits_discarded_note);
-        }
-        self.status = status;
+        apply_profile_to_agent_nodes(&mut self.graph, &name);
+        self.dirty = true;
+        self.status = fill(self.strings().status_profile_applied, &[("name", &name)]);
     }
 
     fn open_template_picker(&mut self) {
-        let previews = TEMPLATE_CHOICES
+        self.templates = template_choices(&self.repo);
+        self.template_index = self
+            .templates
             .iter()
-            .map(|template| {
-                let graph = Self::build_graph(
-                    *template,
-                    &self.task,
-                    self.selected_profile(),
-                    self.model.as_deref(),
+            .position(|choice| *choice == self.template)
+            .unwrap_or(0);
+        let previews = self
+            .templates
+            .clone()
+            .into_iter()
+            .map(|choice| {
+                let description = self.template_description(&choice);
+                let graph = match &choice {
+                    TemplateChoice::Builtin(template) => Some(Self::build_graph(
+                        *template,
+                        &self.task,
+                        self.selected_profile(),
+                        self.model.as_deref(),
+                    )),
+                    TemplateChoice::Project(name) => {
+                        match templates::resolve_template(name, &self.repo) {
+                            Ok(templates::ResolvedTemplate::Project(graph)) => Some(*graph),
+                            _ => None,
+                        }
+                    }
+                };
+                let (shape, nodes, edges) = graph.map_or_else(
+                    || (self.strings().template_load_failed.to_owned(), 0, 0),
+                    |graph| {
+                        (
+                            graph_shape(&graph),
+                            graph.spec.nodes.len(),
+                            graph.spec.edges.len(),
+                        )
+                    },
                 );
                 TemplatePreview {
-                    template: *template,
-                    shape: graph_shape(&graph),
-                    nodes: graph.spec.nodes.len(),
-                    edges: graph.spec.edges.len(),
+                    template: choice,
+                    description,
+                    shape,
+                    nodes,
+                    edges,
                 }
             })
             .collect();
@@ -455,12 +646,60 @@ impl App {
         });
     }
 
-    fn open_profile_picker(&mut self) {
-        let selected = self
-            .profile_index
+    fn open_profile_picker(&mut self, target: BindingTarget) {
+        let current = match target {
+            BindingTarget::Graph => self.profile_index,
+            BindingTarget::Node => self
+                .graph
+                .spec
+                .nodes
+                .get(self.selected_node)
+                .and_then(Node::profile)
+                .and_then(|name| {
+                    self.profiles
+                        .iter()
+                        .position(|profile| profile.name == name)
+                }),
+        };
+        let selected = current
             .unwrap_or(0)
             .min(self.profiles.len().saturating_sub(1));
-        self.modal = Some(Modal::ProfilePicker { selected });
+        self.modal = Some(Modal::ProfilePicker { selected, target });
+    }
+
+    /// Bind one node without rebuilding the graph, so sibling lanes keep the
+    /// bindings the user already gave them.
+    fn apply_profile_to_node(&mut self, profile_index: Option<usize>) {
+        let name = match profile_index {
+            Some(index) => match self.profiles.get(index) {
+                Some(profile) if profile.enabled => Some(profile.name.clone()),
+                Some(_) => {
+                    self.set_status(self.strings().status_profile_none);
+                    return;
+                }
+                None => return,
+            },
+            None => None,
+        };
+        let Some(node) = self.graph.spec.nodes.get_mut(self.selected_node) else {
+            self.set_status(self.strings().status_no_node);
+            return;
+        };
+        if !binds_provider(node) {
+            self.set_status(self.strings().status_not_prompt_node);
+            return;
+        }
+        let id = node.id.clone();
+        set_node_profile(node, name.clone());
+        self.dirty = true;
+        self.manual_edits = true;
+        self.status = match name {
+            Some(name) => fill(
+                self.strings().status_node_profile_applied,
+                &[("id", &id), ("name", &name)],
+            ),
+            None => fill(self.strings().status_node_binding_cleared, &[("id", &id)]),
+        };
     }
 
     fn validate_and_show_issues(&mut self) {
@@ -521,7 +760,19 @@ impl App {
     fn begin_input(&mut self, target: InputTarget) {
         let value = match target {
             InputTarget::Task => self.task.clone(),
-            InputTarget::Model => self.model.clone().unwrap_or_default(),
+            InputTarget::TemplateName => String::new(),
+            InputTarget::Model(BindingTarget::Graph) => self.model.clone().unwrap_or_default(),
+            InputTarget::Model(BindingTarget::Node) => {
+                let Some(node) = self.graph.spec.nodes.get(self.selected_node) else {
+                    self.set_status(self.strings().status_no_node);
+                    return;
+                };
+                if !binds_provider(node) {
+                    self.set_status(self.strings().status_not_prompt_node);
+                    return;
+                }
+                node.model().unwrap_or_default().to_owned()
+            }
             InputTarget::NodePrompt => {
                 let Some(node) = self.graph.spec.nodes.get(self.selected_node) else {
                     self.set_status(self.strings().status_no_node);
@@ -564,7 +815,7 @@ impl App {
                     self.set_status(self.strings().status_task_updated);
                 }
             }
-            InputTarget::Model => {
+            InputTarget::Model(BindingTarget::Graph) => {
                 if value.is_empty() {
                     self.model = None;
                     clear_model_on_agent_nodes(&mut self.graph);
@@ -583,6 +834,26 @@ impl App {
                     )],
                 );
             }
+            InputTarget::Model(BindingTarget::Node) => {
+                let Some(node) = self.graph.spec.nodes.get_mut(self.selected_node) else {
+                    self.set_status(self.strings().status_no_node);
+                    return;
+                };
+                let id = node.id.clone();
+                set_node_model(node, (!value.is_empty()).then(|| value.clone()));
+                self.dirty = true;
+                self.manual_edits = true;
+                self.status = if value.is_empty() {
+                    fill(self.strings().status_node_binding_cleared, &[("id", &id)])
+                } else {
+                    fill(
+                        self.strings().status_node_model_override,
+                        &[("id", &id), ("model", &value)],
+                    )
+                };
+                self.close_sub_modal();
+            }
+            InputTarget::TemplateName => self.save_as_template(&value),
             InputTarget::NodePrompt => {
                 let Some(node) = self.graph.spec.nodes.get_mut(self.selected_node) else {
                     self.set_status(self.strings().status_no_node);
@@ -732,7 +1003,7 @@ impl App {
         let multiline = input.target.multiline();
         match key.code {
             KeyCode::Esc => {
-                self.modal = None;
+                self.close_sub_modal();
                 self.set_status(self.strings().status_edit_cancelled);
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -824,7 +1095,111 @@ impl App {
         *offset = next;
     }
 
+    /// Lane list keys. Split out of `handle_modal_key` because acting on a lane
+    /// needs `&mut self` while the modal borrow would still be live.
+    fn handle_lane_key(&mut self, key: KeyEvent, mut selected: usize) -> Action {
+        let lanes = self.provider_lanes();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('s' | 'q') => {
+                self.lane_flow = false;
+                self.modal = None;
+                self.set_status(self.strings().status_lanes_skipped);
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.lane_flow = false;
+                self.modal = None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                selected = selected.saturating_sub(1);
+                self.modal = Some(Modal::LaneBinding { selected });
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                selected = (selected + 1).min(lanes.len().saturating_sub(1));
+                self.modal = Some(Modal::LaneBinding { selected });
+            }
+            KeyCode::Enter => {
+                if let Some(node) = lanes.get(selected).copied() {
+                    self.selected_node = node;
+                    self.open_profile_picker(BindingTarget::Node);
+                }
+            }
+            KeyCode::Char('m') => {
+                if let Some(node) = lanes.get(selected).copied() {
+                    self.selected_node = node;
+                    self.begin_input(InputTarget::Model(BindingTarget::Node));
+                }
+            }
+            _ => {}
+        }
+        Action::Continue
+    }
+
+    /// Profile picker keys. Split out for the same borrow reason as
+    /// `handle_lane_key`.
+    /// Profile picker keys. Split out for the same borrow reason as
+    /// `handle_lane_key`.
+    fn handle_profile_picker_key(
+        &mut self,
+        key: KeyEvent,
+        mut selected: usize,
+        target: BindingTarget,
+    ) -> Action {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.close_sub_modal(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.lane_flow = false;
+                self.modal = None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                selected = selected.saturating_sub(1);
+                self.modal = Some(Modal::ProfilePicker { selected, target });
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                selected = (selected + 1).min(self.profiles.len().saturating_sub(1));
+                self.modal = Some(Modal::ProfilePicker { selected, target });
+            }
+            KeyCode::Backspace => {
+                self.close_sub_modal();
+                match target {
+                    BindingTarget::Graph => {
+                        self.profile_index = None;
+                        self.rebuild_from_choices();
+                        self.set_status(self.strings().status_profile_none);
+                    }
+                    BindingTarget::Node => self.apply_profile_to_node(None),
+                }
+            }
+            KeyCode::Enter => {
+                self.close_sub_modal();
+                match target {
+                    BindingTarget::Graph => {
+                        if self
+                            .profiles
+                            .get(selected)
+                            .is_some_and(|profile| profile.enabled)
+                        {
+                            self.apply_profile(selected);
+                        } else {
+                            self.set_status(self.strings().status_profile_none);
+                        }
+                    }
+                    BindingTarget::Node => self.apply_profile_to_node(Some(selected)),
+                }
+            }
+            _ => {}
+        }
+        Action::Continue
+    }
+
     fn handle_modal_key(&mut self, key: KeyEvent) -> Action {
+        if let Some(Modal::LaneBinding { selected }) = &self.modal {
+            let selected = *selected;
+            return self.handle_lane_key(key, selected);
+        }
+        if let Some(Modal::ProfilePicker { selected, target }) = &self.modal {
+            let (selected, target) = (*selected, *target);
+            return self.handle_profile_picker_key(key, selected, target);
+        }
         match self.modal.as_mut() {
             Some(Modal::Input(_)) => {
                 self.handle_input_key(key);
@@ -855,39 +1230,7 @@ impl App {
                 }
                 _ => Action::Continue,
             },
-            Some(Modal::ProfilePicker { selected }) => match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    self.modal = None;
-                    Action::Continue
-                }
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.modal = None;
-                    Action::Continue
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    *selected = selected.saturating_sub(1);
-                    Action::Continue
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    *selected = (*selected + 1).min(self.profiles.len().saturating_sub(1));
-                    Action::Continue
-                }
-                KeyCode::Enter => {
-                    let index = *selected;
-                    self.modal = None;
-                    if self
-                        .profiles
-                        .get(index)
-                        .is_some_and(|profile| profile.enabled)
-                    {
-                        self.apply_profile(index);
-                    } else {
-                        self.set_status(self.strings().status_profile_none);
-                    }
-                    Action::Continue
-                }
-                _ => Action::Continue,
-            },
+
             Some(Modal::Issues { .. } | Modal::Help { .. } | Modal::Output { .. }) => {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => {
@@ -917,7 +1260,10 @@ impl App {
                     _ => Action::Continue,
                 }
             }
-            None => Action::Continue,
+            // LaneBinding and ProfilePicker return early above.
+            Some(Modal::LaneBinding { .. } | Modal::ProfilePicker { .. }) | None => {
+                Action::Continue
+            }
         }
     }
 
@@ -964,7 +1310,8 @@ impl App {
                 KeyCode::Char('1') => self.screen = Screen::Overview,
                 KeyCode::Char('2') => self.screen = Screen::Builder,
                 KeyCode::Char('3') => self.screen = Screen::Run,
-                KeyCode::Tab => self.next_screen(),
+                KeyCode::Tab | KeyCode::Right => self.next_screen(),
+                KeyCode::BackTab | KeyCode::Left => self.prev_screen(),
                 KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
                 KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
                 KeyCode::Char('o') => return Action::OpenOutput,
@@ -988,8 +1335,12 @@ impl App {
                 self.screen = Screen::Run;
                 Action::Continue
             }
-            KeyCode::Tab => {
+            KeyCode::Tab | KeyCode::Right => {
                 self.next_screen();
+                Action::Continue
+            }
+            KeyCode::BackTab | KeyCode::Left => {
+                self.prev_screen();
                 Action::Continue
             }
             KeyCode::Char('t') => {
@@ -997,11 +1348,11 @@ impl App {
                 Action::Continue
             }
             KeyCode::Char('p') => {
-                self.open_profile_picker();
+                self.open_profile_picker(self.binding_target());
                 Action::Continue
             }
             KeyCode::Char('m') => {
-                self.begin_input(InputTarget::Model);
+                self.begin_input(InputTarget::Model(self.binding_target()));
                 Action::Continue
             }
             KeyCode::Char('i') => {
@@ -1010,6 +1361,14 @@ impl App {
             }
             KeyCode::Char('r') => Action::Run,
             KeyCode::Char('s') => Action::Save,
+            KeyCode::Char('b') => {
+                self.open_lane_binding();
+                Action::Continue
+            }
+            KeyCode::Char('S') => {
+                self.begin_input(InputTarget::TemplateName);
+                Action::Continue
+            }
             KeyCode::Char('v') => {
                 self.validate_and_show_issues();
                 Action::Continue
@@ -1062,6 +1421,64 @@ impl App {
     fn next_screen(&mut self) {
         let next = (self.screen.index() + 1) % Screen::ALL.len();
         self.screen = Screen::ALL[next];
+    }
+
+    fn provider_lanes(&self) -> Vec<usize> {
+        self.graph
+            .spec
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| binds_provider(node))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn open_lane_binding(&mut self) {
+        let lanes = self.provider_lanes();
+        if lanes.is_empty() {
+            self.lane_flow = false;
+            self.set_status(self.strings().status_no_lanes);
+            return;
+        }
+        let selected = lanes
+            .iter()
+            .position(|index| *index == self.selected_node)
+            .unwrap_or(0);
+        self.lane_flow = true;
+        self.modal = Some(Modal::LaneBinding { selected });
+    }
+
+    /// Close a per-node editor: back to the lane list while the lane flow is
+    /// running, otherwise back to the graph.
+    fn close_sub_modal(&mut self) {
+        if self.lane_flow {
+            self.open_lane_binding();
+        } else {
+            self.modal = None;
+        }
+    }
+
+    fn selected_node_id(&self) -> Option<&str> {
+        self.graph
+            .spec
+            .nodes
+            .get(self.selected_node)
+            .map(|node| node.id.as_str())
+    }
+
+    /// The Builder edits one node; every other screen edits the whole graph.
+    const fn binding_target(&self) -> BindingTarget {
+        match self.screen {
+            Screen::Builder => BindingTarget::Node,
+            Screen::Overview | Screen::Run => BindingTarget::Graph,
+        }
+    }
+
+    fn prev_screen(&mut self) {
+        let count = Screen::ALL.len();
+        let prev = (self.screen.index() + count - 1) % count;
+        self.screen = Screen::ALL[prev];
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -1316,7 +1733,7 @@ impl App {
             Ok(Ok(summary)) => {
                 self.status = fill(
                     strings.status_run_finished,
-                    &[("status", &format!("{:?}", summary.status))],
+                    &[("status", final_status_label(summary.status, self.lang))],
                 );
                 self.last_summary = Some(summary);
             }
@@ -1430,6 +1847,34 @@ impl App {
             lines,
             offset: 0,
         });
+    }
+
+    /// Write the current graph to `.gloop/templates/<name>.yaml`. Refuses to
+    /// replace an existing file so a name collision cannot silently overwrite
+    /// someone's template.
+    fn save_as_template(&mut self, name: &str) {
+        if let Err(error) = self.write_template(name) {
+            self.status = fill(self.strings().template_save_failed, &[("error", &error)]);
+            return;
+        }
+        self.templates = template_choices(&self.repo);
+        self.template = TemplateChoice::Project(name.to_owned());
+        self.template_index = self
+            .templates
+            .iter()
+            .position(|choice| *choice == self.template)
+            .unwrap_or(0);
+        self.status = fill(self.strings().template_saved, &[("name", name)]);
+    }
+
+    fn write_template(&self, name: &str) -> std::result::Result<(), String> {
+        templates::validate_init_template_name(name)?;
+        templates::strict_validate_project_template(&self.graph)?;
+        templates::ensure_managed_directory(&self.repo, Path::new(templates::TEMPLATES_DIR))
+            .map_err(|error| error.to_string())?;
+        let yaml = self.graph.to_yaml().map_err(|error| error.to_string())?;
+        let path = templates::template_path(&self.repo, name);
+        atomic_write::write_text_no_replace_sync(&path, &yaml).map_err(|error| error.to_string())
     }
 
     async fn save(&mut self) -> Result<()> {
@@ -1637,6 +2082,192 @@ fn node_status_label(status: NodeStatus, lang: Language) -> &'static str {
     }
 }
 
+/// Edge kinds keep their Graph IR spelling in every language so a row in the
+/// builder can be grepped in the saved YAML.
+fn edge_kind_label(kind: gloop_core::EdgeKind) -> &'static str {
+    match kind {
+        gloop_core::EdgeKind::Data => "data",
+        gloop_core::EdgeKind::Control => "control",
+        gloop_core::EdgeKind::Resource => "resource",
+        gloop_core::EdgeKind::Conditional => "conditional",
+        gloop_core::EdgeKind::Failure => "failure",
+    }
+}
+
+fn final_status_label(status: gloop_core::FinalStatus, lang: Language) -> &'static str {
+    let strings = lang.strings();
+    match status {
+        gloop_core::FinalStatus::ReadyForHuman => strings.final_ready_for_human,
+        gloop_core::FinalStatus::Failed => strings.final_failed,
+        gloop_core::FinalStatus::Blocked => strings.final_blocked,
+        gloop_core::FinalStatus::VerificationFailed => strings.final_verification_failed,
+        gloop_core::FinalStatus::BudgetExhausted => strings.final_budget_exhausted,
+        gloop_core::FinalStatus::Cancelled => strings.final_cancelled,
+    }
+}
+
+/// True when the node actually calls a provider, so a profile/model binding is
+/// meaningful. `Node::profile()` returns `None` both for "unset on an agent" and
+/// for "a command node has no such field"; this separates the two cases.
+/// Column where every Overview value starts. Padding counts display columns,
+/// not characters, so CJK labels line up with ASCII ones.
+const LABEL_COLUMNS: usize = 14;
+
+fn display_width(text: &str) -> usize {
+    text.chars().map(|c| c.width().unwrap_or(0)).sum()
+}
+
+fn pad_to(text: &str, columns: usize) -> String {
+    format!(
+        "{text}{}",
+        " ".repeat(columns.saturating_sub(display_width(text)))
+    )
+}
+
+fn pad_label(label: &str) -> String {
+    pad_to(label, LABEL_COLUMNS)
+}
+
+/// What the whole graph will run with: one value when every provider node
+/// agrees, otherwise each distinct value, so a mixed graph cannot masquerade
+/// as a single binding.
+fn binding_summary(
+    app: &App,
+    fallback: &'static str,
+    cell: impl Fn(&EffectiveBinding) -> String,
+) -> String {
+    let mut values: Vec<String> = Vec::new();
+    for node in &app.graph.spec.nodes {
+        if let Some(binding) = app.effective_binding(node) {
+            let value = cell(&binding);
+            if !values.contains(&value) {
+                values.push(value);
+            }
+        }
+    }
+    if values.is_empty() {
+        return fallback.to_owned();
+    }
+    values.join(" · ")
+}
+
+fn set_node_profile(node: &mut Node, profile: Option<String>) {
+    match &mut node.kind {
+        NodeKind::Agent { profile: slot, .. }
+        | NodeKind::Reduce { profile: slot, .. }
+        | NodeKind::Synthesize { profile: slot, .. } => *slot = profile,
+        _ => {}
+    }
+}
+
+fn set_node_model(node: &mut Node, model: Option<String>) {
+    match &mut node.kind {
+        NodeKind::Agent { model: slot, .. }
+        | NodeKind::Reduce { model: slot, .. }
+        | NodeKind::Synthesize { model: slot, .. } => *slot = model,
+        _ => {}
+    }
+}
+
+/// True when two provider nodes can run at the same time, i.e. neither is
+/// reachable from the other. Derived from the graph rather than a list of
+/// template names, so project templates get the same treatment.
+fn has_parallel_lanes(graph: &Graph) -> bool {
+    let lanes: Vec<&str> = graph
+        .spec
+        .nodes
+        .iter()
+        .filter(|node| binds_provider(node))
+        .map(|node| node.id.as_str())
+        .collect();
+    if lanes.len() < 2 {
+        return false;
+    }
+    let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
+    for edge in &graph.spec.edges {
+        adjacency
+            .entry(edge.from.as_str())
+            .or_default()
+            .push(edge.to.as_str());
+    }
+    let reachable: HashMap<&str, std::collections::HashSet<&str>> = lanes
+        .iter()
+        .map(|lane| (*lane, reachable_from(lane, &adjacency)))
+        .collect();
+    lanes.iter().enumerate().any(|(position, lane)| {
+        lanes[position + 1..]
+            .iter()
+            .any(|other| !reachable[lane].contains(other) && !reachable[other].contains(lane))
+    })
+}
+
+fn reachable_from<'a>(
+    start: &'a str,
+    adjacency: &HashMap<&'a str, Vec<&'a str>>,
+) -> std::collections::HashSet<&'a str> {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![start];
+    while let Some(current) = stack.pop() {
+        for next in adjacency.get(current).into_iter().flatten() {
+            if seen.insert(*next) {
+                stack.push(next);
+            }
+        }
+    }
+    seen
+}
+
+fn binds_provider(node: &Node) -> bool {
+    matches!(
+        node.kind,
+        NodeKind::Agent { .. } | NodeKind::Reduce { .. } | NodeKind::Synthesize { .. }
+    )
+}
+
+/// One resolved binding slot. `Inherited` carries the concrete name that will
+/// run; `Unresolved` is for defaults gloop cannot name, such as the model a
+/// command CLI picks for itself when the node sets none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BindingValue {
+    Explicit(String),
+    Inherited(String),
+    Unresolved(&'static str),
+}
+
+impl BindingValue {
+    fn cell(&self) -> String {
+        match self {
+            Self::Explicit(value) => value.clone(),
+            Self::Inherited(value) => format!("{value}*"),
+            Self::Unresolved(label) => (*label).to_owned(),
+        }
+    }
+
+    const fn name(&self) -> Option<&String> {
+        match self {
+            Self::Explicit(value) | Self::Inherited(value) => Some(value),
+            Self::Unresolved(_) => None,
+        }
+    }
+
+    const fn is_inherited(&self) -> bool {
+        matches!(self, Self::Inherited(_))
+    }
+}
+
+/// What one node will really run with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectiveBinding {
+    profile: BindingValue,
+    model: BindingValue,
+}
+
+impl EffectiveBinding {
+    const fn has_inherited(&self) -> bool {
+        self.profile.is_inherited() || self.model.is_inherited()
+    }
+}
+
 fn node_kind_label(node: &Node) -> &'static str {
     match &node.kind {
         NodeKind::Agent { .. } => "agent",
@@ -1665,12 +2296,13 @@ fn help_lines(lang: Language) -> Vec<String> {
         s.help_step_status.to_owned(),
         String::new(),
         format!("{}:", s.help_keys_title),
-        format!("1/2/3 — {}", s.key_screens),
+        format!("\u{2190}/\u{2192} · Tab · 1/2/3 — {}", s.key_screens),
         format!("i — {}  ·  m — {}", s.key_task, s.key_model),
         format!("t — {}  ·  p — {}", s.key_template, s.key_profile),
         format!("v — {}  ·  s — {}", s.key_validate, s.key_save),
-        format!("r — {}  ·  o — output", s.key_run),
+        format!("r — {}  ·  o — {}", s.key_run, s.key_output),
         format!("? — {}  ·  l — {}", s.key_help, s.key_lang),
+        format!("b — {}  ·  S — {}", s.key_lanes, s.key_save_template),
         format!("q — {}", s.key_quit),
     ]
 }
@@ -1717,7 +2349,7 @@ fn render(frame: &mut Frame, app: &App) {
     }
 
     let footer_keys = vec![
-        Span::styled("1/2/3", Style::default().fg(Color::Cyan)),
+        Span::styled("\u{2190}/\u{2192}", Style::default().fg(Color::Cyan)),
         Span::raw(format!(" {}  ", strings.key_screens)),
         Span::styled("i", Style::default().fg(Color::Cyan)),
         Span::raw(format!(" {}  ", strings.key_task)),
@@ -1727,12 +2359,16 @@ fn render(frame: &mut Frame, app: &App) {
         Span::raw(format!(" {}  ", strings.key_profile)),
         Span::styled("m", Style::default().fg(Color::Cyan)),
         Span::raw(format!(" {}  ", strings.key_model)),
+        Span::styled("b", Style::default().fg(Color::Cyan)),
+        Span::raw(format!(" {}  ", strings.key_lanes)),
         Span::styled("v", Style::default().fg(Color::Cyan)),
         Span::raw(format!(" {}  ", strings.key_validate)),
         Span::styled("r", Style::default().fg(Color::Green)),
         Span::raw(format!(" {}  ", strings.key_run)),
         Span::styled("s", Style::default().fg(Color::Yellow)),
         Span::raw(format!(" {}  ", strings.key_save)),
+        Span::styled("S", Style::default().fg(Color::Yellow)),
+        Span::raw(format!(" {}  ", strings.key_save_template)),
         Span::styled("?", Style::default().fg(Color::Cyan)),
         Span::raw(format!(" {}  ", strings.key_help)),
         Span::styled("l", Style::default().fg(Color::Cyan)),
@@ -1742,7 +2378,7 @@ fn render(frame: &mut Frame, app: &App) {
     ];
     let footer = Paragraph::new(Text::from(vec![
         Line::from(vec![
-            Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(strings.status_prefix, Style::default().fg(Color::DarkGray)),
             Span::raw(&app.status),
         ]),
         Line::from(footer_keys),
@@ -1753,10 +2389,20 @@ fn render(frame: &mut Frame, app: &App) {
     match &app.modal {
         Some(Modal::Input(input)) => {
             let height = input_height(input, area);
-            render_input(frame, input, strings, centered_rect(90, height, area));
+            let title = match input.target {
+                InputTarget::Task => strings.input_task.to_owned(),
+                InputTarget::Model(BindingTarget::Graph) => strings.input_model.to_owned(),
+                InputTarget::Model(BindingTarget::Node) => fill(
+                    strings.input_node_model,
+                    &[("id", app.selected_node_id().unwrap_or_default())],
+                ),
+                InputTarget::NodePrompt => strings.input_prompt.to_owned(),
+                InputTarget::TemplateName => strings.input_template_name.to_owned(),
+            };
+            render_input(frame, input, &title, centered_rect(90, height, area));
         }
         Some(Modal::TemplatePicker { selected, previews }) => {
-            let height = u16::try_from(previews.len().saturating_mul(2) + 3).unwrap_or(u16::MAX);
+            let height = u16::try_from(previews.len().saturating_mul(2) + 4).unwrap_or(u16::MAX);
             render_template_picker(
                 frame,
                 app,
@@ -1765,8 +2411,26 @@ fn render(frame: &mut Frame, app: &App) {
                 centered_rect(84, height, area),
             );
         }
-        Some(Modal::ProfilePicker { selected }) => {
-            render_profile_picker(frame, app, *selected, centered_rect(70, 15, area));
+        Some(Modal::LaneBinding { selected }) => {
+            let lanes = app.provider_lanes();
+            let height = u16::try_from(lanes.len() + 6).unwrap_or(u16::MAX);
+            render_lane_binding(
+                frame,
+                app,
+                *selected,
+                &lanes,
+                centered_rect(80, height, area),
+            );
+        }
+        Some(Modal::ProfilePicker { selected, target }) => {
+            let height = u16::try_from(app.profiles.len().max(1) + 5).unwrap_or(u16::MAX);
+            render_profile_picker(
+                frame,
+                app,
+                *selected,
+                *target,
+                centered_rect(70, height, area),
+            );
         }
         Some(Modal::Issues { lines, offset }) => {
             render_scroll_overlay(
@@ -1780,12 +2444,13 @@ fn render(frame: &mut Frame, app: &App) {
         }
         Some(Modal::Help { offset }) => {
             let lines = help_lines(app.lang);
+            let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
             render_scroll_overlay(
                 frame,
                 strings.help_title,
                 &lines,
                 *offset,
-                centered_rect(84, 21, area),
+                centered_rect(84, height, area),
                 Color::Cyan,
             );
         }
@@ -1818,8 +2483,12 @@ fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
         .split(area);
-    let selected_profile = app.selected_profile().unwrap_or(strings.runtime_default);
-    let model = app.model.as_deref().unwrap_or(strings.provider_default);
+    let profile_summary = binding_summary(app, strings.runtime_default, |binding| {
+        binding.profile.cell()
+    });
+    let model_summary = binding_summary(app, strings.provider_default, |binding| {
+        binding.model.cell()
+    });
     let save_line = if app.dirty {
         format!("{} ({})", app.graph_path.display(), strings.label_dirty)
     } else {
@@ -1835,23 +2504,23 @@ fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled(format!("{:<10} ", strings.label_task), label_style),
+            Span::styled(pad_label(strings.label_task), label_style),
             Span::raw(app.task.lines().next().unwrap_or_default().to_owned()),
         ]),
         Line::from(vec![
-            Span::styled(format!("{:<10} ", strings.label_template), label_style),
-            Span::raw(template_label(app.template)),
+            Span::styled(pad_label(strings.label_template), label_style),
+            Span::raw(app.template.label().to_owned()),
         ]),
         Line::from(vec![
-            Span::styled(format!("{:<10} ", strings.label_profile), label_style),
-            Span::raw(selected_profile.to_owned()),
+            Span::styled(pad_label(strings.label_profile), label_style),
+            Span::raw(profile_summary),
         ]),
         Line::from(vec![
-            Span::styled(format!("{:<10} ", strings.label_model), label_style),
-            Span::raw(model.to_owned()),
+            Span::styled(pad_label(strings.label_model), label_style),
+            Span::raw(model_summary),
         ]),
         Line::from(vec![
-            Span::styled(format!("{:<10} ", strings.label_graph), label_style),
+            Span::styled(pad_label(strings.label_graph), label_style),
             Span::raw(fill(
                 strings.nodes_edges,
                 &[
@@ -1861,14 +2530,17 @@ fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
             )),
         ]),
         Line::from(vec![
-            Span::styled(format!("{:<10} ", strings.label_shape), label_style),
+            Span::styled(pad_label(strings.label_shape), label_style),
             Span::styled(
-                graph_shape(&app.graph),
+                clip_to_columns(
+                    &graph_shape(&app.graph),
+                    usize::from(columns[0].width).saturating_sub(LABEL_COLUMNS + 2),
+                ),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
-            Span::styled(format!("{:<10} ", strings.label_save), label_style),
+            Span::styled(pad_label(strings.label_save), label_style),
             Span::raw(save_line),
         ]),
         Line::from(""),
@@ -1880,11 +2552,31 @@ fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
     ];
     frame.render_widget(
         Paragraph::new(Text::from(summary))
-            .block(Block::default().borders(Borders::ALL).title(" Selection "))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(strings.panel_selection),
+            )
             .wrap(ratatui::widgets::Wrap { trim: false }),
         columns[0],
     );
 
+    let id_columns = app
+        .graph
+        .spec
+        .nodes
+        .iter()
+        .map(|node| display_width(&node.id))
+        .max()
+        .unwrap_or_default();
+    let kind_columns = app
+        .graph
+        .spec
+        .nodes
+        .iter()
+        .map(|node| node_kind_label(node).len() + 2)
+        .max()
+        .unwrap_or_default();
     let mut flow = app
         .graph
         .spec
@@ -1893,8 +2585,10 @@ fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(index, node)| {
             let selected = index == app.selected_node;
-            let profile = node.profile().unwrap_or("runtime");
-            let model = node.model().unwrap_or("default");
+            let binding = app.effective_binding(node);
+            let binding_cell = binding.as_ref().map_or_else(String::new, |binding| {
+                format!("  {} / {}", binding.profile.cell(), binding.model.cell())
+            });
             let style = if selected {
                 Style::default()
                     .fg(Color::Cyan)
@@ -1907,14 +2601,23 @@ fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
                     format!("{:>2} ", index + 1),
                     Style::default().fg(Color::DarkGray),
                 ),
-                Span::styled(node.id.clone(), style),
+                Span::styled(pad_to(&node.id, id_columns), style),
                 Span::raw(format!(
-                    "  [{}]  {profile} / {model}",
-                    node_kind_label(node)
+                    "  {}{binding_cell}",
+                    pad_to(&format!("[{}]", node_kind_label(node)), kind_columns)
                 )),
             ]))
         })
         .collect::<Vec<_>>();
+    if app.graph.spec.nodes.iter().any(|node| {
+        app.effective_binding(node)
+            .is_some_and(|binding| binding.has_inherited())
+    }) {
+        flow.push(ListItem::new(Line::from(Span::styled(
+            format!(" {}", strings.binding_inherited_legend),
+            Style::default().fg(Color::DarkGray),
+        ))));
+    }
     if !app.graph.spec.edges.is_empty() {
         flow.push(ListItem::new(Line::from(Span::styled(
             format!(" {}", strings.edges_header),
@@ -1944,6 +2647,14 @@ fn render_builder(frame: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(area);
+    let id_columns = app
+        .graph
+        .spec
+        .nodes
+        .iter()
+        .map(|node| display_width(&node.id))
+        .max()
+        .unwrap_or_default();
     let items = app
         .graph
         .spec
@@ -1958,7 +2669,11 @@ fn render_builder(frame: &mut Frame, app: &App, area: Rect) {
             };
             ListItem::new(Line::from(vec![
                 Span::styled(marker, Style::default().fg(Color::Cyan)),
-                Span::raw(format!(" {}  {}", node.id, node_kind_label(node))),
+                Span::raw(format!(
+                    " {}  {}",
+                    pad_to(&node.id, id_columns),
+                    node_kind_label(node)
+                )),
             ]))
         })
         .collect::<Vec<_>>();
@@ -1984,13 +2699,21 @@ fn render_builder(frame: &mut Frame, app: &App, area: Rect) {
         .spec
         .edges
         .iter()
-        .map(|edge| format!("{} -{:?}-> {}", edge.from, edge.kind, edge.to))
+        .map(|edge| {
+            format!(
+                "{} -{}-> {}",
+                edge.from,
+                edge_kind_label(edge.kind),
+                edge.to
+            )
+        })
         .collect::<Vec<_>>();
     let prompt = node_prompt(node).unwrap_or(strings.builder_not_prompt);
+    let binding = app.effective_binding(node);
     let detail = vec![
         Line::from(vec![
             Span::styled(
-                "NODE ",
+                format!("{} ", strings.builder_node_header),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -2005,12 +2728,18 @@ fn render_builder(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(format!(
             "{}: {}",
             strings.builder_label_profile,
-            node.profile().unwrap_or(strings.runtime_default)
+            binding.as_ref().map_or_else(
+                || strings.runtime_default.to_owned(),
+                |binding| binding.profile.cell()
+            )
         )),
         Line::from(format!(
             "{}: {}",
             strings.builder_label_model,
-            node.model().unwrap_or(strings.provider_default)
+            binding.as_ref().map_or_else(
+                || strings.provider_default.to_owned(),
+                |binding| binding.model.cell()
+            )
         )),
         Line::from(format!(
             "{}: {}",
@@ -2040,6 +2769,15 @@ fn render_builder(frame: &mut Frame, app: &App, area: Rect) {
     let mut text = detail;
     text.extend(edges.into_iter().map(Line::from));
     text.push(Line::from(""));
+    if binding
+        .as_ref()
+        .is_some_and(EffectiveBinding::has_inherited)
+    {
+        text.push(Line::from(Span::styled(
+            strings.binding_inherited_legend,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
     text.push(Line::from(strings.builder_keys));
     frame.render_widget(
         Paragraph::new(Text::from(text))
@@ -2125,7 +2863,7 @@ fn render_run(frame: &mut Frame, app: &App, area: Rect) {
         )));
         lines.push(Line::from(fill(
             strings.run_status_label,
-            &[("status", &format!("{:?}", summary.status))],
+            &[("status", final_status_label(summary.status, app.lang))],
         )));
         lines.push(Line::from(fill(
             strings.run_meta,
@@ -2141,7 +2879,7 @@ fn render_run(frame: &mut Frame, app: &App, area: Rect) {
                 strings.run_selected,
                 &[
                     ("id", &node.id),
-                    ("status", &format!("{:?}", outcome.status)),
+                    ("status", node_status_label(outcome.status, app.lang)),
                 ],
             )));
             if let Some(output) = &outcome.output {
@@ -2168,11 +2906,29 @@ fn render_run(frame: &mut Frame, app: &App, area: Rect) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" Runtime / results "),
+                    .title(strings.panel_runtime_results),
             )
             .wrap(ratatui::widgets::Wrap { trim: false }),
         columns[1],
     );
+}
+
+/// Clip to a display-column budget so one preview row stays one row. Wrapping
+/// here would silently push later rows out of a height-computed overlay.
+fn clip_to_columns(text: &str, columns: usize) -> String {
+    let budget = columns.saturating_sub(1);
+    let mut used = 0usize;
+    let mut clipped = String::new();
+    for character in text.chars() {
+        let width = character.width().unwrap_or(0);
+        if used + width > budget {
+            clipped.push('\u{2026}');
+            return clipped;
+        }
+        used += width;
+        clipped.push(character);
+    }
+    clipped
 }
 
 fn truncate_rendered(text: &str, limit: usize) -> String {
@@ -2191,12 +2947,7 @@ fn input_height(input: &InputState, area: Rect) -> u16 {
 }
 
 #[allow(clippy::too_many_lines)]
-fn render_input(frame: &mut Frame, input: &InputState, strings: &Strings, area: Rect) {
-    let title = match input.target {
-        InputTarget::Task => strings.input_task,
-        InputTarget::Model => strings.input_model,
-        InputTarget::NodePrompt => strings.input_prompt,
-    };
+fn render_input(frame: &mut Frame, input: &InputState, title: &str, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
@@ -2313,23 +3064,26 @@ fn render_template_picker(
         lines.push(Line::from(vec![
             Span::styled(marker, Style::default().fg(Color::Cyan)),
             Span::styled(
-                format!(" {:<24} ", template_label(preview.template)),
+                format!(" {} ", pad_to(preview.template.label(), 24)),
                 name_style,
             ),
-            Span::raw(template_desc(strings, preview.template)),
+            Span::raw(preview.description.clone()),
             Span::styled(current, Style::default().fg(Color::Green)),
         ]));
         lines.push(Line::from(Span::styled(
-            format!(
-                "   {} · {}",
-                fill(
-                    strings.nodes_edges,
-                    &[
-                        ("nodes", &preview.nodes.to_string()),
-                        ("edges", &preview.edges.to_string()),
-                    ],
+            clip_to_columns(
+                &format!(
+                    "   {} · {}",
+                    fill(
+                        strings.nodes_edges,
+                        &[
+                            ("nodes", &preview.nodes.to_string()),
+                            ("edges", &preview.edges.to_string()),
+                        ],
+                    ),
+                    preview.shape
                 ),
-                preview.shape
+                usize::from(area.width.saturating_sub(2)),
             ),
             Style::default().fg(Color::DarkGray),
         )));
@@ -2351,28 +3105,52 @@ fn render_template_picker(
     }
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan))
-                    .title(strings.template_picker_title),
-            )
-            .wrap(ratatui::widgets::Wrap { trim: false }),
+        Paragraph::new(Text::from(lines)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(strings.template_picker_title),
+        ),
         area,
     );
 }
 
-fn render_profile_picker(frame: &mut Frame, app: &App, selected: usize, area: Rect) {
+fn render_profile_picker(
+    frame: &mut Frame,
+    app: &App,
+    selected: usize,
+    target: BindingTarget,
+    area: Rect,
+) {
     let strings = app.strings();
-    let mut lines: Vec<Line> = Vec::new();
+    let bound = match target {
+        BindingTarget::Graph => app.selected_profile().map(ToOwned::to_owned),
+        BindingTarget::Node => app
+            .graph
+            .spec
+            .nodes
+            .get(app.selected_node)
+            .and_then(Node::profile)
+            .map(ToOwned::to_owned),
+    };
+    let scope = match target {
+        BindingTarget::Graph => strings.picker_scope_graph.to_owned(),
+        BindingTarget::Node => fill(
+            strings.picker_scope_node,
+            &[("id", app.selected_node_id().unwrap_or_default())],
+        ),
+    };
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        scope,
+        Style::default().fg(Color::Cyan),
+    ))];
     if app.profiles.is_empty() {
         lines.push(Line::from(strings.status_profile_none));
     }
     for (index, profile) in app.profiles.iter().enumerate() {
         let is_selected = index == selected;
         let marker = if is_selected { "\u{25b8}" } else { " " };
-        let current = if Some(index) == app.profile_index {
+        let current = if bound.as_deref() == Some(profile.name.as_str()) {
             format!(" {}", strings.picker_current)
         } else {
             String::new()
@@ -2409,7 +3187,7 @@ fn render_profile_picker(frame: &mut Frame, app: &App, selected: usize, area: Re
         ]));
     }
     lines.push(Line::from(""));
-    if app.manual_edits {
+    if target == BindingTarget::Graph && app.manual_edits {
         lines.push(Line::from(Span::styled(
             strings.picker_discard_warning,
             Style::default().fg(Color::Yellow),
@@ -2417,22 +3195,82 @@ fn render_profile_picker(frame: &mut Frame, app: &App, selected: usize, area: Re
     } else {
         lines.push(Line::from(Span::styled(
             format!(
-                "{} · {} · {}",
-                strings.key_move, strings.key_apply, strings.key_close
+                "{} · {} · {} · {}",
+                strings.key_move, strings.key_apply, strings.picker_clear_hint, strings.key_close
             ),
             Style::default().fg(Color::DarkGray),
         )));
     }
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan))
-                    .title(strings.profile_picker_title),
-            )
-            .wrap(ratatui::widgets::Wrap { trim: false }),
+        Paragraph::new(Text::from(lines)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(strings.profile_picker_title),
+        ),
+        area,
+    );
+}
+
+fn render_lane_binding(frame: &mut Frame, app: &App, selected: usize, lanes: &[usize], area: Rect) {
+    #![allow(clippy::similar_names)]
+    let strings = app.strings();
+    let id_columns = lanes
+        .iter()
+        .filter_map(|index| app.graph.spec.nodes.get(*index))
+        .map(|node| display_width(&node.id))
+        .max()
+        .unwrap_or_default();
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            clip_to_columns(
+                &fill(strings.lane_intro, &[("count", &lanes.len().to_string())]),
+                usize::from(area.width.saturating_sub(2)),
+            ),
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from(""),
+    ];
+    for (position, node_index) in lanes.iter().enumerate() {
+        let Some(node) = app.graph.spec.nodes.get(*node_index) else {
+            continue;
+        };
+        let marker = if position == selected {
+            "\u{25b8}"
+        } else {
+            " "
+        };
+        let style = if position == selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let binding = app.effective_binding(node);
+        let cells = binding.as_ref().map_or_else(String::new, |binding| {
+            format!("{} / {}", binding.profile.cell(), binding.model.cell())
+        });
+        lines.push(Line::from(vec![
+            Span::styled(marker, Style::default().fg(Color::Cyan)),
+            Span::styled(format!(" {}", pad_to(&node.id, id_columns)), style),
+            Span::raw(format!("  {cells}")),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        strings.binding_inherited_legend,
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(strings.lane_picker_title),
+        ),
         area,
     );
 }
@@ -2492,6 +3330,7 @@ async fn run_loop(
 ) -> Result<()> {
     loop {
         app.drain_run_events().await;
+        app.poll_binding_options();
         terminal.draw(|frame| render(frame, &app))?;
         if !event::poll(Duration::from_millis(50))? {
             continue;
@@ -2569,7 +3408,10 @@ pub async fn launch(repo: PathBuf, trust_project_profiles: bool, lang: Language)
     let guard = TerminalGuard;
     let mut terminal = setup_terminal()?;
     let result = match App::new(repo, trust_project_profiles, lang) {
-        Ok(app) => run_loop(&mut terminal, app).await,
+        Ok(mut app) => {
+            app.start_binding_discovery();
+            run_loop(&mut terminal, app).await
+        }
         Err(error) => Err(error),
     };
     let restore = restore_terminal(&mut terminal);
@@ -2611,6 +3453,390 @@ mod tests {
         assert_eq!(
             template_label(GraphTemplate::ImplementTestLoop),
             "implement-test-loop"
+        );
+    }
+
+    #[test]
+    fn arrows_and_backtab_cycle_screens_both_ways() {
+        let (_repo, mut app) = temp_app();
+        assert_eq!(app.screen, Screen::Overview);
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.screen, Screen::Builder);
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.screen, Screen::Run);
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.screen, Screen::Overview, "right wraps forward");
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.screen, Screen::Run, "left wraps backward");
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.screen, Screen::Builder);
+    }
+
+    #[test]
+    fn arrows_do_not_switch_screens_while_a_picker_is_open() {
+        let (_repo, mut app) = temp_app();
+        app.open_template_picker();
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.screen, Screen::Overview);
+        assert!(app.modal.is_some());
+    }
+
+    fn profile_option(
+        name: &str,
+        runtime_default: bool,
+        default_model: Option<&str>,
+    ) -> ProfileOption {
+        ProfileOption {
+            name: name.to_owned(),
+            kind: "command".to_owned(),
+            enabled: true,
+            runtime_default,
+            default_model: default_model.map(ToOwned::to_owned),
+            models: Vec::new(),
+            discovery: "unsupported".to_owned(),
+            discovery_error: None,
+        }
+    }
+
+    fn only_node(app: &App) -> &Node {
+        app.graph.spec.nodes.first().expect("template has a node")
+    }
+
+    #[test]
+    fn command_nodes_never_show_a_provider_binding() {
+        let (_repo, mut app) = temp_app();
+        app.graph = App::build_graph(GraphTemplate::PlanImplementVerify, "task", None, None);
+        let verify = app
+            .graph
+            .spec
+            .nodes
+            .iter()
+            .find(|node| node.id == "verify")
+            .expect("template has a verify node");
+        assert_eq!(app.effective_binding(verify), None);
+    }
+
+    #[test]
+    fn unset_bindings_stay_descriptive_until_discovery_answers() {
+        let (_repo, mut app) = temp_app();
+        app.graph = App::build_graph(GraphTemplate::Direct, "task", None, None);
+        let strings = Language::En.strings();
+        let binding = app
+            .effective_binding(only_node(&app))
+            .expect("agent nodes bind a provider");
+        assert_eq!(binding.profile.cell(), strings.runtime_default);
+        assert_eq!(binding.model.cell(), strings.provider_default);
+        assert!(
+            !binding.has_inherited(),
+            "nothing to flag while no concrete default is known"
+        );
+    }
+
+    #[test]
+    fn unset_bindings_name_the_runtime_default_once_discovery_lands() {
+        let (_repo, mut app) = temp_app();
+        app.graph = App::build_graph(GraphTemplate::Direct, "task", None, None);
+        app.binding_options = Some(vec![
+            profile_option("codex", false, None),
+            profile_option("claude", true, Some("fable")),
+        ]);
+        let binding = app
+            .effective_binding(only_node(&app))
+            .expect("agent nodes bind a provider");
+        assert_eq!(binding.profile.cell(), "claude*");
+        assert_eq!(binding.model.cell(), "fable*");
+        assert!(binding.has_inherited());
+    }
+
+    #[test]
+    fn explicit_node_bindings_win_and_are_not_flagged() {
+        let (_repo, mut app) = temp_app();
+        app.graph = App::build_graph(
+            GraphTemplate::Direct,
+            "task",
+            Some("codex"),
+            Some("gpt-5.6-sol"),
+        );
+        app.binding_options = Some(vec![profile_option("claude", true, Some("fable"))]);
+        let binding = app
+            .effective_binding(only_node(&app))
+            .expect("agent nodes bind a provider");
+        assert_eq!(binding.profile.cell(), "codex");
+        assert_eq!(binding.model.cell(), "gpt-5.6-sol");
+        assert!(!binding.has_inherited());
+    }
+
+    #[test]
+    fn command_profile_without_a_default_model_is_not_given_an_invented_one() {
+        let (_repo, mut app) = temp_app();
+        app.graph = App::build_graph(GraphTemplate::Direct, "task", Some("claude"), None);
+        app.binding_options = Some(vec![profile_option("claude", true, None)]);
+        let binding = app
+            .effective_binding(only_node(&app))
+            .expect("agent nodes bind a provider");
+        assert_eq!(binding.profile.cell(), "claude");
+        assert_eq!(
+            binding.model.cell(),
+            Language::En.strings().provider_default
+        );
+    }
+
+    fn profiles_of(app: &App) -> Vec<Option<String>> {
+        app.graph
+            .spec
+            .nodes
+            .iter()
+            .map(|node| node.profile().map(ToOwned::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn binding_a_node_leaves_sibling_lanes_untouched() {
+        let (_repo, mut app) = temp_app();
+        app.graph = App::build_graph(GraphTemplate::ParallelResearchReduce, "task", None, None);
+        app.profiles = vec![
+            ProfileChoice {
+                name: "claude".to_owned(),
+                kind: "command".to_owned(),
+                source: wizard::ProfileSource::Builtin,
+                enabled: true,
+                default_model: None,
+            },
+            ProfileChoice {
+                name: "codex".to_owned(),
+                kind: "command".to_owned(),
+                source: wizard::ProfileSource::Builtin,
+                enabled: true,
+                default_model: None,
+            },
+        ];
+        app.selected_node = 1;
+        app.apply_profile_to_node(Some(1));
+        assert_eq!(
+            profiles_of(&app),
+            vec![None, Some("codex".to_owned()), None, None],
+            "only the selected lane is bound"
+        );
+
+        app.selected_node = 2;
+        app.apply_profile_to_node(Some(0));
+        assert_eq!(
+            profiles_of(&app),
+            vec![
+                None,
+                Some("codex".to_owned()),
+                Some("claude".to_owned()),
+                None
+            ],
+            "a second lane binds without resetting the first"
+        );
+
+        app.selected_node = 1;
+        app.apply_profile_to_node(None);
+        assert_eq!(
+            profiles_of(&app),
+            vec![None, None, Some("claude".to_owned()), None],
+            "clearing one lane leaves the others bound"
+        );
+        assert!(app.manual_edits && app.dirty);
+    }
+
+    #[test]
+    fn the_builder_binds_one_node_while_other_screens_bind_the_graph() {
+        let (_repo, mut app) = temp_app();
+        app.screen = Screen::Builder;
+        assert_eq!(app.binding_target(), BindingTarget::Node);
+        app.handle_key(key(KeyCode::Char('p')));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::ProfilePicker {
+                target: BindingTarget::Node,
+                ..
+            })
+        ));
+
+        app.modal = None;
+        app.screen = Screen::Overview;
+        app.handle_key(key(KeyCode::Char('p')));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::ProfilePicker {
+                target: BindingTarget::Graph,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_node_model_edit_does_not_touch_other_nodes() {
+        let (_repo, mut app) = temp_app();
+        app.graph = App::build_graph(GraphTemplate::PlanImplementVerify, "task", None, None);
+        app.screen = Screen::Builder;
+        app.selected_node = 1;
+        app.begin_input(InputTarget::Model(BindingTarget::Node));
+        for character in "gpt-5.6-sol".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        let models: Vec<Option<&str>> = app.graph.spec.nodes.iter().map(Node::model).collect();
+        assert_eq!(models, vec![None, Some("gpt-5.6-sol"), None]);
+        assert_eq!(app.model, None, "the graph-wide override is untouched");
+    }
+
+    #[test]
+    fn parallel_lanes_are_detected_from_edges_not_template_names() {
+        for (template, parallel) in [
+            (GraphTemplate::Direct, false),
+            (GraphTemplate::PlanImplementVerify, false),
+            (GraphTemplate::ImplementTestLoop, false),
+            (GraphTemplate::ParallelResearchReduce, true),
+            (GraphTemplate::DesignWallBounce, true),
+            (GraphTemplate::Council, true),
+            (GraphTemplate::DecomposeFanoutReduce, true),
+        ] {
+            let graph = App::build_graph(template, "task", None, None);
+            assert_eq!(
+                has_parallel_lanes(&graph),
+                parallel,
+                "{} lane detection",
+                template_label(template)
+            );
+        }
+    }
+
+    #[test]
+    fn applying_a_parallel_template_opens_the_lane_list_and_skip_changes_nothing() {
+        let (_repo, mut app) = temp_app();
+        app.apply_template(
+            app.templates
+                .iter()
+                .position(|choice| {
+                    *choice == TemplateChoice::Builtin(GraphTemplate::ParallelResearchReduce)
+                })
+                .expect("template is offered"),
+        );
+        assert!(matches!(app.modal, Some(Modal::LaneBinding { .. })));
+        assert!(app.lane_flow);
+
+        let before = profiles_of(&app);
+        app.handle_key(key(KeyCode::Char('s')));
+        assert!(app.modal.is_none());
+        assert!(!app.lane_flow);
+        assert_eq!(profiles_of(&app), before, "skipping binds nothing");
+    }
+
+    #[test]
+    fn applying_a_serial_template_does_not_interrupt_with_the_lane_list() {
+        let (_repo, mut app) = temp_app();
+        app.apply_template(
+            app.templates
+                .iter()
+                .position(|choice| {
+                    *choice == TemplateChoice::Builtin(GraphTemplate::PlanImplementVerify)
+                })
+                .expect("template is offered"),
+        );
+        assert!(app.modal.is_none());
+        assert!(!app.lane_flow);
+    }
+
+    #[test]
+    fn binding_a_lane_returns_to_the_lane_list() {
+        let (_repo, mut app) = temp_app();
+        app.profiles = vec![ProfileChoice {
+            name: "claude".to_owned(),
+            kind: "command".to_owned(),
+            source: wizard::ProfileSource::Builtin,
+            enabled: true,
+            default_model: None,
+        }];
+        app.apply_template(
+            app.templates
+                .iter()
+                .position(|choice| {
+                    *choice == TemplateChoice::Builtin(GraphTemplate::ParallelResearchReduce)
+                })
+                .expect("template is offered"),
+        );
+        app.handle_key(key(KeyCode::Char('j')));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.modal, Some(Modal::ProfilePicker { .. })));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(app.modal, Some(Modal::LaneBinding { .. })),
+            "binding one lane returns to the list so the next lane can be bound"
+        );
+        assert_eq!(
+            profiles_of(&app)[1],
+            Some("claude".to_owned()),
+            "the second lane is the one bound"
+        );
+    }
+
+    #[test]
+    fn a_saved_template_keeps_its_lane_bindings_when_reapplied() {
+        let (repo, mut app) = temp_app();
+        app.graph = App::build_graph(GraphTemplate::ParallelResearchReduce, "task", None, None);
+        app.selected_node = 0;
+        set_node_profile(
+            app.graph.spec.nodes.get_mut(0).expect("lane 0"),
+            Some("claude".to_owned()),
+        );
+        set_node_profile(
+            app.graph.spec.nodes.get_mut(1).expect("lane 1"),
+            Some("codex".to_owned()),
+        );
+        app.save_as_template("my-panel");
+        assert!(
+            repo.path()
+                .join(templates::TEMPLATES_DIR)
+                .join("my-panel.yaml")
+                .is_file(),
+            "the template lands in the project templates directory"
+        );
+
+        let index = app
+            .templates
+            .iter()
+            .position(|choice| *choice == TemplateChoice::Project("my-panel".to_owned()))
+            .expect("the saved template is offered by the picker");
+        app.apply_template(
+            app.templates
+                .iter()
+                .position(|choice| *choice == TemplateChoice::Builtin(GraphTemplate::Direct))
+                .expect("direct is offered"),
+        );
+        assert_eq!(app.graph.spec.nodes.len(), 1);
+
+        app.apply_template(index);
+        assert_eq!(
+            profiles_of(&app),
+            vec![
+                Some("claude".to_owned()),
+                Some("codex".to_owned()),
+                None,
+                None
+            ],
+            "reapplying the saved template restores its per-lane bindings"
+        );
+    }
+
+    #[test]
+    fn saving_a_template_refuses_bad_names_and_existing_files() {
+        let (_repo, mut app) = temp_app();
+        app.save_as_template("Not Kebab");
+        assert!(app.templates.iter().all(|choice| !matches!(
+            choice,
+            TemplateChoice::Project(name) if name == "Not Kebab"
+        )));
+
+        app.save_as_template("keeper");
+        let saved = app.templates.len();
+        app.save_as_template("keeper");
+        assert_eq!(
+            app.templates.len(),
+            saved,
+            "a second save under the same name does not silently replace the first"
         );
     }
 
@@ -2856,7 +4082,7 @@ mod tests {
     #[tokio::test]
     async fn model_input_still_commits_on_plain_enter() {
         let (_repo, mut app) = temp_app();
-        app.begin_input(InputTarget::Model);
+        app.begin_input(InputTarget::Model(BindingTarget::Graph));
         for character in "fast-model".chars() {
             app.handle_key(key(KeyCode::Char(character)));
         }
@@ -2914,7 +4140,10 @@ mod tests {
         app.handle_key(key(KeyCode::Char('j')));
         app.handle_key(key(KeyCode::Enter));
         assert!(app.modal.is_none());
-        assert_eq!(app.template, GraphTemplate::PlanImplementVerify);
+        assert_eq!(
+            app.template,
+            TemplateChoice::Builtin(GraphTemplate::PlanImplementVerify)
+        );
         assert!(app.dirty);
         assert!(!app.manual_edits);
         assert_eq!(graph_shape(&app.graph), "plan -> implement -> verify");
@@ -2933,7 +4162,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('j')));
         app.handle_key(key(KeyCode::Esc));
         assert!(app.modal.is_none());
-        assert_eq!(app.template, GraphTemplate::Direct);
+        assert_eq!(app.template, TemplateChoice::Builtin(GraphTemplate::Direct));
         assert_eq!(app.graph, before);
     }
 
