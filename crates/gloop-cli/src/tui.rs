@@ -2300,8 +2300,9 @@ fn help_lines(lang: Language) -> Vec<String> {
         format!("i — {}  ·  m — {}", s.key_task, s.key_model),
         format!("t — {}  ·  p — {}", s.key_template, s.key_profile),
         format!("v — {}  ·  s — {}", s.key_validate, s.key_save),
-        format!("r — {}  ·  o — output", s.key_run),
+        format!("r — {}  ·  o — {}", s.key_run, s.key_output),
         format!("? — {}  ·  l — {}", s.key_help, s.key_lang),
+        format!("b — {}  ·  S — {}", s.key_lanes, s.key_save_template),
         format!("q — {}", s.key_quit),
     ]
 }
@@ -2443,12 +2444,13 @@ fn render(frame: &mut Frame, app: &App) {
         }
         Some(Modal::Help { offset }) => {
             let lines = help_lines(app.lang);
+            let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
             render_scroll_overlay(
                 frame,
                 strings.help_title,
                 &lines,
                 *offset,
-                centered_rect(84, 21, area),
+                centered_rect(84, height, area),
                 Color::Cyan,
             );
         }
