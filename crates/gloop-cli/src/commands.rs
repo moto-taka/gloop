@@ -431,7 +431,7 @@ pub fn build_profile_choices(
     Ok(choices)
 }
 
-async fn gui_profile_options(
+pub(crate) async fn resolve_profile_options(
     repo: &Path,
     trust_project_profiles: bool,
     choices: &[wizard::ProfileChoice],
@@ -1196,7 +1196,7 @@ pub async fn graph_init(
             graph.metadata.description = Some(description);
         }
         let profile_options =
-            match gui_profile_options(&repo, trust_project_profiles, &profiles).await {
+            match resolve_profile_options(&repo, trust_project_profiles, &profiles).await {
                 Ok(options) => options,
                 Err(error) => return provider_store_error(error),
             };
@@ -1857,7 +1857,7 @@ pub async fn graph_edit(
 
     if gui_mode {
         let profile_options =
-            match gui_profile_options(&repo, trust_project_profiles, &profiles).await {
+            match resolve_profile_options(&repo, trust_project_profiles, &profiles).await {
                 Ok(options) => options,
                 Err(error) => return provider_store_error(error),
             };
