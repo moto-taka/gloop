@@ -526,8 +526,17 @@ harness choice appeared to apply to everything, no model was visible, and
    two provider nodes with no directed path between them — not from a list of
    template names, so project templates behave the same.
 
-Still open after 0.7.0: saving the current graph as a project template and
-offering project templates in the picker (see §7, still unimplemented).
+6. **Project templates.** `S` saves the current graph to
+   `.gloop/templates/<name>.yaml` after the same name and strict-template
+   validation `graph init` uses, refusing to replace an existing file so a name
+   collision cannot overwrite someone's template. The picker lists builtins and
+   project templates together, previewing each one's description, node/edge
+   counts, and shape. Applying a project template loads its YAML as user content
+   and does **not** overlay the graph-wide profile/model, because a saved
+   template's per-lane bindings are the reason to save it.
+   Consequently graph-wide `p` now binds every provider node in the current
+   graph instead of rebuilding from the template — matching what `m` already did
+   and what the "applied to agent-like nodes" status line always claimed.
 
 ## 16. v0.7.0 localization completeness, real bindings, arrow navigation
 

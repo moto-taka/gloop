@@ -47,8 +47,8 @@ use unicode_width::UnicodeWidthChar;
 use crate::{
     atomic_write::{self, write_text_atomic_if_unchanged_sync},
     commands::{
-        apply_model_to_agent_nodes, build_profile_choices, clear_model_on_agent_nodes,
-        resolve_profile_options,
+        apply_model_to_agent_nodes, apply_profile_to_agent_nodes, build_profile_choices,
+        clear_model_on_agent_nodes, resolve_profile_options,
     },
     gui::ProfileOption,
     i18n::{Language, Strings, fill},
@@ -56,7 +56,40 @@ use crate::{
     wizard::{self, EditorState, GraphTemplate, ProfileChoice},
 };
 
-const TEMPLATE_CHOICES: [GraphTemplate; 8] = [
+/// A template the picker can offer: a code-generated builtin or a YAML file
+/// under `.gloop/templates`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TemplateChoice {
+    Builtin(GraphTemplate),
+    Project(String),
+}
+
+impl TemplateChoice {
+    fn label(&self) -> &str {
+        match self {
+            Self::Builtin(template) => template_label(*template),
+            Self::Project(name) => name,
+        }
+    }
+}
+
+fn template_choices(repo: &Path) -> Vec<TemplateChoice> {
+    let mut choices: Vec<TemplateChoice> = BUILTIN_TEMPLATES
+        .iter()
+        .copied()
+        .map(TemplateChoice::Builtin)
+        .collect();
+    if let Ok(entries) = templates::list_project_templates(repo) {
+        choices.extend(
+            entries
+                .into_iter()
+                .map(|entry| TemplateChoice::Project(entry.name)),
+        );
+    }
+    choices
+}
+
+const BUILTIN_TEMPLATES: [GraphTemplate; 8] = [
     GraphTemplate::Direct,
     GraphTemplate::PlanImplementVerify,
     GraphTemplate::ParallelResearchReduce,
@@ -106,11 +139,12 @@ enum InputTarget {
     Task,
     Model(BindingTarget),
     NodePrompt,
+    TemplateName,
 }
 
 impl InputTarget {
     const fn multiline(self) -> bool {
-        !matches!(self, Self::Model(_))
+        !matches!(self, Self::Model(_) | Self::TemplateName)
     }
 }
 
@@ -127,7 +161,8 @@ struct InputState {
 
 #[derive(Debug)]
 struct TemplatePreview {
-    template: GraphTemplate,
+    template: TemplateChoice,
+    description: String,
     shape: String,
     nodes: usize,
     edges: usize,
@@ -216,7 +251,8 @@ struct App {
     lang: Language,
     screen: Screen,
     graph: Graph,
-    template: GraphTemplate,
+    templates: Vec<TemplateChoice>,
+    template: TemplateChoice,
     template_index: usize,
     task: String,
     model: Option<String>,
@@ -314,7 +350,8 @@ impl App {
             .iter()
             .find_map(Node::model)
             .map(str::to_owned);
-        let template = GraphTemplate::Direct;
+        let templates = template_choices(&repo);
+        let template = TemplateChoice::Builtin(GraphTemplate::Direct);
         // A graph loaded from disk is treated as user content: applying a
         // template replaces it, so the pickers warn about it.
         let manual_edits = expected_sha256.is_some();
@@ -328,6 +365,7 @@ impl App {
             lang,
             screen: Screen::Overview,
             graph,
+            templates,
             template,
             template_index: 0,
             task,
@@ -442,6 +480,9 @@ impl App {
             profile.map(|value| vec![value.to_owned()]),
             None,
         );
+        if let Some(profile) = profile {
+            apply_profile_to_agent_nodes(&mut graph, profile);
+        }
         if let Some(model) = model {
             apply_model_to_agent_nodes(&mut graph, model);
         }
@@ -460,34 +501,47 @@ impl App {
     /// Manual node edits are replaced; callers surface that through the
     /// picker warning and the post-apply status message.
     fn rebuild_from_choices(&mut self) {
-        self.graph = Self::build_graph(
-            self.template,
-            &self.task,
-            self.selected_profile(),
-            self.model.as_deref(),
-        );
+        match self.template.clone() {
+            TemplateChoice::Builtin(template) => {
+                self.graph = Self::build_graph(
+                    template,
+                    &self.task,
+                    self.selected_profile(),
+                    self.model.as_deref(),
+                );
+                self.manual_edits = false;
+            }
+            TemplateChoice::Project(name) => {
+                let resolved = templates::resolve_template(&name, &self.repo);
+                let Ok(templates::ResolvedTemplate::Project(graph)) = resolved else {
+                    self.status = fill(
+                        self.strings().template_save_failed,
+                        &[("error", self.strings().template_load_failed)],
+                    );
+                    return;
+                };
+                self.graph = *graph;
+                templates::apply_new_overrides(&mut self.graph, "work", &self.task);
+                // A saved template carries its own per-node bindings; the
+                // graph-wide selection must not overwrite them on load.
+                self.manual_edits = true;
+            }
+        }
         self.selected_node = 0;
         self.connect_from = None;
         self.dirty = true;
-        self.manual_edits = false;
     }
 
     fn apply_template(&mut self, index: usize) {
+        let Some(choice) = self.templates.get(index).cloned() else {
+            return;
+        };
         let had_edits = self.manual_edits;
         self.template_index = index;
-        self.template = TEMPLATE_CHOICES[index];
+        self.template = choice;
         self.rebuild_from_choices();
         let strings = self.strings();
-        let template = match self.template {
-            GraphTemplate::Direct => strings.template_desc_direct,
-            GraphTemplate::PlanImplementVerify => strings.template_desc_plan_implement_verify,
-            GraphTemplate::ParallelResearchReduce => strings.template_desc_parallel_research_reduce,
-            GraphTemplate::ReviewFixLoop => strings.template_desc_review_fix_loop,
-            GraphTemplate::DesignWallBounce => strings.template_desc_design_wall_bounce,
-            GraphTemplate::Council => strings.template_desc_council,
-            GraphTemplate::DecomposeFanoutReduce => strings.template_desc_decompose_fanout_reduce,
-            GraphTemplate::ImplementTestLoop => strings.template_desc_implement_test_loop,
-        };
+        let description = self.template_description(&self.template);
         let shape = graph_shape(&self.graph);
         let key = if had_edits {
             strings.status_template_edits_discarded
@@ -497,8 +551,8 @@ impl App {
         self.status = fill(
             key,
             &[
-                ("name", template_label(self.template)),
-                ("shape", &format!("{shape} ({template})")),
+                ("name", self.template.label()),
+                ("shape", &format!("{shape} ({description})")),
             ],
         );
         if has_parallel_lanes(&self.graph) {
@@ -506,6 +560,26 @@ impl App {
         }
     }
 
+    fn template_description(&self, choice: &TemplateChoice) -> String {
+        match choice {
+            TemplateChoice::Builtin(template) => {
+                template_desc(self.strings(), *template).to_owned()
+            }
+            TemplateChoice::Project(name) => templates::list_project_templates(&self.repo)
+                .ok()
+                .and_then(|entries| {
+                    entries
+                        .into_iter()
+                        .find(|entry| entry.name == *name)
+                        .and_then(|entry| entry.description)
+                })
+                .unwrap_or_else(|| self.strings().picker_source_project.to_owned()),
+        }
+    }
+
+    /// Bind every provider node at once. This edits the current graph in place
+    /// rather than rebuilding from the template, so prompts and topology the
+    /// user already has survive, and a loaded project template keeps its shape.
     fn apply_profile(&mut self, index: usize) {
         let Some(profile) = self.profiles.get(index) else {
             return;
@@ -513,36 +587,56 @@ impl App {
         if !profile.enabled {
             return;
         }
-        let had_edits = self.manual_edits;
+        let name = profile.name.clone();
         self.profile_index = Some(index);
-        self.rebuild_from_choices();
-        let strings = self.strings();
-        let mut status = fill(
-            strings.status_profile_applied,
-            &[("name", self.selected_profile().unwrap_or_default())],
-        );
-        if had_edits {
-            status.push(' ');
-            status.push_str(strings.status_edits_discarded_note);
-        }
-        self.status = status;
+        apply_profile_to_agent_nodes(&mut self.graph, &name);
+        self.dirty = true;
+        self.status = fill(self.strings().status_profile_applied, &[("name", &name)]);
     }
 
     fn open_template_picker(&mut self) {
-        let previews = TEMPLATE_CHOICES
+        self.templates = template_choices(&self.repo);
+        self.template_index = self
+            .templates
             .iter()
-            .map(|template| {
-                let graph = Self::build_graph(
-                    *template,
-                    &self.task,
-                    self.selected_profile(),
-                    self.model.as_deref(),
+            .position(|choice| *choice == self.template)
+            .unwrap_or(0);
+        let previews = self
+            .templates
+            .clone()
+            .into_iter()
+            .map(|choice| {
+                let description = self.template_description(&choice);
+                let graph = match &choice {
+                    TemplateChoice::Builtin(template) => Some(Self::build_graph(
+                        *template,
+                        &self.task,
+                        self.selected_profile(),
+                        self.model.as_deref(),
+                    )),
+                    TemplateChoice::Project(name) => {
+                        match templates::resolve_template(name, &self.repo) {
+                            Ok(templates::ResolvedTemplate::Project(graph)) => Some(*graph),
+                            _ => None,
+                        }
+                    }
+                };
+                let (shape, nodes, edges) = graph.map_or_else(
+                    || (self.strings().template_load_failed.to_owned(), 0, 0),
+                    |graph| {
+                        (
+                            graph_shape(&graph),
+                            graph.spec.nodes.len(),
+                            graph.spec.edges.len(),
+                        )
+                    },
                 );
                 TemplatePreview {
-                    template: *template,
-                    shape: graph_shape(&graph),
-                    nodes: graph.spec.nodes.len(),
-                    edges: graph.spec.edges.len(),
+                    template: choice,
+                    description,
+                    shape,
+                    nodes,
+                    edges,
                 }
             })
             .collect();
@@ -666,6 +760,7 @@ impl App {
     fn begin_input(&mut self, target: InputTarget) {
         let value = match target {
             InputTarget::Task => self.task.clone(),
+            InputTarget::TemplateName => String::new(),
             InputTarget::Model(BindingTarget::Graph) => self.model.clone().unwrap_or_default(),
             InputTarget::Model(BindingTarget::Node) => {
                 let Some(node) = self.graph.spec.nodes.get(self.selected_node) else {
@@ -758,6 +853,7 @@ impl App {
                 };
                 self.close_sub_modal();
             }
+            InputTarget::TemplateName => self.save_as_template(&value),
             InputTarget::NodePrompt => {
                 let Some(node) = self.graph.spec.nodes.get_mut(self.selected_node) else {
                     self.set_status(self.strings().status_no_node);
@@ -1269,6 +1365,10 @@ impl App {
                 self.open_lane_binding();
                 Action::Continue
             }
+            KeyCode::Char('S') => {
+                self.begin_input(InputTarget::TemplateName);
+                Action::Continue
+            }
             KeyCode::Char('v') => {
                 self.validate_and_show_issues();
                 Action::Continue
@@ -1747,6 +1847,34 @@ impl App {
             lines,
             offset: 0,
         });
+    }
+
+    /// Write the current graph to `.gloop/templates/<name>.yaml`. Refuses to
+    /// replace an existing file so a name collision cannot silently overwrite
+    /// someone's template.
+    fn save_as_template(&mut self, name: &str) {
+        if let Err(error) = self.write_template(name) {
+            self.status = fill(self.strings().template_save_failed, &[("error", &error)]);
+            return;
+        }
+        self.templates = template_choices(&self.repo);
+        self.template = TemplateChoice::Project(name.to_owned());
+        self.template_index = self
+            .templates
+            .iter()
+            .position(|choice| *choice == self.template)
+            .unwrap_or(0);
+        self.status = fill(self.strings().template_saved, &[("name", name)]);
+    }
+
+    fn write_template(&self, name: &str) -> std::result::Result<(), String> {
+        templates::validate_init_template_name(name)?;
+        templates::strict_validate_project_template(&self.graph)?;
+        templates::ensure_managed_directory(&self.repo, Path::new(templates::TEMPLATES_DIR))
+            .map_err(|error| error.to_string())?;
+        let yaml = self.graph.to_yaml().map_err(|error| error.to_string())?;
+        let path = templates::template_path(&self.repo, name);
+        atomic_write::write_text_no_replace_sync(&path, &yaml).map_err(|error| error.to_string())
     }
 
     async fn save(&mut self) -> Result<()> {
@@ -2238,6 +2366,8 @@ fn render(frame: &mut Frame, app: &App) {
         Span::raw(format!(" {}  ", strings.key_run)),
         Span::styled("s", Style::default().fg(Color::Yellow)),
         Span::raw(format!(" {}  ", strings.key_save)),
+        Span::styled("S", Style::default().fg(Color::Yellow)),
+        Span::raw(format!(" {}  ", strings.key_save_template)),
         Span::styled("?", Style::default().fg(Color::Cyan)),
         Span::raw(format!(" {}  ", strings.key_help)),
         Span::styled("l", Style::default().fg(Color::Cyan)),
@@ -2266,6 +2396,7 @@ fn render(frame: &mut Frame, app: &App) {
                     &[("id", app.selected_node_id().unwrap_or_default())],
                 ),
                 InputTarget::NodePrompt => strings.input_prompt.to_owned(),
+                InputTarget::TemplateName => strings.input_template_name.to_owned(),
             };
             render_input(frame, input, &title, centered_rect(90, height, area));
         }
@@ -2376,7 +2507,7 @@ fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled(pad_label(strings.label_template), label_style),
-            Span::raw(template_label(app.template)),
+            Span::raw(app.template.label().to_owned()),
         ]),
         Line::from(vec![
             Span::styled(pad_label(strings.label_profile), label_style),
@@ -2931,10 +3062,10 @@ fn render_template_picker(
         lines.push(Line::from(vec![
             Span::styled(marker, Style::default().fg(Color::Cyan)),
             Span::styled(
-                format!(" {:<24} ", template_label(preview.template)),
+                format!(" {} ", pad_to(preview.template.label(), 24)),
                 name_style,
             ),
-            Span::raw(template_desc(strings, preview.template)),
+            Span::raw(preview.description.clone()),
             Span::styled(current, Style::default().fg(Color::Green)),
         ]));
         lines.push(Line::from(Span::styled(
@@ -3575,9 +3706,11 @@ mod tests {
     fn applying_a_parallel_template_opens_the_lane_list_and_skip_changes_nothing() {
         let (_repo, mut app) = temp_app();
         app.apply_template(
-            TEMPLATE_CHOICES
+            app.templates
                 .iter()
-                .position(|template| *template == GraphTemplate::ParallelResearchReduce)
+                .position(|choice| {
+                    *choice == TemplateChoice::Builtin(GraphTemplate::ParallelResearchReduce)
+                })
                 .expect("template is offered"),
         );
         assert!(matches!(app.modal, Some(Modal::LaneBinding { .. })));
@@ -3594,9 +3727,11 @@ mod tests {
     fn applying_a_serial_template_does_not_interrupt_with_the_lane_list() {
         let (_repo, mut app) = temp_app();
         app.apply_template(
-            TEMPLATE_CHOICES
+            app.templates
                 .iter()
-                .position(|template| *template == GraphTemplate::PlanImplementVerify)
+                .position(|choice| {
+                    *choice == TemplateChoice::Builtin(GraphTemplate::PlanImplementVerify)
+                })
                 .expect("template is offered"),
         );
         assert!(app.modal.is_none());
@@ -3614,9 +3749,11 @@ mod tests {
             default_model: None,
         }];
         app.apply_template(
-            TEMPLATE_CHOICES
+            app.templates
                 .iter()
-                .position(|template| *template == GraphTemplate::ParallelResearchReduce)
+                .position(|choice| {
+                    *choice == TemplateChoice::Builtin(GraphTemplate::ParallelResearchReduce)
+                })
                 .expect("template is offered"),
         );
         app.handle_key(key(KeyCode::Char('j')));
@@ -3631,6 +3768,73 @@ mod tests {
             profiles_of(&app)[1],
             Some("claude".to_owned()),
             "the second lane is the one bound"
+        );
+    }
+
+    #[test]
+    fn a_saved_template_keeps_its_lane_bindings_when_reapplied() {
+        let (repo, mut app) = temp_app();
+        app.graph = App::build_graph(GraphTemplate::ParallelResearchReduce, "task", None, None);
+        app.selected_node = 0;
+        set_node_profile(
+            app.graph.spec.nodes.get_mut(0).expect("lane 0"),
+            Some("claude".to_owned()),
+        );
+        set_node_profile(
+            app.graph.spec.nodes.get_mut(1).expect("lane 1"),
+            Some("codex".to_owned()),
+        );
+        app.save_as_template("my-panel");
+        assert!(
+            repo.path()
+                .join(templates::TEMPLATES_DIR)
+                .join("my-panel.yaml")
+                .is_file(),
+            "the template lands in the project templates directory"
+        );
+
+        let index = app
+            .templates
+            .iter()
+            .position(|choice| *choice == TemplateChoice::Project("my-panel".to_owned()))
+            .expect("the saved template is offered by the picker");
+        app.apply_template(
+            app.templates
+                .iter()
+                .position(|choice| *choice == TemplateChoice::Builtin(GraphTemplate::Direct))
+                .expect("direct is offered"),
+        );
+        assert_eq!(app.graph.spec.nodes.len(), 1);
+
+        app.apply_template(index);
+        assert_eq!(
+            profiles_of(&app),
+            vec![
+                Some("claude".to_owned()),
+                Some("codex".to_owned()),
+                None,
+                None
+            ],
+            "reapplying the saved template restores its per-lane bindings"
+        );
+    }
+
+    #[test]
+    fn saving_a_template_refuses_bad_names_and_existing_files() {
+        let (_repo, mut app) = temp_app();
+        app.save_as_template("Not Kebab");
+        assert!(app.templates.iter().all(|choice| !matches!(
+            choice,
+            TemplateChoice::Project(name) if name == "Not Kebab"
+        )));
+
+        app.save_as_template("keeper");
+        let saved = app.templates.len();
+        app.save_as_template("keeper");
+        assert_eq!(
+            app.templates.len(),
+            saved,
+            "a second save under the same name does not silently replace the first"
         );
     }
 
@@ -3934,7 +4138,10 @@ mod tests {
         app.handle_key(key(KeyCode::Char('j')));
         app.handle_key(key(KeyCode::Enter));
         assert!(app.modal.is_none());
-        assert_eq!(app.template, GraphTemplate::PlanImplementVerify);
+        assert_eq!(
+            app.template,
+            TemplateChoice::Builtin(GraphTemplate::PlanImplementVerify)
+        );
         assert!(app.dirty);
         assert!(!app.manual_edits);
         assert_eq!(graph_shape(&app.graph), "plan -> implement -> verify");
@@ -3953,7 +4160,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('j')));
         app.handle_key(key(KeyCode::Esc));
         assert!(app.modal.is_none());
-        assert_eq!(app.template, GraphTemplate::Direct);
+        assert_eq!(app.template, TemplateChoice::Builtin(GraphTemplate::Direct));
         assert_eq!(app.graph, before);
     }
 
