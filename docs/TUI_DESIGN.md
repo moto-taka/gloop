@@ -513,9 +513,21 @@ harness choice appeared to apply to everything, no model was visible, and
    rows silently pushed entries out of a height-computed overlay: with eight
    templates the last two and the key hints were unreachable.
 
-Still open after 0.7.0: per-node profile/model editing, a lane-assignment step
-after applying a parallel template, and saving the current graph as a project
-template (see §5 and §7, still unimplemented).
+4. **Per-node bindings.** `p` and `m` bind the whole graph from the Overview and
+   the selected node from the Builder, so sibling lanes keep the bindings they
+   already have; `Backspace` in the picker clears a binding back to the default.
+   Binding one node edits that node in place instead of rebuilding from the
+   template, which is what made a single harness choice look like it applied to
+   everything.
+5. **Lane assignment.** Applying a template that has parallel lanes opens a lane
+   list: `Enter` picks the harness for a lane, `m` its model, `s` skips and keeps
+   every default, and `b` reopens it later. Binding a lane returns to the list so
+   several lanes can be bound in one pass. "Parallel" is derived from the graph —
+   two provider nodes with no directed path between them — not from a list of
+   template names, so project templates behave the same.
+
+Still open after 0.7.0: saving the current graph as a project template and
+offering project templates in the picker (see §7, still unimplemented).
 
 ## 16. v0.7.0 localization completeness, real bindings, arrow navigation
 
