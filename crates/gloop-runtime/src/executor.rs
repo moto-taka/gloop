@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
+    fmt::Write as _,
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
@@ -220,19 +221,33 @@ pub struct ProgressEvent {
     pub run_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
     pub kind: RunEventKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub data: Value,
 }
 
 impl From<&RunEvent> for ProgressEvent {
     fn from(event: &RunEvent) -> Self {
+        let data = match event.kind {
+            RunEventKind::RunStarted | RunEventKind::NodeStarted => event.data.clone(),
+            RunEventKind::NodeOutput => event.data.get("artifacts_written").cloned().map_or(
+                Value::Null,
+                |artifacts_written| json!({ "artifacts_written": artifacts_written }),
+            ),
+            _ => Value::Null,
+        };
         Self {
             sequence: event.sequence,
             run_id: event.run_id.clone(),
             node_id: event.node_id.clone(),
+            attempt: event.attempt,
             kind: event.kind,
             message: event.message.clone(),
+            data,
         }
     }
 }
@@ -458,7 +473,11 @@ impl Runtime {
                 RunEventKind::RunStarted,
                 None,
                 None,
-                None,
+                Some(format!(
+                    "{} nodes queued · max parallel {}",
+                    graph.spec.nodes.len(),
+                    max_parallel
+                )),
                 json!({
                     "graph_hash": graph_hash,
                     "graph_name": graph.metadata.name,
@@ -3365,6 +3384,47 @@ mod tests {
         assert_eq!(replay.nodes["node"].status, summary.nodes["node"].status);
         assert!(!replay.truncated_tail);
     }
+
+    #[tokio::test]
+    async fn progress_events_explain_provider_work_and_artifacts() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let provider = Arc::new(FakeProvider::new(FakeMode::Echo, Duration::ZERO));
+        let (runtime, mut options) = runtime(&temporary, provider);
+        let (sender, mut progress) = mpsc::unbounded_channel();
+        options.progress = Some(sender);
+        let graph = Graph::new(
+            "progress",
+            "progress test",
+            vec![Node::agent("node", "output")],
+        );
+
+        runtime.run(&graph, options).await.expect("run completes");
+        let events = std::iter::from_fn(|| progress.try_recv().ok()).collect::<Vec<_>>();
+        let started = events
+            .iter()
+            .find(|event| event.kind == RunEventKind::NodeStarted)
+            .expect("node started event");
+        assert!(
+            started
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("attempt 1/1"))
+        );
+        assert!(
+            started
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("output budget"))
+        );
+        let output = events
+            .iter()
+            .find(|event| event.kind == RunEventKind::NodeOutput)
+            .expect("node output event");
+        assert_eq!(
+            output.message.as_deref(),
+            Some("output received · artifacts written")
+        );
+    }
 }
 
 type NodeFuture = Pin<
@@ -3419,15 +3479,53 @@ impl Runtime {
         for attempt in 1..=max_attempts {
             outcome.attempts = attempt;
             let requested_profile = profile_for_attempt(&input.node, attempt);
+            let requested_model = input.node.model();
+            let fan_out = input.node.fan_out();
+            let provider_backed = matches!(
+                &input.node.kind,
+                NodeKind::Agent { .. } | NodeKind::Reduce { .. } | NodeKind::Synthesize { .. }
+            );
+            let output_budget = input.node.output().map(|output| {
+                if provider_backed {
+                    fanout_candidate_output_limit(output.max_bytes, fan_out, output.format)
+                        .map_or(output.max_bytes, |limit| limit)
+                } else {
+                    output.max_bytes
+                }
+            });
+            let mut started_message = format!("attempt {attempt}/{max_attempts}");
+            if provider_backed {
+                let _ = write!(
+                    &mut started_message,
+                    " · profile {}{} · {} lane{}",
+                    requested_profile.unwrap_or("runtime default"),
+                    requested_model
+                        .map(|model| format!(" · model {model}"))
+                        .unwrap_or_default(),
+                    fan_out,
+                    if fan_out == 1 { "" } else { "s" }
+                );
+            }
+            if let Some(limit) = output_budget {
+                let _ = write!(
+                    &mut started_message,
+                    " · output budget {limit} B{}",
+                    if provider_backed { "/lane" } else { "" }
+                );
+            }
             context
                 .emit(
                     RunEventKind::NodeStarted,
                     Some(&input.qualified_id),
                     Some(attempt),
-                    None,
+                    Some(started_message),
                     json!({
+                        "provider_backed": provider_backed,
                         "profile": requested_profile,
-                        "fan_out": input.node.fan_out(),
+                        "model": requested_model,
+                        "fan_out": fan_out,
+                        "max_attempts": max_attempts,
+                        "output_budget": output_budget,
                     }),
                 )
                 .await?;
@@ -3563,8 +3661,9 @@ impl Runtime {
                             RunEventKind::NodeOutput,
                             Some(&input.qualified_id),
                             Some(attempt),
-                            None,
+                            Some("output received · artifacts written".to_owned()),
                             json!({
+                                "artifacts_written": true,
                                 "output": success.value,
                                 "output_artifact": artifacts.output,
                                 "stdout_artifact": artifacts.stdout,

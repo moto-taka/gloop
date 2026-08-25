@@ -36,6 +36,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs},
 };
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::{
     sync::{mpsc, oneshot},
@@ -297,7 +298,7 @@ struct App {
     last_summary: Option<RunSummary>,
     last_run_id: Option<String>,
     announced_run: bool,
-    events: VecDeque<String>,
+    events: VecDeque<ProgressEvent>,
     /// Inside the lane-assignment flow, so closing a per-node editor returns
     /// to the lane list instead of dropping the user back to the graph.
     lane_flow: bool,
@@ -2142,16 +2143,7 @@ impl App {
         {
             self.node_status.insert(node.to_owned(), status);
         }
-        let node = event.node_id.as_deref().unwrap_or("run");
-        let message = event.message.as_deref().unwrap_or_default();
-        let line = format!(
-            "{:>4} {:<22} {:<18} {}",
-            event.sequence,
-            node,
-            event_kind_label(event.kind, self.lang),
-            message
-        );
-        self.events.push_back(line);
+        self.events.push_back(event.clone());
         while self.events.len() > 80 {
             self.events.pop_front();
         }
@@ -3261,19 +3253,30 @@ fn render_run(frame: &mut Frame, app: &App, area: Rect) {
                 .copied()
                 .unwrap_or(NodeStatus::Pending);
             let (symbol, color) = status_symbol(status);
+            let lane_label = node_fanout_lanes(node).map(|total| {
+                let total = total.to_string();
+                fill(strings.run_lane_label, &[("total", &total)])
+            });
             let marker = if index == app.selected_node {
                 "▸"
             } else {
                 " "
             };
-            ListItem::new(Line::from(vec![
+            let mut row = vec![
                 Span::styled(format!("{marker} {symbol} "), Style::default().fg(color)),
-                Span::raw(format!("{:<18} ", node.id)),
+                Span::raw(format!("{:<15} ", node.id)),
                 Span::styled(
                     node_status_label(status, app.lang),
                     Style::default().fg(color),
                 ),
-            ]))
+            ];
+            if let Some(lane_label) = lane_label {
+                row.push(Span::styled(
+                    format!(" {lane_label}"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            ListItem::new(Line::from(row))
         })
         .collect::<Vec<_>>();
     let title = if app.active_run.is_some() {
@@ -3292,15 +3295,90 @@ fn render_run(frame: &mut Frame, app: &App, area: Rect) {
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     ))];
-    lines.extend(app.events.iter().cloned().map(Line::from));
+    let selected_node = app.selected_node_id();
+    let selected_event_limit = if app.last_summary.is_some() { 2 } else { 4 };
+    let selected_events =
+        selected_node_recent_events(&app.events, selected_node, selected_event_limit, app.lang);
+    let waiting_message = run_waiting_message(app);
+    let detail_lines = run_detail_lines(
+        app,
+        selected_node,
+        selected_events.len(),
+        waiting_message.is_some(),
+    );
+    let event_capacity = usize::from(area.height.saturating_sub(2))
+        .saturating_sub(detail_lines)
+        .max(1);
+    let line_width = usize::from(columns[1].width.saturating_sub(2));
+    if app.events.is_empty() {
+        if let Some(message) = &waiting_message {
+            lines.push(Line::from(Span::styled(
+                clip_to_columns(message, line_width),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    } else {
+        lines.extend(app.events.iter().rev().take(event_capacity).map(|event| {
+            Line::from(clip_to_columns(
+                &progress_event_line(event, app.lang),
+                line_width,
+            ))
+        }));
+    }
+    if !app.events.is_empty()
+        && let Some(message) = &waiting_message
+    {
+        lines.push(Line::from(Span::styled(
+            clip_to_columns(message, line_width),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::from(""));
+    if let Some(node_id) = selected_node {
+        let status = app
+            .last_summary
+            .as_ref()
+            .and_then(|summary| summary.nodes.get(node_id))
+            .map_or_else(
+                || {
+                    app.node_status
+                        .get(node_id)
+                        .copied()
+                        .unwrap_or(NodeStatus::Pending)
+                },
+                |outcome| outcome.status,
+            );
+        let selected_line = fill(
+            strings.run_selected,
+            &[
+                ("id", node_id),
+                ("status", node_status_label(status, app.lang)),
+            ],
+        );
+        lines.push(Line::from(clip_to_columns(&selected_line, line_width)));
+        if selected_events.is_empty() {
+            lines.push(Line::from("  -"));
+        } else {
+            lines.extend(selected_events.into_iter().map(|value| {
+                Line::from(format!(
+                    "  {}",
+                    clip_to_columns(&value, line_width.saturating_sub(2))
+                ))
+            }));
+        }
+    }
     if let Some(run_id) = &app.last_run_id {
         lines.push(Line::from(""));
+        let run_dir = format!(".gloop/runs/{run_id}");
         lines.push(Line::from(vec![
             Span::styled(
-                format!("{}: ", strings.run_dir_label),
+                format!("{} ", strings.run_dir_label),
                 Style::default().fg(Color::DarkGray),
             ),
-            Span::raw(format!(".gloop/runs/{run_id}")),
+            Span::raw(clip_to_columns(
+                &run_dir,
+                line_width.saturating_sub(strings.run_dir_label.len() + 1),
+            )),
         ]));
     }
     if let Some(summary) = &app.last_summary {
@@ -3311,39 +3389,36 @@ fn render_run(frame: &mut Frame, app: &App, area: Rect) {
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         )));
-        lines.push(Line::from(fill(
+        let status_line = fill(
             strings.run_status_label,
             &[("status", final_status_label(summary.status, app.lang))],
-        )));
-        lines.push(Line::from(fill(
+        );
+        lines.push(Line::from(clip_to_columns(&status_line, line_width)));
+        let meta_line = fill(
             strings.run_meta,
             &[
                 ("id", &summary.run_id),
                 ("ms", &summary.duration_ms.to_string()),
             ],
-        )));
+        );
+        lines.push(Line::from(clip_to_columns(&meta_line, line_width)));
         if let Some(node) = app.graph.spec.nodes.get(app.selected_node)
             && let Some(outcome) = summary.nodes.get(&node.id)
         {
-            lines.push(Line::from(fill(
-                strings.run_selected,
-                &[
-                    ("id", &node.id),
-                    ("status", node_status_label(outcome.status, app.lang)),
-                ],
-            )));
             if let Some(output) = &outcome.output {
                 let rendered = serde_json::to_string(output).unwrap_or_else(|_| output.to_string());
-                lines.push(Line::from(fill(
+                let output_line = fill(
                     strings.run_output,
                     &[("output", &truncate_rendered(&rendered, 240))],
-                )));
+                );
+                lines.push(Line::from(clip_to_columns(&output_line, line_width)));
             }
             if let Some(error) = &outcome.error {
-                lines.push(Line::from(fill(
+                let error_line = fill(
                     strings.run_error,
                     &[("error", &truncate_rendered(error, 240))],
-                )));
+                );
+                lines.push(Line::from(clip_to_columns(&error_line, line_width)));
             }
             lines.push(Line::from(Span::styled(
                 strings.run_open_output,
@@ -3388,6 +3463,192 @@ fn truncate_rendered(text: &str, limit: usize) -> String {
     }
     let kept: String = text.chars().take(limit).collect();
     format!("{kept}\u{2026}(+{} chars)", count - limit)
+}
+
+fn run_detail_lines(
+    app: &App,
+    selected_node: Option<&str>,
+    selected_event_count: usize,
+    waiting_message: bool,
+) -> usize {
+    let mut lines = 1 + usize::from(waiting_message) + 1;
+    if selected_node.is_some() {
+        lines += 1 + selected_event_count.max(1);
+    }
+    if app.last_run_id.is_some() {
+        lines += 2;
+    }
+    if let Some(summary) = &app.last_summary {
+        lines += 4;
+        if let Some(node_id) = selected_node
+            && let Some(outcome) = summary.nodes.get(node_id)
+        {
+            lines += 1;
+            lines += usize::from(outcome.output.is_some());
+            lines += usize::from(outcome.error.is_some());
+        }
+    }
+    lines
+}
+
+fn run_waiting_message(app: &App) -> Option<String> {
+    app.active_run.as_ref()?;
+    if app
+        .node_status
+        .values()
+        .any(|status| *status == NodeStatus::Running)
+    {
+        Some(app.strings().run_waiting_active.to_owned())
+    } else if app
+        .node_status
+        .values()
+        .any(|status| *status == NodeStatus::Ready)
+    {
+        Some(app.strings().run_waiting_ready.to_owned())
+    } else if app.events.is_empty() {
+        Some(app.strings().run_waiting_started.to_owned())
+    } else {
+        Some(app.strings().run_waiting_next.to_owned())
+    }
+}
+
+fn progress_event_line(event: &ProgressEvent, lang: Language) -> String {
+    let node = event.node_id.as_deref().unwrap_or("run");
+    let message = truncate_rendered(&progress_event_message(event, lang), 160);
+    format!(
+        "{:>4} {:<22} {:<18} {}",
+        event.sequence,
+        node,
+        event_kind_label(event.kind, lang),
+        message
+    )
+}
+
+fn progress_event_message(event: &ProgressEvent, lang: Language) -> String {
+    let strings = lang.strings();
+    match event.kind {
+        RunEventKind::RunStarted => {
+            let nodes = event
+                .data
+                .get("nodes")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len)
+                .to_string();
+            let max_parallel = event
+                .data
+                .get("max_parallel")
+                .and_then(Value::as_u64)
+                .map_or_else(|| "-".to_owned(), |value| value.to_string());
+            fill(
+                strings.run_event_run_started,
+                &[("nodes", &nodes), ("max_parallel", &max_parallel)],
+            )
+        }
+        RunEventKind::NodeStarted => {
+            let attempt = event
+                .attempt
+                .map_or_else(|| "-".to_owned(), |value| value.to_string());
+            let max_attempts = event
+                .data
+                .get("max_attempts")
+                .and_then(Value::as_u64)
+                .map_or_else(|| "-".to_owned(), |value| value.to_string());
+            let Some(budget) = event.data.get("output_budget").and_then(Value::as_u64) else {
+                return event.message.clone().unwrap_or_default();
+            };
+            let budget = budget.to_string();
+            if event
+                .data
+                .get("provider_backed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                let profile = event
+                    .data
+                    .get("profile")
+                    .and_then(Value::as_str)
+                    .unwrap_or(strings.runtime_default);
+                let model = event
+                    .data
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or(strings.provider_default);
+                let lanes = event
+                    .data
+                    .get("fan_out")
+                    .and_then(Value::as_u64)
+                    .map_or_else(|| "-".to_owned(), |value| value.to_string());
+                fill(
+                    strings.run_event_provider_started,
+                    &[
+                        ("attempt", &attempt),
+                        ("max_attempts", &max_attempts),
+                        ("profile", profile),
+                        ("model", model),
+                        ("lanes", &lanes),
+                        ("budget", &budget),
+                    ],
+                )
+            } else {
+                fill(
+                    strings.run_event_node_started,
+                    &[
+                        ("attempt", &attempt),
+                        ("max_attempts", &max_attempts),
+                        ("budget", &budget),
+                    ],
+                )
+            }
+        }
+        RunEventKind::NodeOutput
+            if event
+                .data
+                .get("artifacts_written")
+                .and_then(Value::as_bool)
+                .unwrap_or(false) =>
+        {
+            strings.run_event_output_artifacts.to_owned()
+        }
+        _ => event.message.clone().unwrap_or_default(),
+    }
+}
+
+fn selected_node_recent_events(
+    events: &VecDeque<ProgressEvent>,
+    selected_node: Option<&str>,
+    limit: usize,
+    lang: Language,
+) -> Vec<String> {
+    let Some(selected_node) = selected_node else {
+        return Vec::new();
+    };
+    let lines: Vec<String> = events
+        .iter()
+        .rev()
+        .filter(|event| event.node_id.as_deref() == Some(selected_node))
+        .take(limit)
+        .map(|event| {
+            let message = truncate_rendered(&progress_event_message(event, lang), 120);
+            format!(
+                "{:>4} {:<18} {}",
+                event.sequence,
+                event_kind_label(event.kind, lang),
+                message
+            )
+        })
+        .collect();
+    lines.into_iter().rev().collect()
+}
+
+fn node_fanout_lanes(node: &Node) -> Option<usize> {
+    if !binds_provider(node) {
+        return None;
+    }
+    let total = node.fan_out();
+    if total < 2 {
+        return None;
+    }
+    Some(total)
 }
 
 fn input_height(input: &InputState, area: Rect) -> u16 {
@@ -5133,6 +5394,93 @@ mod tests {
         assert_eq!(up_twice, 2);
         let down = move_vertical(value, up_twice, 1, &mut preferred);
         assert_eq!(value.chars().nth(down), Some('e'));
+    }
+
+    #[test]
+    fn selected_node_recent_events_only_includes_matching_node() {
+        let selected_node = "worker";
+        let mut events = VecDeque::new();
+        events.push_back(ProgressEvent {
+            sequence: 1,
+            run_id: "run-1".to_owned(),
+            node_id: Some("worker".to_owned()),
+            attempt: Some(1),
+            kind: RunEventKind::NodeStarted,
+            message: Some("first".to_owned()),
+            data: Value::Null,
+        });
+        events.push_back(ProgressEvent {
+            sequence: 2,
+            run_id: "run-1".to_owned(),
+            node_id: Some("other".to_owned()),
+            attempt: Some(1),
+            kind: RunEventKind::NodeStarted,
+            message: Some("skip".to_owned()),
+            data: Value::Null,
+        });
+        events.push_back(ProgressEvent {
+            sequence: 3,
+            run_id: "run-1".to_owned(),
+            node_id: Some("worker".to_owned()),
+            attempt: Some(1),
+            kind: RunEventKind::NodeSucceeded,
+            message: Some("done".to_owned()),
+            data: Value::Null,
+        });
+        let values = selected_node_recent_events(&events, Some(selected_node), 3, Language::En);
+        assert_eq!(values.len(), 2);
+        assert!(values[0].contains("running"));
+        assert!(values[1].contains("succeeded"));
+    }
+
+    #[test]
+    fn node_fanout_lanes_tracks_running_candidates() {
+        let mut fanout = Node::agent("fanout", "");
+        if let NodeKind::Agent { fan_out, .. } = &mut fanout.kind {
+            *fan_out = 2;
+        }
+        let lanes = node_fanout_lanes(&fanout);
+        assert_eq!(lanes, Some(2));
+    }
+
+    #[test]
+    fn progress_event_line_keeps_newest_prefix_information() {
+        let event = ProgressEvent {
+            sequence: 7,
+            run_id: "run-1".to_owned(),
+            node_id: Some("worker".to_owned()),
+            attempt: Some(1),
+            kind: RunEventKind::NodeFailed,
+            message: Some("very long ".repeat(100)),
+            data: Value::Null,
+        };
+        let line = progress_event_line(&event, Language::En);
+        assert!(line.contains("worker"));
+        assert!(line.contains("failed"));
+    }
+
+    #[test]
+    fn progress_event_message_localizes_structured_runtime_details() {
+        let event = ProgressEvent {
+            sequence: 1,
+            run_id: "run-1".to_owned(),
+            node_id: Some("worker".to_owned()),
+            attempt: Some(1),
+            kind: RunEventKind::NodeStarted,
+            message: Some("attempt 1/1 · profile codex · 2 lanes".to_owned()),
+            data: serde_json::json!({
+                "provider_backed": true,
+                "profile": "codex",
+                "model": "sol",
+                "fan_out": 2,
+                "max_attempts": 1,
+                "output_budget": 524_268,
+            }),
+        };
+        let line = progress_event_line(&event, Language::Ja);
+        assert!(line.contains("試行"));
+        assert!(line.contains("プロファイル codex"));
+        assert!(!line.contains("attempt"));
     }
 
     #[test]
