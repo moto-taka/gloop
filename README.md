@@ -123,8 +123,18 @@ Overview / Graph Builder / Run Monitor, `i` for the natural-language task
 reports it) inserts a newline, `Esc` cancels),
 `t/p/m` to pick template/profile/model from preview pickers, `v` to validate
 (the issue list opens automatically), `s` to save, and `r` to run (auto-saves
-first). During a run, `o` opens the selected node's output, and `?` opens
-help. `Ctrl-C` cancels an active run; `q` exits when idle.
+first). In Graph Builder, `a` inserts a node after the selected node and
+connects it automatically; each row shows its outgoing connections. Use `c`,
+move to a target, and press `Enter` to add another connection. During a run,
+`o` opens the selected node's output, and `?` opens help. `q` or `Ctrl-C`
+cancels an active run; `q` exits when idle.
+
+Model catalogs are read from each configured harness in the background. If
+`m` is pressed while discovery is still running, the picker waits and opens
+automatically when the choices arrive. A failed or unsupported catalog shows
+the reason and offers retry (`r`) or explicit manual entry (`e`) instead of
+dropping directly into a blank text field. Long catalogs support
+`PageUp`/`PageDown` and `Home`/`End`.
 
 The interface language follows your system locale (`GLOOP_LANG`, `LC_ALL`,
 `LC_MESSAGES`, or `LANG`; Japanese and English are supported) and can be

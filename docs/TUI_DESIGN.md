@@ -122,8 +122,9 @@ moving graph semantics into presentation code.
 | `j/k` or arrows | Move the active list selection |
 | `i` | Natural-language task input |
 | `t` | Template selector |
-| `p` | Harness/profile selector |
-| `m` | Model selector; manual entry is always available |
+| `p` | Harness/profile selector for the selected node |
+| `m` | Model selector for the selected node, listing the models the bound harness CLI reports; `e` switches to manual entry, which is always available |
+| `P` / `M` | The same selectors applied to every provider node at once |
 | `v` | Validate with the existing Graph validator |
 | `s` | Atomic save to the selected graph/preset target |
 | `r` | Start a validated foreground run |
@@ -132,11 +133,17 @@ moving graph semantics into presentation code.
 | `e` | Edit the selected node's prompt or fields |
 | `Esc` | Close an editor, cancel a connection, or close a palette |
 | `Ctrl-C` | Cancel the active runtime run; quit when idle |
-| `q` | Quit when idle |
+| `q` | Cancel the active runtime run; quit when idle |
 
 Input fields support cursor movement, Home/End, backspace, delete, and blank
 model input to restore provider-default model routing. Mouse is optional and
 never required.
+
+Model discovery is a visible asynchronous state. Opening the model selector
+while discovery is in flight shows a loading panel and opens the choices when
+the harness responds. Failures show the provider reason with retry and manual
+entry actions. The profile picker shows loading, failure, unsupported, or the
+number of available models for every harness.
 
 ## 5. Graph Builder specification
 
@@ -178,6 +185,10 @@ The editor uses the existing structs and then calls `Graph::validate`; it does
 not maintain a second schema.
 
 ### Edges and conditions
+
+`a` inserts a new agent immediately after the selected node and creates a data
+edge from the selected node automatically. Builder rows show each node's
+outgoing targets, so the resulting flow remains visible while editing.
 
 `c` starts an edge, then the target is selected. The edge editor chooses one of
 the existing kinds: `data`, `control`, `resource`, `conditional`, or `failure`.
@@ -512,12 +523,16 @@ harness choice appeared to apply to everything, no model was visible, and
    labels line up. Picker rows are clipped to one line each, because wrapped
    rows silently pushed entries out of a height-computed overlay: with eight
    templates the last two and the key hints were unreachable.
-4. **Per-node bindings.** `p` and `m` bind the whole graph from the Overview and
-   the selected node from the Builder, so sibling lanes keep the bindings they
-   already have; `Backspace` in the picker clears a binding back to the default.
-   Binding one node edits that node in place instead of rebuilding from the
-   template, which is what made a single harness choice look like it applied to
-   everything.
+4. **Per-node bindings.** `p` and `m` bind the node selected in the list on any
+   screen, so sibling lanes keep the bindings they already have; `P` and `M`
+   bind every provider node at once. `Backspace` in a picker clears a binding
+   back to the default. Binding one node edits that node in place instead of
+   rebuilding from the template, which is what made a single harness choice
+   look like it applied to everything.
+   `m` opens a picker over the models the bound harness CLI reported during
+   discovery (the same catalog the Overview uses to name inherited defaults);
+   `e` inside the picker — or an empty catalog — falls back to manual entry,
+   because gloop deliberately accepts arbitrary model ids.
 5. **Lane assignment.** Applying a template that has parallel lanes opens a lane
    list: `Enter` picks the harness for a lane, `m` its model, `s` skips and keeps
    every default, and `b` reopens it later. Binding a lane returns to the list so
@@ -532,8 +547,8 @@ harness choice appeared to apply to everything, no model was visible, and
    counts, and shape. Applying a project template loads its YAML as user content
    and does **not** overlay the graph-wide profile/model, because a saved
    template's per-lane bindings are the reason to save it.
-   Consequently graph-wide `p` now binds every provider node in the current
-   graph instead of rebuilding from the template — matching what `m` already did
+   Consequently graph-wide `P` binds every provider node in the current
+   graph instead of rebuilding from the template — matching what `M` already did
    and what the "applied to agent-like nodes" status line always claimed.
 
 The full loop is now available without leaving the TUI: pick or assemble a

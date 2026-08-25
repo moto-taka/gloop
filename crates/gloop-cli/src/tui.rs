@@ -23,7 +23,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use gloop_core::{Edge, Graph, Node, NodeKind, NodeStatus, PromptSpec, RunEventKind, RunSummary};
-use gloop_provider::{PROJECT_CONFIG_PATH, ProfileStore, ProviderRegistry};
+use gloop_provider::{CatalogModel, PROJECT_CONFIG_PATH, ProfileStore, ProviderRegistry};
 use gloop_runtime::{
     GateDecision, GateRequest, HumanGate, ProgressEvent, RunOptions, Runtime,
     replay_journal_partial,
@@ -179,6 +179,11 @@ enum Modal {
         selected: usize,
         target: BindingTarget,
     },
+    ModelPicker {
+        selected: usize,
+        target: BindingTarget,
+        models: Vec<CatalogModel>,
+    },
     LaneBinding {
         selected: usize,
     },
@@ -194,6 +199,31 @@ enum Modal {
         lines: Vec<String>,
         offset: usize,
     },
+    ModelLoading {
+        target: BindingTarget,
+        profile: Option<String>,
+    },
+    ModelUnavailable {
+        target: BindingTarget,
+        profile: Option<String>,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindingDiscoveryState {
+    NotStarted,
+    Loading,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+struct BindingDiscoveryError(String);
+
+impl std::fmt::Display for BindingDiscoveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
 }
 
 #[derive(Debug)]
@@ -274,7 +304,9 @@ struct App {
     /// Provider capability/model data resolved off the draw loop, because
     /// discovery shells out to every configured provider CLI.
     binding_options: Option<Vec<ProfileOption>>,
-    binding_rx: Option<oneshot::Receiver<Vec<ProfileOption>>>,
+    binding_discovery: BindingDiscoveryState,
+    binding_rx: Option<oneshot::Receiver<Result<Vec<ProfileOption>, BindingDiscoveryError>>>,
+    binding_error: Option<String>,
     status: String,
     /// Graph differs from what is saved on disk.
     dirty: bool,
@@ -285,6 +317,7 @@ struct App {
 }
 
 impl App {
+    #[allow(clippy::too_many_lines)]
     fn new(repo: PathBuf, trust_project_profiles: bool, lang: Language) -> Result<Self> {
         let profiles = build_profile_choices(&repo, trust_project_profiles).map_err(|error| {
             anyhow!(
@@ -384,7 +417,9 @@ impl App {
             events: VecDeque::new(),
             lane_flow: false,
             binding_options: None,
+            binding_discovery: BindingDiscoveryState::NotStarted,
             binding_rx: None,
+            binding_error: None,
             status: lang.strings().status_ready.to_owned(),
             dirty: false,
             manual_edits,
@@ -403,22 +438,59 @@ impl App {
         let trust_project_profiles = self.trust_project_profiles;
         let profiles = self.profiles.clone();
         tokio::spawn(async move {
-            if let Ok(options) =
-                resolve_profile_options(&repo, trust_project_profiles, &profiles).await
-            {
-                let _ = sender.send(options);
-            }
+            let result = resolve_profile_options(&repo, trust_project_profiles, &profiles)
+                .await
+                .map_err(|error| BindingDiscoveryError(error.to_string()));
+            let _ = sender.send(result);
         });
+        self.binding_discovery = BindingDiscoveryState::Loading;
+        self.binding_error = None;
         self.binding_rx = Some(receiver);
     }
 
     fn poll_binding_options(&mut self) {
-        let Some(receiver) = self.binding_rx.as_mut() else {
-            return;
+        let response = {
+            let Some(receiver) = self.binding_rx.as_mut() else {
+                return;
+            };
+            match receiver.try_recv() {
+                Err(oneshot::error::TryRecvError::Empty) => return,
+                response => response,
+            }
         };
-        if let Ok(options) = receiver.try_recv() {
-            self.binding_options = Some(options);
-            self.binding_rx = None;
+        self.binding_rx = None;
+        let waiting_target = match self.modal {
+            Some(Modal::ModelLoading { target, .. }) => Some(target),
+            _ => None,
+        };
+        match response {
+            Ok(Ok(options)) => {
+                self.binding_options = Some(options);
+                self.binding_discovery = BindingDiscoveryState::NotStarted;
+                self.binding_error = None;
+                if let Some(target) = waiting_target {
+                    self.begin_model_picker(target);
+                }
+            }
+            Ok(Err(error)) => {
+                let reason = error.to_string();
+                self.binding_options = None;
+                self.binding_discovery = BindingDiscoveryState::Failed;
+                self.binding_error = Some(reason.clone());
+                if let Some(target) = waiting_target {
+                    self.open_model_unavailable(target, reason);
+                }
+            }
+            Err(oneshot::error::TryRecvError::Closed) => {
+                let reason = self.strings().profile_models_failed_unknown.to_owned();
+                self.binding_options = None;
+                self.binding_discovery = BindingDiscoveryState::Failed;
+                self.binding_error = Some(reason.clone());
+                if let Some(target) = waiting_target {
+                    self.open_model_unavailable(target, reason);
+                }
+            }
+            Err(oneshot::error::TryRecvError::Empty) => unreachable!("handled above"),
         }
     }
 
@@ -647,6 +719,9 @@ impl App {
     }
 
     fn open_profile_picker(&mut self, target: BindingTarget) {
+        if target == BindingTarget::Node && !self.selected_node_binds_provider() {
+            return;
+        }
         let current = match target {
             BindingTarget::Graph => self.profile_index,
             BindingTarget::Node => self
@@ -665,6 +740,188 @@ impl App {
             .unwrap_or(0)
             .min(self.profiles.len().saturating_sub(1));
         self.modal = Some(Modal::ProfilePicker { selected, target });
+    }
+
+    /// Guard for per-node binding editors, with the status explaining why
+    /// nothing opened when the selection cannot take a binding.
+    fn selected_node_binds_provider(&mut self) -> bool {
+        let Some(node) = self.graph.spec.nodes.get(self.selected_node) else {
+            self.set_status(self.strings().status_no_node);
+            return false;
+        };
+        if !binds_provider(node) {
+            self.set_status(self.strings().status_not_prompt_node);
+            return false;
+        }
+        true
+    }
+
+    /// The profile whose discovered catalog feeds the model picker: the
+    /// explicit binding for the target, otherwise the runtime default.
+    fn catalog_profile(&self, target: BindingTarget) -> Option<String> {
+        let explicit = match target {
+            BindingTarget::Graph => self.selected_profile(),
+            BindingTarget::Node => self
+                .graph
+                .spec
+                .nodes
+                .get(self.selected_node)
+                .and_then(Node::profile),
+        };
+        explicit
+            .map(ToOwned::to_owned)
+            .or_else(|| self.runtime_default_profile().map(ToOwned::to_owned))
+    }
+
+    /// Open the model picker fed by the catalog the bound harness CLI reported.
+    /// Discovery and failure are visible states; manual input is an explicit
+    /// fallback instead of the automatic result of pressing `m` too early.
+    fn open_model_picker(&mut self, target: BindingTarget) {
+        if target == BindingTarget::Node && !self.selected_node_binds_provider() {
+            return;
+        }
+        let profile = self.catalog_profile(target);
+        if self.binding_discovery == BindingDiscoveryState::Loading {
+            self.status = self.strings().status_model_catalog_loading.to_owned();
+            self.modal = Some(Modal::ModelLoading { target, profile });
+            return;
+        }
+        if self.binding_options.is_none() {
+            let reason = self
+                .binding_error
+                .clone()
+                .unwrap_or_else(|| self.strings().profile_models_failed_unknown.to_owned());
+            self.open_model_unavailable(target, reason);
+            return;
+        }
+        self.begin_model_picker(target);
+    }
+
+    fn begin_model_picker(&mut self, target: BindingTarget) {
+        let current = match target {
+            BindingTarget::Graph => self.model.clone(),
+            BindingTarget::Node => self
+                .graph
+                .spec
+                .nodes
+                .get(self.selected_node)
+                .and_then(Node::model)
+                .map(ToOwned::to_owned),
+        };
+        let profile = self.catalog_profile(target);
+        let option = profile
+            .as_deref()
+            .and_then(|name| self.binding_option(name));
+        let models = option
+            .map(|option| option.models.clone())
+            .unwrap_or_default();
+        if models.is_empty() {
+            let reason = option.map_or_else(
+                || self.strings().profile_models_unsupported.to_owned(),
+                |option| match option.discovery.as_str() {
+                    "failed" => option
+                        .discovery_error
+                        .clone()
+                        .unwrap_or_else(|| self.strings().profile_models_failed_unknown.to_owned()),
+                    "unsupported" => self.strings().profile_models_unsupported.to_owned(),
+                    _ => self.strings().profile_models_empty.to_owned(),
+                },
+            );
+            self.open_model_unavailable(target, reason);
+            return;
+        }
+        let selected = current
+            .as_deref()
+            .and_then(|model| models.iter().position(|entry| entry.id == model))
+            .unwrap_or(0);
+        self.modal = Some(Modal::ModelPicker {
+            selected,
+            target,
+            models,
+        });
+    }
+
+    fn open_model_unavailable(&mut self, target: BindingTarget, reason: String) {
+        let profile = self.catalog_profile(target);
+        self.status = fill(
+            self.strings().status_model_catalog_missing,
+            &[(
+                "profile",
+                profile.as_deref().unwrap_or(self.strings().runtime_default),
+            )],
+        );
+        self.modal = Some(Modal::ModelUnavailable {
+            target,
+            profile,
+            reason,
+        });
+    }
+
+    fn profile_model_discovery_label(&self, profile: &str) -> String {
+        let strings = self.strings();
+        if self.binding_discovery == BindingDiscoveryState::Loading {
+            return strings.profile_models_loading.to_owned();
+        }
+        let Some(option) = self.binding_option(profile) else {
+            return if self.binding_discovery == BindingDiscoveryState::Failed {
+                strings.profile_models_failed.to_owned()
+            } else {
+                strings.profile_models_unsupported.to_owned()
+            };
+        };
+        if !option.models.is_empty() {
+            return fill(
+                strings.profile_models_count,
+                &[("count", &option.models.len().to_string())],
+            );
+        }
+        match option.discovery.as_str() {
+            "failed" => strings.profile_models_failed.to_owned(),
+            "unsupported" => strings.profile_models_unsupported.to_owned(),
+            _ => strings.profile_models_empty.to_owned(),
+        }
+    }
+
+    /// Set or clear a model override. `None` clears back to the default.
+    fn apply_model_binding(&mut self, target: BindingTarget, value: Option<String>) {
+        match target {
+            BindingTarget::Graph => {
+                if let Some(model) = &value {
+                    self.model = Some(model.clone());
+                    apply_model_to_agent_nodes(&mut self.graph, model);
+                } else {
+                    self.model = None;
+                    clear_model_on_agent_nodes(&mut self.graph);
+                }
+                self.dirty = true;
+                self.status = fill(
+                    self.strings().status_model_override,
+                    &[(
+                        "model",
+                        self.model
+                            .as_deref()
+                            .unwrap_or_else(|| self.strings().provider_default),
+                    )],
+                );
+            }
+            BindingTarget::Node => {
+                let Some(node) = self.graph.spec.nodes.get_mut(self.selected_node) else {
+                    self.set_status(self.strings().status_no_node);
+                    return;
+                };
+                let id = node.id.clone();
+                set_node_model(node, value.clone());
+                self.dirty = true;
+                self.manual_edits = true;
+                self.status = match value {
+                    Some(model) => fill(
+                        self.strings().status_node_model_override,
+                        &[("id", &id), ("model", &model)],
+                    ),
+                    None => fill(self.strings().status_node_binding_cleared, &[("id", &id)]),
+                };
+            }
+        }
     }
 
     /// Bind one node without rebuilding the graph, so sibling lanes keep the
@@ -815,43 +1072,11 @@ impl App {
                     self.set_status(self.strings().status_task_updated);
                 }
             }
-            InputTarget::Model(BindingTarget::Graph) => {
-                if value.is_empty() {
-                    self.model = None;
-                    clear_model_on_agent_nodes(&mut self.graph);
-                } else {
-                    self.model = Some(value.clone());
-                    apply_model_to_agent_nodes(&mut self.graph, &value);
+            InputTarget::Model(target) => {
+                self.apply_model_binding(target, (!value.is_empty()).then(|| value.clone()));
+                if target == BindingTarget::Node {
+                    self.close_sub_modal();
                 }
-                self.dirty = true;
-                self.status = fill(
-                    self.strings().status_model_override,
-                    &[(
-                        "model",
-                        self.model
-                            .as_deref()
-                            .unwrap_or_else(|| self.strings().provider_default),
-                    )],
-                );
-            }
-            InputTarget::Model(BindingTarget::Node) => {
-                let Some(node) = self.graph.spec.nodes.get_mut(self.selected_node) else {
-                    self.set_status(self.strings().status_no_node);
-                    return;
-                };
-                let id = node.id.clone();
-                set_node_model(node, (!value.is_empty()).then(|| value.clone()));
-                self.dirty = true;
-                self.manual_edits = true;
-                self.status = if value.is_empty() {
-                    fill(self.strings().status_node_binding_cleared, &[("id", &id)])
-                } else {
-                    fill(
-                        self.strings().status_node_model_override,
-                        &[("id", &id), ("model", &value)],
-                    )
-                };
-                self.close_sub_modal();
             }
             InputTarget::TemplateName => self.save_as_template(&value),
             InputTarget::NodePrompt => {
@@ -1083,7 +1308,10 @@ impl App {
             Modal::Issues { lines, offset } | Modal::Output { lines, offset, .. } => {
                 (offset, lines.len())
             }
-            Modal::Help { offset } => (offset, help_line_count(self.lang)),
+            Modal::Help { offset } => (
+                offset,
+                help_line_count(self.active_run.is_some(), self.lang),
+            ),
             _ => return,
         };
         let magnitude = delta.unsigned_abs();
@@ -1126,7 +1354,7 @@ impl App {
             KeyCode::Char('m') => {
                 if let Some(node) = lanes.get(selected).copied() {
                     self.selected_node = node;
-                    self.begin_input(InputTarget::Model(BindingTarget::Node));
+                    self.open_model_picker(BindingTarget::Node);
                 }
             }
             _ => {}
@@ -1191,6 +1419,96 @@ impl App {
         Action::Continue
     }
 
+    /// Model picker keys. The chosen id and count are extracted by the caller
+    /// for the same borrow reason as `handle_lane_key`.
+    fn handle_model_picker_key(
+        &mut self,
+        key: KeyEvent,
+        selected: usize,
+        target: BindingTarget,
+        chosen: Option<String>,
+        count: usize,
+    ) -> Action {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.close_sub_modal(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.lane_flow = false;
+                self.modal = None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(Modal::ModelPicker { selected: slot, .. }) = self.modal.as_mut() {
+                    *slot = selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(Modal::ModelPicker { selected: slot, .. }) = self.modal.as_mut() {
+                    *slot = (selected + 1).min(count.saturating_sub(1));
+                }
+            }
+            KeyCode::PageUp => {
+                if let Some(Modal::ModelPicker { selected: slot, .. }) = self.modal.as_mut() {
+                    *slot = selected.saturating_sub(10);
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(Modal::ModelPicker { selected: slot, .. }) = self.modal.as_mut() {
+                    *slot = (selected + 10).min(count.saturating_sub(1));
+                }
+            }
+            KeyCode::Home => {
+                if let Some(Modal::ModelPicker { selected: slot, .. }) = self.modal.as_mut() {
+                    *slot = 0;
+                }
+            }
+            KeyCode::End => {
+                if let Some(Modal::ModelPicker { selected: slot, .. }) = self.modal.as_mut() {
+                    *slot = count.saturating_sub(1);
+                }
+            }
+            KeyCode::Char('e') => {
+                self.modal = None;
+                self.begin_input(InputTarget::Model(target));
+            }
+            KeyCode::Backspace => {
+                self.close_sub_modal();
+                self.apply_model_binding(target, None);
+            }
+            KeyCode::Enter => {
+                self.close_sub_modal();
+                self.apply_model_binding(target, chosen);
+            }
+            _ => {}
+        }
+        Action::Continue
+    }
+
+    fn handle_model_discovery_modal_key(&mut self, key: KeyEvent) -> Option<Action> {
+        if matches!(self.modal, Some(Modal::ModelLoading { .. })) {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                self.modal = None;
+            }
+            return Some(Action::Continue);
+        }
+        let Some(Modal::ModelUnavailable { target, .. }) = &self.modal else {
+            return None;
+        };
+        let target = *target;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.modal = None,
+            KeyCode::Char('e') => {
+                self.modal = None;
+                self.begin_input(InputTarget::Model(target));
+            }
+            KeyCode::Char('r') => {
+                let profile = self.catalog_profile(target);
+                self.modal = Some(Modal::ModelLoading { target, profile });
+                self.start_binding_discovery();
+            }
+            _ => {}
+        }
+        Some(Action::Continue)
+    }
+
     fn handle_modal_key(&mut self, key: KeyEvent) -> Action {
         if let Some(Modal::LaneBinding { selected }) = &self.modal {
             let selected = *selected;
@@ -1199,6 +1517,20 @@ impl App {
         if let Some(Modal::ProfilePicker { selected, target }) = &self.modal {
             let (selected, target) = (*selected, *target);
             return self.handle_profile_picker_key(key, selected, target);
+        }
+        if let Some(Modal::ModelPicker {
+            selected,
+            target,
+            models,
+        }) = &self.modal
+        {
+            let (selected, target) = (*selected, *target);
+            let chosen = models.get(selected).map(|model| model.id.clone());
+            let count = models.len();
+            return self.handle_model_picker_key(key, selected, target, chosen, count);
+        }
+        if let Some(action) = self.handle_model_discovery_modal_key(key) {
+            return action;
         }
         match self.modal.as_mut() {
             Some(Modal::Input(_)) => {
@@ -1260,15 +1592,28 @@ impl App {
                     _ => Action::Continue,
                 }
             }
-            // LaneBinding and ProfilePicker return early above.
-            Some(Modal::LaneBinding { .. } | Modal::ProfilePicker { .. }) | None => {
-                Action::Continue
-            }
+            // LaneBinding and the profile/model pickers return early above.
+            Some(
+                Modal::LaneBinding { .. }
+                | Modal::ProfilePicker { .. }
+                | Modal::ModelPicker { .. }
+                | Modal::ModelLoading { .. }
+                | Modal::ModelUnavailable { .. },
+            )
+            | None => Action::Continue,
         }
     }
 
     #[allow(clippy::too_many_lines)]
     fn handle_key(&mut self, key: KeyEvent) -> Action {
+        let cancel_active = |app: &mut Self| {
+            if let Some(active) = &app.active_run {
+                active.cancellation.cancel();
+                app.pending_gates.clear();
+                app.set_status(app.strings().status_cancel_requested);
+            }
+        };
+
         if matches!(self.modal, Some(Modal::Input(_))) {
             return self.handle_modal_key(key);
         }
@@ -1277,13 +1622,15 @@ impl App {
                 self.modal = None;
                 return Action::Continue;
             }
-            if let Some(active) = &self.active_run {
-                active.cancellation.cancel();
-                self.pending_gates.clear();
-                self.set_status(self.strings().status_cancel_requested);
+            if self.active_run.is_some() {
+                cancel_active(self);
             } else {
                 return Action::Quit;
             }
+            return Action::Continue;
+        }
+        if key.code == KeyCode::Char('q') && self.active_run.is_some() {
+            cancel_active(self);
             return Action::Continue;
         }
         if self.active_run.is_some() && !self.pending_gates.is_empty() {
@@ -1348,11 +1695,19 @@ impl App {
                 Action::Continue
             }
             KeyCode::Char('p') => {
-                self.open_profile_picker(self.binding_target());
+                self.open_profile_picker(BindingTarget::Node);
+                Action::Continue
+            }
+            KeyCode::Char('P') => {
+                self.open_profile_picker(BindingTarget::Graph);
                 Action::Continue
             }
             KeyCode::Char('m') => {
-                self.begin_input(InputTarget::Model(self.binding_target()));
+                self.open_model_picker(BindingTarget::Node);
+                Action::Continue
+            }
+            KeyCode::Char('M') => {
+                self.open_model_picker(BindingTarget::Graph);
                 Action::Continue
             }
             KeyCode::Char('i') => {
@@ -1467,14 +1822,6 @@ impl App {
             .map(|node| node.id.as_str())
     }
 
-    /// The Builder edits one node; every other screen edits the whole graph.
-    const fn binding_target(&self) -> BindingTarget {
-        match self.screen {
-            Screen::Builder => BindingTarget::Node,
-            Screen::Overview | Screen::Run => BindingTarget::Graph,
-        }
-    }
-
     fn prev_screen(&mut self) {
         let count = Screen::ALL.len();
         let prev = (self.screen.index() + count - 1) % count;
@@ -1497,6 +1844,12 @@ impl App {
     }
 
     fn add_node(&mut self) {
+        let from = self
+            .graph
+            .spec
+            .nodes
+            .get(self.selected_node)
+            .map(|node| node.id.clone());
         let mut counter = self.graph.spec.nodes.len() + 1;
         let id = loop {
             let candidate = format!("step_{counter}");
@@ -1527,8 +1880,8 @@ impl App {
                 return;
             }
         };
-        if let Some(previous) = self.graph.spec.nodes.last() {
-            state = match wizard::add_edge_to_editor(&state, Edge::data(&previous.id, &id)) {
+        if let Some(from) = from {
+            state = match wizard::add_edge_to_editor(&state, Edge::data(&from, &id)) {
                 Ok(state) => state,
                 Err(error) => {
                     self.status = fill(
@@ -1539,8 +1892,17 @@ impl App {
                 }
             };
         }
-        self.graph = state.graph;
-        self.selected_node = self.graph.spec.nodes.len() - 1;
+        let mut graph = state.graph;
+        let mut nodes = graph.spec.nodes;
+        let mut new_index = nodes.len().saturating_sub(1);
+        if let Some(current) = nodes.iter().position(|node| node.id == id) {
+            let new = nodes.remove(current);
+            new_index = self.selected_node.saturating_add(1).min(nodes.len());
+            nodes.insert(new_index, new);
+        }
+        graph.spec.nodes = nodes;
+        self.graph = graph;
+        self.selected_node = self.selected_node.saturating_add(1).min(new_index);
         self.dirty = true;
         self.manual_edits = true;
         self.status = fill(self.strings().status_added_node, &[("id", &id)]);
@@ -2281,8 +2643,9 @@ fn node_kind_label(node: &Node) -> &'static str {
     }
 }
 
-fn help_lines(lang: Language) -> Vec<String> {
+fn help_lines(running: bool, lang: Language) -> Vec<String> {
     let s = lang.strings();
+    let quit = if running { s.key_cancel } else { s.key_quit };
     vec![
         s.help_intro.to_owned(),
         String::new(),
@@ -2299,16 +2662,17 @@ fn help_lines(lang: Language) -> Vec<String> {
         format!("\u{2190}/\u{2192} · Tab · 1/2/3 — {}", s.key_screens),
         format!("i — {}  ·  m — {}", s.key_task, s.key_model),
         format!("t — {}  ·  p — {}", s.key_template, s.key_profile),
+        format!("P — {}  ·  M — {}", s.key_profile_all, s.key_model_all),
         format!("v — {}  ·  s — {}", s.key_validate, s.key_save),
         format!("r — {}  ·  o — {}", s.key_run, s.key_output),
         format!("? — {}  ·  l — {}", s.key_help, s.key_lang),
         format!("b — {}  ·  S — {}", s.key_lanes, s.key_save_template),
-        format!("q — {}", s.key_quit),
+        format!("q — {}", quit),
     ]
 }
 
-fn help_line_count(lang: Language) -> usize {
-    help_lines(lang).len()
+fn help_line_count(running: bool, lang: Language) -> usize {
+    help_lines(running, lang).len()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2374,7 +2738,14 @@ fn render(frame: &mut Frame, app: &App) {
         Span::styled("l", Style::default().fg(Color::Cyan)),
         Span::raw(format!(" {}  ", strings.key_lang)),
         Span::styled("q", Style::default().fg(Color::Red)),
-        Span::raw(format!(" {}", strings.key_quit)),
+        Span::raw(format!(
+            " {}",
+            if app.active_run.is_some() {
+                strings.key_cancel
+            } else {
+                strings.key_quit
+            }
+        )),
     ];
     let footer = Paragraph::new(Text::from(vec![
         Line::from(vec![
@@ -2432,6 +2803,40 @@ fn render(frame: &mut Frame, app: &App) {
                 centered_rect(70, height, area),
             );
         }
+        Some(Modal::ModelPicker {
+            selected,
+            target,
+            models,
+        }) => {
+            let height = u16::try_from(models.len().min(12) + 7).unwrap_or(u16::MAX);
+            render_model_picker(
+                frame,
+                app,
+                *selected,
+                *target,
+                models,
+                centered_rect(70, height, area),
+            );
+        }
+        Some(Modal::ModelLoading { profile, .. }) => {
+            render_model_loading(
+                frame,
+                profile.as_deref().unwrap_or(strings.runtime_default),
+                strings,
+                centered_rect(64, 7, area),
+            );
+        }
+        Some(Modal::ModelUnavailable {
+            profile, reason, ..
+        }) => {
+            render_model_unavailable(
+                frame,
+                profile.as_deref().unwrap_or(strings.runtime_default),
+                reason,
+                strings,
+                centered_rect(72, 9, area),
+            );
+        }
         Some(Modal::Issues { lines, offset }) => {
             render_scroll_overlay(
                 frame,
@@ -2443,7 +2848,7 @@ fn render(frame: &mut Frame, app: &App) {
             );
         }
         Some(Modal::Help { offset }) => {
-            let lines = help_lines(app.lang);
+            let lines = help_lines(app.active_run.is_some(), app.lang);
             let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
             render_scroll_overlay(
                 frame,
@@ -2655,6 +3060,7 @@ fn render_builder(frame: &mut Frame, app: &App, area: Rect) {
         .map(|node| display_width(&node.id))
         .max()
         .unwrap_or_default();
+    let max_list_width = usize::from(columns[0].width.saturating_sub(2)).max(1);
     let items = app
         .graph
         .spec
@@ -2662,19 +3068,32 @@ fn render_builder(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .enumerate()
         .map(|(index, node)| {
-            let marker = if index == app.selected_node {
-                "▸"
+            let outgoing = app
+                .graph
+                .spec
+                .edges
+                .iter()
+                .filter_map(|edge| (edge.from == node.id).then_some(edge.to.as_str()))
+                .collect::<Vec<_>>();
+            let selected = index == app.selected_node;
+            let item = ListItem::new(Line::from(Span::raw(builder_node_row(
+                &node.id,
+                node_kind_label(node),
+                &outgoing,
+                strings.builder_end,
+                id_columns,
+                selected,
+                max_list_width,
+            ))));
+            if selected {
+                item.style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
             } else {
-                " "
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(marker, Style::default().fg(Color::Cyan)),
-                Span::raw(format!(
-                    " {}  {}",
-                    pad_to(&node.id, id_columns),
-                    node_kind_label(node)
-                )),
-            ]))
+                item
+            }
         })
         .collect::<Vec<_>>();
     let title = if let Some(from) = &app.connect_from {
@@ -2789,6 +3208,37 @@ fn render_builder(frame: &mut Frame, app: &App, area: Rect) {
             .wrap(ratatui::widgets::Wrap { trim: false }),
         columns[1],
     );
+}
+
+fn builder_node_row(
+    id: &str,
+    kind: &str,
+    outgoing: &[&str],
+    end_label: &str,
+    id_columns: usize,
+    selected: bool,
+    width: usize,
+) -> String {
+    let outgoing = if outgoing.is_empty() {
+        vec![end_label]
+    } else {
+        outgoing.to_vec()
+    };
+    let marker = if selected { "▸" } else { " " };
+    let mut targets = String::new();
+    for (index, target) in outgoing.iter().enumerate() {
+        if index > 0 {
+            targets.push_str(", ");
+        }
+        targets.push_str(target);
+    }
+    let body = format!(
+        "{marker} {}  {}  → {}",
+        pad_to(id, id_columns),
+        kind,
+        targets
+    );
+    clip_to_columns(&body, width)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3165,6 +3615,7 @@ fn render_profile_picker(
             wizard::ProfileSource::User => strings.picker_source_user,
             wizard::ProfileSource::Project => strings.picker_source_project,
         };
+        let model_discovery = app.profile_model_discovery_label(&profile.name);
         let name_style = if is_selected {
             Style::default()
                 .fg(Color::Cyan)
@@ -3181,6 +3632,10 @@ fn render_profile_picker(
                     .default_model
                     .as_deref()
                     .map_or_else(String::new, |model| format!(" · {model}")),
+            ),
+            Span::styled(
+                format!(" · {model_discovery}"),
+                Style::default().fg(Color::DarkGray),
             ),
             Span::styled(current, Style::default().fg(Color::Green)),
             Span::styled(enabled_note, Style::default().fg(Color::Red)),
@@ -3209,6 +3664,154 @@ fn render_profile_picker(
                 .border_style(Style::default().fg(Color::Cyan))
                 .title(strings.profile_picker_title),
         ),
+        area,
+    );
+}
+
+fn render_model_picker(
+    frame: &mut Frame,
+    app: &App,
+    selected: usize,
+    target: BindingTarget,
+    models: &[CatalogModel],
+    area: Rect,
+) {
+    let strings = app.strings();
+    let bound = match target {
+        BindingTarget::Graph => app.model.clone(),
+        BindingTarget::Node => app
+            .graph
+            .spec
+            .nodes
+            .get(app.selected_node)
+            .and_then(Node::model)
+            .map(ToOwned::to_owned),
+    };
+    let scope = match target {
+        BindingTarget::Graph => strings.picker_scope_graph.to_owned(),
+        BindingTarget::Node => fill(
+            strings.picker_scope_node,
+            &[("id", app.selected_node_id().unwrap_or_default())],
+        ),
+    };
+    let source = fill(
+        strings.model_picker_source,
+        &[(
+            "profile",
+            app.catalog_profile(target)
+                .as_deref()
+                .unwrap_or(strings.runtime_default),
+        )],
+    );
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(scope, Style::default().fg(Color::Cyan))),
+        Line::from(Span::styled(source, Style::default().fg(Color::DarkGray))),
+    ];
+    // Window the list so the selected entry stays visible: long catalogs
+    // (aider lists hundreds of models) do not fit the overlay.
+    let capacity = usize::from(area.height.saturating_sub(7)).max(1);
+    let offset = selected.saturating_sub(capacity.saturating_sub(1));
+    for (index, model) in models.iter().enumerate().skip(offset).take(capacity) {
+        let is_selected = index == selected;
+        let marker = if is_selected { "\u{25b8}" } else { " " };
+        let current = if bound.as_deref() == Some(model.id.as_str()) {
+            format!(" {}", strings.picker_current)
+        } else {
+            String::new()
+        };
+        let label = if model.label == model.id {
+            String::new()
+        } else {
+            format!("  {}", model.label)
+        };
+        let name_style = if is_selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, Style::default().fg(Color::Cyan)),
+            Span::styled(format!(" {}", model.id), name_style),
+            Span::raw(label),
+            Span::styled(current, Style::default().fg(Color::Green)),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("{} · {}", strings.key_move, strings.model_picker_page_hint),
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "{} · {} · {}",
+            strings.key_apply, strings.picker_clear_hint, strings.model_picker_custom_hint
+        ),
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(strings.model_picker_title),
+        ),
+        area,
+    );
+}
+
+fn render_model_loading(frame: &mut Frame, profile: &str, strings: &Strings, area: Rect) {
+    let lines = vec![
+        Line::from(fill(strings.model_loading_body, &[("profile", profile)])),
+        Line::from(""),
+        Line::from(Span::styled(
+            strings.model_loading_keys,
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(strings.model_loading_title),
+        ),
+        area,
+    );
+}
+
+fn render_model_unavailable(
+    frame: &mut Frame,
+    profile: &str,
+    reason: &str,
+    strings: &Strings,
+    area: Rect,
+) {
+    let lines = vec![
+        Line::from(fill(
+            strings.model_unavailable_body,
+            &[("profile", profile)],
+        )),
+        Line::from(Span::styled(reason, Style::default().fg(Color::Yellow))),
+        Line::from(""),
+        Line::from(Span::styled(
+            strings.model_unavailable_keys,
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow))
+                    .title(strings.model_unavailable_title),
+            )
+            .wrap(ratatui::widgets::Wrap { trim: false }),
         area,
     );
 }
@@ -3498,6 +4101,120 @@ mod tests {
         }
     }
 
+    #[test]
+    fn model_request_waits_for_discovery_and_opens_picker_automatically() {
+        let (_repo, mut app) = temp_app();
+        let (sender, receiver) = oneshot::channel();
+        app.binding_discovery = BindingDiscoveryState::Loading;
+        app.binding_rx = Some(receiver);
+
+        app.open_model_picker(BindingTarget::Node);
+        assert!(matches!(app.modal, Some(Modal::ModelLoading { .. })));
+
+        let mut option = profile_option("claude", true, None);
+        option.models = vec![CatalogModel::uniform("fable")];
+        sender
+            .send(Ok(vec![option]))
+            .expect("send discovery result");
+        app.poll_binding_options();
+
+        assert!(matches!(
+            app.modal,
+            Some(Modal::ModelPicker { ref models, .. }) if models[0].id == "fable"
+        ));
+    }
+
+    #[test]
+    fn closing_loading_dialog_prevents_late_picker_open() {
+        let (_repo, mut app) = temp_app();
+        let (sender, receiver) = oneshot::channel();
+        app.binding_discovery = BindingDiscoveryState::Loading;
+        app.binding_rx = Some(receiver);
+        app.open_model_picker(BindingTarget::Node);
+        app.handle_key(key(KeyCode::Esc));
+
+        let mut option = profile_option("claude", true, None);
+        option.models = vec![CatalogModel::uniform("fable")];
+        sender
+            .send(Ok(vec![option]))
+            .expect("send discovery result");
+        app.poll_binding_options();
+
+        assert!(app.modal.is_none());
+        assert!(app.binding_options.is_some());
+    }
+
+    #[test]
+    fn discovery_failure_is_visible_and_manual_entry_is_explicit() {
+        let (_repo, mut app) = temp_app();
+        let (sender, receiver) = oneshot::channel();
+        app.binding_discovery = BindingDiscoveryState::Loading;
+        app.binding_rx = Some(receiver);
+        app.open_model_picker(BindingTarget::Node);
+        sender
+            .send(Err(BindingDiscoveryError("provider timed out".to_owned())))
+            .expect("send discovery failure");
+        app.poll_binding_options();
+
+        assert!(matches!(
+            app.modal,
+            Some(Modal::ModelUnavailable { ref reason, .. }) if reason == "provider timed out"
+        ));
+        app.handle_key(key(KeyCode::Char('e')));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Input(InputState {
+                target: InputTarget::Model(BindingTarget::Node),
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn empty_catalog_opens_unavailable_dialog_instead_of_input() {
+        let (_repo, mut app) = temp_app();
+        app.binding_options = Some(vec![profile_option("claude", true, None)]);
+        app.binding_discovery = BindingDiscoveryState::NotStarted;
+
+        app.open_model_picker(BindingTarget::Node);
+
+        assert!(matches!(app.modal, Some(Modal::ModelUnavailable { .. })));
+    }
+
+    #[test]
+    fn model_picker_supports_page_and_boundary_navigation() {
+        let (_repo, mut app) = temp_app();
+        let models = (0..25)
+            .map(|index| CatalogModel::uniform(format!("model-{index}")))
+            .collect();
+        app.modal = Some(Modal::ModelPicker {
+            selected: 0,
+            target: BindingTarget::Node,
+            models,
+        });
+
+        app.handle_key(key(KeyCode::PageDown));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::ModelPicker { selected: 10, .. })
+        ));
+        app.handle_key(key(KeyCode::End));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::ModelPicker { selected: 24, .. })
+        ));
+        app.handle_key(key(KeyCode::PageDown));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::ModelPicker { selected: 24, .. })
+        ));
+        app.handle_key(key(KeyCode::Home));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::ModelPicker { selected: 0, .. })
+        ));
+    }
+
     fn only_node(app: &App) -> &Node {
         app.graph.spec.nodes.first().expect("template has a node")
     }
@@ -3642,22 +4359,26 @@ mod tests {
     }
 
     #[test]
-    fn the_builder_binds_one_node_while_other_screens_bind_the_graph() {
+    fn lowercase_keys_bind_the_selected_node_and_uppercase_the_graph() {
         let (_repo, mut app) = temp_app();
-        app.screen = Screen::Builder;
-        assert_eq!(app.binding_target(), BindingTarget::Node);
-        app.handle_key(key(KeyCode::Char('p')));
-        assert!(matches!(
-            app.modal,
-            Some(Modal::ProfilePicker {
-                target: BindingTarget::Node,
-                ..
-            })
-        ));
+        for screen in [Screen::Builder, Screen::Overview] {
+            app.screen = screen;
+            app.modal = None;
+            app.handle_key(key(KeyCode::Char('p')));
+            assert!(
+                matches!(
+                    app.modal,
+                    Some(Modal::ProfilePicker {
+                        target: BindingTarget::Node,
+                        ..
+                    })
+                ),
+                "p binds the selected node on {screen:?}"
+            );
+        }
 
         app.modal = None;
-        app.screen = Screen::Overview;
-        app.handle_key(key(KeyCode::Char('p')));
+        app.handle_key(key(KeyCode::Char('P')));
         assert!(matches!(
             app.modal,
             Some(Modal::ProfilePicker {
@@ -3665,6 +4386,131 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    fn catalog_option(name: &str, models: &[&str]) -> ProfileOption {
+        let mut option = profile_option(name, true, None);
+        option.models = models.iter().map(|id| CatalogModel::uniform(*id)).collect();
+        option
+    }
+
+    #[test]
+    fn the_model_picker_offers_the_discovered_catalog_and_binds_one_node() {
+        let (_repo, mut app) = temp_app();
+        app.graph = App::build_graph(GraphTemplate::DecomposeFanoutReduce, "task", None, None);
+        app.binding_options = Some(vec![catalog_option("pi", &["fable-mini", "fable-pro"])]);
+        app.selected_node = 1;
+        app.handle_key(key(KeyCode::Char('m')));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::ModelPicker {
+                target: BindingTarget::Node,
+                ..
+            })
+        ));
+        app.handle_key(key(KeyCode::Char('j')));
+        app.handle_key(key(KeyCode::Enter));
+        let models: Vec<Option<&str>> = app.graph.spec.nodes.iter().map(Node::model).collect();
+        assert_eq!(models[1], Some("fable-pro"));
+        assert!(
+            models
+                .iter()
+                .enumerate()
+                .all(|(index, model)| index == 1 || model.is_none()),
+            "only the selected node is bound"
+        );
+        assert_eq!(app.model, None, "the graph-wide override is untouched");
+    }
+
+    #[test]
+    fn uppercase_m_offers_the_catalog_and_binds_every_provider_node() {
+        let (_repo, mut app) = temp_app();
+        app.graph = App::build_graph(GraphTemplate::DecomposeFanoutReduce, "task", None, None);
+        // The graph-wide catalog follows the selected graph profile, which
+        // `App::new` defaults to the first enabled profile.
+        let profile = app
+            .selected_profile()
+            .expect("a default profile")
+            .to_owned();
+        app.binding_options = Some(vec![catalog_option(&profile, &["fable-mini", "fable-pro"])]);
+        app.handle_key(key(KeyCode::Char('M')));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::ModelPicker {
+                target: BindingTarget::Graph,
+                ..
+            })
+        ));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.model.as_deref(), Some("fable-mini"));
+        assert!(
+            app.graph
+                .spec
+                .nodes
+                .iter()
+                .filter(|node| binds_provider(node))
+                .all(|node| node.model() == Some("fable-mini")),
+            "every provider node is bound"
+        );
+    }
+
+    #[test]
+    fn the_model_picker_does_not_force_manual_input_without_a_catalog() {
+        let (_repo, mut app) = temp_app();
+        assert!(app.binding_options.is_none(), "discovery has not answered");
+        app.handle_key(key(KeyCode::Char('m')));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::ModelUnavailable {
+                target: BindingTarget::Node,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn the_model_picker_switches_to_manual_entry_and_preselects_the_current_model() {
+        let (_repo, mut app) = temp_app();
+        app.graph = App::build_graph(GraphTemplate::DecomposeFanoutReduce, "task", None, None);
+        app.binding_options = Some(vec![catalog_option("pi", &["fable-mini", "fable-pro"])]);
+        app.selected_node = 1;
+        set_node_model(
+            app.graph.spec.nodes.get_mut(1).expect("worker node"),
+            Some("fable-pro".to_owned()),
+        );
+        app.handle_key(key(KeyCode::Char('m')));
+        assert!(
+            matches!(app.modal, Some(Modal::ModelPicker { selected: 1, .. })),
+            "the current model is preselected"
+        );
+        app.handle_key(key(KeyCode::Char('e')));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Input(InputState {
+                target: InputTarget::Model(BindingTarget::Node),
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn backspace_in_the_model_picker_clears_the_override() {
+        let (_repo, mut app) = temp_app();
+        app.graph = App::build_graph(GraphTemplate::DecomposeFanoutReduce, "task", None, None);
+        app.binding_options = Some(vec![catalog_option("pi", &["fable-mini"])]);
+        app.selected_node = 1;
+        set_node_model(
+            app.graph.spec.nodes.get_mut(1).expect("worker node"),
+            Some("fable-mini".to_owned()),
+        );
+        app.handle_key(key(KeyCode::Char('m')));
+        app.handle_key(key(KeyCode::Backspace));
+        assert!(app.modal.is_none());
+        assert_eq!(
+            app.graph.spec.nodes.get(1).and_then(Node::model),
+            None,
+            "the override is cleared back to the default"
+        );
     }
 
     #[test]
@@ -3771,6 +4617,49 @@ mod tests {
             Some("claude".to_owned()),
             "the second lane is the one bound"
         );
+    }
+
+    #[test]
+    fn add_node_inserts_after_selected_with_auto_connection() {
+        let (_repo, mut app) = temp_app();
+        app.graph = App::build_graph(GraphTemplate::PlanImplementVerify, "task", None, None);
+        app.selected_node = 1;
+        let from = app.graph.spec.nodes[1].id.clone();
+        app.add_node();
+
+        assert_eq!(app.selected_node, 2);
+        assert_eq!(app.graph.spec.nodes.len(), 4);
+        let inserted = app.graph.spec.nodes[2].id.clone();
+        assert_ne!(inserted, from);
+        assert!(
+            app.graph
+                .spec
+                .edges
+                .iter()
+                .any(|edge| edge.from == from && edge.to == inserted)
+        );
+    }
+
+    #[test]
+    fn builder_node_row_shows_outgoing_edges_or_end() {
+        let with_targets = builder_node_row(
+            "plan",
+            "agent",
+            &["implement", "review"],
+            "end",
+            4,
+            true,
+            80,
+        );
+        assert_eq!(with_targets, "▸ plan  agent  → implement, review");
+        let with_end = builder_node_row("plan", "agent", &[], "end", 4, false, 80);
+        assert_eq!(with_end, "  plan  agent  → end");
+    }
+
+    #[test]
+    fn idle_q_still_quits() {
+        let (_repo, mut app) = temp_app();
+        assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Action::Quit);
     }
 
     #[test]
@@ -4011,6 +4900,39 @@ mod tests {
                 .expect_err("gate should cancel"),
             "TUI gate cancelled"
         );
+    }
+
+    #[tokio::test]
+    async fn active_run_q_cancels_runtime() {
+        let (_repo, mut app) = temp_app();
+        let cancellation = CancellationToken::new();
+        let (_gate_tx, gate_rx) = mpsc::unbounded_channel::<GateEnvelope>();
+        let (_progress_tx, progress_rx) = mpsc::unbounded_channel::<ProgressEvent>();
+        let task = tokio::spawn(async {
+            std::future::pending::<std::result::Result<RunSummary, String>>().await
+        });
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        app.pending_gates.push_back(GateEnvelope {
+            request: GateRequest {
+                run_id: "run".to_owned(),
+                node_id: "node".to_owned(),
+                message: "continue".to_owned(),
+                default: GateDecision::Approve,
+            },
+            reply: reply_tx,
+        });
+        app.active_run = Some(ActiveRun {
+            cancellation: cancellation.clone(),
+            gates: gate_rx,
+            progress: progress_rx,
+            task,
+        });
+
+        let action = app.handle_key(key(KeyCode::Char('q')));
+        assert_eq!(action, Action::Continue);
+        assert!(cancellation.is_cancelled());
+        assert!(app.pending_gates.is_empty());
+        assert_eq!(app.status, Language::En.strings().status_cancel_requested);
     }
 
     #[tokio::test]
