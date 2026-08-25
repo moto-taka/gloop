@@ -133,11 +133,17 @@ moving graph semantics into presentation code.
 | `e` | Edit the selected node's prompt or fields |
 | `Esc` | Close an editor, cancel a connection, or close a palette |
 | `Ctrl-C` | Cancel the active runtime run; quit when idle |
-| `q` | Quit when idle |
+| `q` | Cancel the active runtime run; quit when idle |
 
 Input fields support cursor movement, Home/End, backspace, delete, and blank
 model input to restore provider-default model routing. Mouse is optional and
 never required.
+
+Model discovery is a visible asynchronous state. Opening the model selector
+while discovery is in flight shows a loading panel and opens the choices when
+the harness responds. Failures show the provider reason with retry and manual
+entry actions. The profile picker shows loading, failure, unsupported, or the
+number of available models for every harness.
 
 ## 5. Graph Builder specification
 
@@ -179,6 +185,10 @@ The editor uses the existing structs and then calls `Graph::validate`; it does
 not maintain a second schema.
 
 ### Edges and conditions
+
+`a` inserts a new agent immediately after the selected node and creates a data
+edge from the selected node automatically. Builder rows show each node's
+outgoing targets, so the resulting flow remains visible while editing.
 
 `c` starts an edge, then the target is selected. The edge editor chooses one of
 the existing kinds: `data`, `control`, `resource`, `conditional`, or `failure`.
