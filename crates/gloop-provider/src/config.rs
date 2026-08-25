@@ -866,7 +866,7 @@ fn builtin_profiles() -> IndexMap<String, Profile> {
             builtin_command(
                 vec!["pi", "--print", "--mode", "json", "--no-session"],
                 CommandPromptMode::Argument,
-                vec!["--", "{prompt}"],
+                vec!["{prompt}"],
                 vec!["--model", "{model}"],
                 OutputFormat::JsonLines,
                 Some("/message/content/0/text"),

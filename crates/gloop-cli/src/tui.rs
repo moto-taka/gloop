@@ -1661,7 +1661,7 @@ impl App {
                 KeyCode::BackTab | KeyCode::Left => self.prev_screen(),
                 KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
                 KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
-                KeyCode::Char('o') => return Action::OpenOutput,
+                KeyCode::Enter | KeyCode::Char('o') => return Action::OpenOutput,
                 KeyCode::Char('?') => self.open_help(),
                 KeyCode::Char('l') => self.toggle_language(),
                 _ => {}
@@ -4928,6 +4928,8 @@ mod tests {
             task,
         });
 
+        app.pending_gates.clear();
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::OpenOutput);
         let action = app.handle_key(key(KeyCode::Char('q')));
         assert_eq!(action, Action::Continue);
         assert!(cancellation.is_cancelled());
