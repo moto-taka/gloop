@@ -846,7 +846,6 @@ mod tests {
                     "--no-session",
                     "--model",
                     "test-model",
-                    "--",
                     "do work",
                 ],
                 None,
