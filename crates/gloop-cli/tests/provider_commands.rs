@@ -1,5 +1,5 @@
 use assert_cmd::prelude::*;
-use predicates::prelude::predicate;
+use predicates::prelude::{PredicateBooleanExt, predicate};
 use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -41,6 +41,47 @@ fn write_project_profiles(project: &Path, source: &str) {
     let path = project.join(".gloop");
     fs::create_dir_all(&path).expect("create .gloop directory");
     fs::write(path.join("profiles.toml"), source).expect("write test profiles");
+}
+
+#[test]
+fn explicit_repo_selects_provider_config_for_writes_reads_and_probes() {
+    let home = tempdir().expect("home");
+    let cwd = tempdir().expect("current directory");
+    let project = tempdir().expect("target project");
+    let bin = tempdir().expect("fake bin");
+    write_fake_executable(bin.path(), "repo-probe", "echo repo-probe 1.0");
+    let definition = "kind = 'command'\nargv = ['repo-probe']\nversion_args = ['--version']";
+    cmd_in_isolation(cwd.path(), home.path(), bin.path())
+        .arg("--repo")
+        .arg(project.path())
+        .args(["provider", "add", "chosen_project", definition, "--json"])
+        .assert()
+        .success();
+    assert!(project.path().join(".gloop/profiles.toml").is_file());
+    assert!(!cwd.path().join(".gloop").exists());
+
+    for (args, expected) in [
+        (vec!["provider", "list", "--json"], "chosen_project"),
+        (
+            vec!["provider", "probe", "chosen_project", "--json"],
+            "repo-probe 1.0",
+        ),
+    ] {
+        cmd_in_isolation(cwd.path(), home.path(), bin.path())
+            .args(args)
+            .arg("--repo")
+            .arg(project.path())
+            .arg("--trust-project-profiles")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(expected));
+    }
+    cmd_in_isolation(cwd.path(), home.path(), bin.path())
+        .args(["provider", "list", "--json", "--repo"])
+        .arg(project.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("chosen_project").not());
 }
 
 fn write_openai_like_builtins(project: &Path) {

@@ -1,6 +1,6 @@
 # gloop terminal interfaces
 
-The default `gloop` / `gloop tui` home lists recently saved graphs. Enter opens
+The default `gloop` home lists recently saved graphs. Enter opens
 one directly and `r` runs it. **+ Graph · Manual** opens a blank canvas with no
 setup wizard. `a` opens an instruction input; Enter adds the AI step, connects it
 after the selection, and returns to the graph. Later steps reuse the selected AI's
@@ -60,7 +60,7 @@ moving graph semantics into presentation code.
 
 ## 2. Recommended UX
 
-`gloop graph` opens the resident session. `gloop graph tui` is an explicit alias.
+`gloop graph` opens the advanced resident session. Use `gloop` for the everyday workspace.
 
 1. **Overview** opens with the last session or a small selector row for graph
    template, profile, and model. Nothing is hard-coded as Planner/Writer/
@@ -490,7 +490,7 @@ The resident TUI was revised after field feedback (0.4.x):
    help overlay with the six-step first-run flow, and `o` opens a scrollable
    viewer for the selected node's output (reading the live journal while the
    run is in flight).
-5. **Agent observability.** New `gloop status [RUN_ID] [--wait] [--json]`
+5. **Agent observability.** New `gloop debug status [RUN_ID] [--wait] [--json]`
    command (see README "Watching runs from scripts and agents"). It reduces
    the run journal with the same rules as replay (`replay_events_partial`),
    tolerates the in-flight truncated final row, merges `summary.json` when it

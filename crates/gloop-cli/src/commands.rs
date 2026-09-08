@@ -2102,8 +2102,12 @@ pub fn graph_schema(json_mode: bool) -> CommandResult {
     }
 }
 
-pub async fn provider_list(json_mode: bool, trust_project_profiles: bool) -> CommandResult {
-    let profile_store = match load_profiles_for_repo(Path::new("."), trust_project_profiles) {
+pub async fn provider_list(
+    repo: &Path,
+    json_mode: bool,
+    trust_project_profiles: bool,
+) -> CommandResult {
+    let profile_store = match load_profiles_for_repo(repo, trust_project_profiles) {
         Ok(store) => store,
         Err(error) => return provider_store_error(error),
     };
@@ -2137,6 +2141,7 @@ pub async fn provider_list(json_mode: bool, trust_project_profiles: bool) -> Com
 }
 
 pub async fn provider_probe(
+    repo: &Path,
     profile: String,
     json_mode: bool,
     trust_project_profiles: bool,
@@ -2149,7 +2154,7 @@ pub async fn provider_probe(
         );
     }
 
-    let registry = match load_profiles_for_repo(Path::new("."), trust_project_profiles) {
+    let registry = match load_profiles_for_repo(repo, trust_project_profiles) {
         Ok(store) => ProviderRegistry::new(store),
         Err(error) => return provider_store_error(error),
     };
@@ -2185,6 +2190,7 @@ pub async fn provider_probe(
 
 #[allow(clippy::too_many_lines)]
 pub async fn provider_add(
+    repo: &Path,
     profile: String,
     definition: String,
     json_mode: bool,
@@ -2224,7 +2230,7 @@ pub async fn provider_add(
         );
     }
 
-    let mut root = match load_profiles_file(".").await {
+    let mut root = match load_profiles_file(repo).await {
         Ok(root) => root,
         Err(error) => {
             return CommandResult::failure_json(
@@ -2278,7 +2284,7 @@ pub async fn provider_add(
         }
     };
 
-    let path = Path::new(".").join(PROJECT_CONFIG_PATH);
+    let path = repo.join(PROJECT_CONFIG_PATH);
     if let Err(error) = write_text_atomic(&path, &output).await {
         return CommandResult::failure_json(
             ExitCode::Internal,
@@ -2291,7 +2297,7 @@ pub async fn provider_add(
         CommandResult::success_json(json!({
             "success": true,
             "profile": profile,
-            "path": PROJECT_CONFIG_PATH,
+            "path": path,
             "written": true,
             "project_profiles_enabled": trust_project_profiles,
         }))
@@ -2302,19 +2308,24 @@ pub async fn provider_add(
             " (project profiles are currently disabled; use --trust-project-profiles)".to_owned()
         };
         CommandResult::success_text(format!(
-            "added profile '{profile}' to {PROJECT_CONFIG_PATH}{suffix}"
+            "added profile '{profile}' to {}{suffix}",
+            path.display()
         ))
     }
 }
 
-pub async fn provider_doctor(json_mode: bool, trust_project_profiles: bool) -> CommandResult {
-    let registry = match load_profiles_for_repo(Path::new("."), trust_project_profiles) {
+pub async fn provider_doctor(
+    repo: &Path,
+    json_mode: bool,
+    trust_project_profiles: bool,
+) -> CommandResult {
+    let registry = match load_profiles_for_repo(repo, trust_project_profiles) {
         Ok(store) => ProviderRegistry::new(store),
         Err(error) => return provider_store_error(error),
     };
 
     let project_names = if trust_project_profiles {
-        profile_names_in_file(Path::new(PROJECT_CONFIG_PATH))
+        profile_names_in_file(&repo.join(PROJECT_CONFIG_PATH))
     } else {
         HashSet::new()
     };
@@ -2368,8 +2379,8 @@ pub async fn provider_doctor(json_mode: bool, trust_project_profiles: bool) -> C
     }
 }
 
-async fn load_profiles_file(path: &str) -> std::io::Result<TomlValue> {
-    let full = Path::new(path).join(PROJECT_CONFIG_PATH);
+async fn load_profiles_file(path: &Path) -> std::io::Result<TomlValue> {
+    let full = path.join(PROJECT_CONFIG_PATH);
 
     match fs::metadata(&full).await {
         Ok(metadata) if metadata.len() > MAX_PROFILE_TOML_BYTES => Err(std::io::Error::new(
@@ -2859,7 +2870,7 @@ fn format_status_text(report: &LiveRunReport, run_dir: &Path, language: Language
 /// which they read from `phase`/`final_status`). With `--wait`, the command
 /// blocks until the run finishes and then exits with the run's own status
 /// code. `--wait` also retries the run-directory lookup and the first journal
-/// reads for a grace period, so `gloop run --run-id x & gloop status x --wait`
+/// reads for a grace period, so `gloop run --run-id x & gloop debug status x --wait`
 /// does not race the runtime's directory creation.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_status(

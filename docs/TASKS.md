@@ -1,6 +1,6 @@
 # Independent tasks and the terminal workspace
 
-`gloop` (or `gloop tui`) opens the task TUI for the current project.
+`gloop` opens the task TUI for the current project.
 The home screen lists recently saved graphs first: Enter opens the selected graph,
 and `r` runs it. **+ Graph · Manual** starts a blank canvas; **Auto** proposes a
 workflow from a request. **1 AI** keeps the single-task path, and **Background run**
@@ -106,7 +106,7 @@ permissions remain authoritative.
 ## Start and reconnect
 
 ```sh
-gloop tui --repo /path/to/project --lang ja
+gloop --repo /path/to/project --lang ja
 gloop ui --repo /path/to/project --no-open  # print the loopback URL
 gloop start "Investigate the failing test" --profile codex --model gpt-5.6-luna --json
 gloop tasks --repo /path/to/project --json

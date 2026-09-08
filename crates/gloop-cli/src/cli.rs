@@ -13,8 +13,31 @@ use crate::i18n::Language;
 use crate::tui;
 
 #[derive(Parser)]
-#[command(name = "gloop", version = env!("CARGO_PKG_VERSION"), about = "Gloop CLI")]
+#[command(
+    name = "gloop",
+    version = env!("CARGO_PKG_VERSION"),
+    about = "Build and run AI workflows",
+    after_help = "Start here:\n  gloop                    Open the workspace\n  gloop --lang ja           Open in Japanese\n  gloop run --graph FILE    Run a saved workflow\n\nUse 'gloop <command> --help' for details."
+)]
 struct Cli {
+    #[arg(
+        long,
+        global = true,
+        default_value = ".",
+        value_name = "PATH",
+        help = "Project directory"
+    )]
+    repo: PathBuf,
+
+    #[arg(
+        long,
+        alias = "language",
+        global = true,
+        value_enum,
+        help = "Display language (default: system locale)"
+    )]
+    lang: Option<Language>,
+
     #[arg(
         long,
         global = true,
@@ -28,49 +51,54 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Open the task TUI (also the default command).
-    Tui(TuiCommand),
-    /// Open the optional local browser workspace.
-    Ui(UiCommand),
-    /// Start an independent task and return its id immediately.
+    /// Open the workspace (same as plain gloop).
+    #[command(hide = true)]
+    Tui,
+    /// Run a workflow or a single AI task in this terminal.
+    Run(RunCommand),
+    /// Start a task in the background.
     Start(StartCommand),
-    /// List tasks or read one task's complete result.
+    /// List background tasks or read a task's result.
     Tasks(TasksCommand),
-    /// Request cancellation of an independent task.
+    /// Stop a background task.
     Stop(StopCommand),
     #[command(hide = true)]
     TaskWorker(StopCommand),
-    /// Run a graph or create a one-node graph from a goal.
-    Run(RunCommand),
-    /// Create, validate, explain, render, or inspect the graph schema.
+    /// Create, edit, and validate workflow files.
     Graph(GraphCommand),
-    /// Configure and diagnose model/harness profiles.
+    /// Configure AI tools and check their availability.
     #[command(subcommand)]
     Provider(ProviderCommand),
-    /// Show live or final status of one run; pollable while the run is in flight.
+    /// Open the workspace in a browser.
+    Ui(UiCommand),
+    /// Inspect run status, output, and execution records.
+    #[command(subcommand)]
+    Debug(DebugCommand),
+    // Published spellings remain accepted for scripts; dispatch is shared with debug.
+    #[command(hide = true)]
     Status(StatusCommand),
-    /// Inspect a completed run directory.
-    Inspect(InspectCommand),
-    /// Print journal events from a run directory.
-    Logs(LogsCommand),
-    /// Replay scheduler state from a run journal.
-    Replay(ReplayCommand),
+    #[command(hide = true)]
+    Inspect(RunDirectory),
+    #[command(hide = true)]
+    Logs(RunDirectory),
+    #[command(hide = true)]
+    Replay(RunDirectory),
 }
 
-#[derive(Args)]
-struct TuiCommand {
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
-    #[arg(long, value_enum)]
-    lang: Option<Language>,
+#[derive(Subcommand)]
+enum DebugCommand {
+    /// Show live status; omit `RUN_ID` for the newest run.
+    Status(StatusCommand),
+    /// Read a completed run's result and node outputs.
+    Inspect(RunDirectory),
+    /// Read the execution journal.
+    Logs(RunDirectory),
+    /// Reconstruct scheduler state from the journal without running models.
+    Replay(RunDirectory),
 }
 
 #[derive(Args, Default)]
 struct UiCommand {
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
-    #[arg(long, value_enum)]
-    lang: Option<Language>,
     #[arg(long, help = "Print the local URL without opening a browser")]
     no_open: bool,
 }
@@ -97,8 +125,6 @@ struct StartCommand {
     after: Option<String>,
     #[arg(long)]
     graph: Option<PathBuf>,
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
     #[arg(long, default_value_t = crate::jobs::default_timeout())]
     timeout: u64,
     #[arg(long, default_value_t = crate::jobs::default_calls())]
@@ -112,8 +138,6 @@ struct StartCommand {
 #[derive(Args)]
 struct TasksCommand {
     id: Option<String>,
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
     #[arg(long, requires = "id")]
     wait: bool,
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=3600))]
@@ -125,8 +149,6 @@ struct TasksCommand {
 #[derive(Args)]
 struct StopCommand {
     id: String,
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
     #[arg(long)]
     json: bool,
 }
@@ -166,9 +188,6 @@ struct RunCommand {
     #[arg(long)]
     json: bool,
 
-    #[arg(long = "repo", value_name = "PATH", default_value = ".")]
-    repo: PathBuf,
-
     #[arg(long = "dry-run")]
     dry_run: bool,
 
@@ -187,7 +206,7 @@ struct RunCommand {
     #[arg(
         long = "run-id",
         value_name = "ID",
-        help = "Run id to use instead of a fresh ULID; supervisors can poll 'gloop status <id>'"
+        help = "Run id to use instead of a fresh ULID; inspect with 'gloop debug status <id>'"
     )]
     run_id: Option<String>,
 }
@@ -197,29 +216,13 @@ struct GraphCommand {
     /// Start the resident graph TUI when no graph subcommand is supplied.
     #[command(subcommand)]
     command: Option<GraphSubcommand>,
-
-    #[arg(
-        long = "repo",
-        value_name = "PATH",
-        default_value = ".",
-        global = true,
-        help = "Project directory for graph commands"
-    )]
-    repo: PathBuf,
-
-    #[arg(
-        long = "lang",
-        alias = "language",
-        value_enum,
-        help = "Display language; defaults to the system locale"
-    )]
-    language: Option<Language>,
 }
 
 #[derive(Subcommand)]
 enum GraphSubcommand {
-    /// Start the resident graph TUI explicitly.
-    Tui(GraphTui),
+    /// Open the advanced graph editor.
+    #[command(hide = true)]
+    Tui,
     /// Show built-in templates, saved templates, and graph YAML files in this project.
     List(GraphList),
     /// Create a graph file from a template or interactively.
@@ -228,7 +231,8 @@ enum GraphSubcommand {
     Init(GraphInit),
     /// Edit a graph file, saved template, or built-in template.
     Edit(GraphEdit),
-    /// Edit a saved project template by name.
+    /// Edit a saved project template by name (prefer graph edit).
+    #[command(hide = true)]
     Update(GraphEdit),
     /// Check one graph file.
     Validate(GraphFile),
@@ -241,26 +245,7 @@ enum GraphSubcommand {
 }
 
 #[derive(Args)]
-struct GraphTui {
-    #[arg(
-        long = "lang",
-        alias = "language",
-        value_enum,
-        help = "Display language; defaults to the system locale (GLOOP_LANG, LC_ALL, LC_MESSAGES, LANG)"
-    )]
-    language: Option<Language>,
-}
-
-#[derive(Args)]
 struct GraphList {
-    #[arg(
-        long = "lang",
-        alias = "language",
-        value_enum,
-        help = "Display language; defaults to the system locale"
-    )]
-    language: Option<Language>,
-
     #[arg(long, help = "Print one JSON object for scripts and assistants")]
     json: bool,
 }
@@ -332,6 +317,7 @@ struct GraphInit {
     loop_cap: Option<u32>,
 
     #[arg(long, conflicts_with_all = ["name", "from", "description", "request", "provider_profiles", "loop_cap"])]
+    #[arg(hide = true)]
     list: bool,
 
     #[arg(
@@ -340,14 +326,6 @@ struct GraphInit {
         help = "Open the browser editor instead of asking in the terminal"
     )]
     gui: bool,
-
-    #[arg(
-        long = "lang",
-        alias = "language",
-        value_enum,
-        help = "Display language; defaults to the system locale"
-    )]
-    language: Option<Language>,
 
     #[arg(long)]
     force: bool,
@@ -366,14 +344,6 @@ struct GraphEdit {
 
     #[arg(long, help = "Open the local browser editor")]
     gui: bool,
-
-    #[arg(
-        long = "lang",
-        alias = "language",
-        value_enum,
-        help = "Display language; defaults to the system locale"
-    )]
-    language: Option<Language>,
 
     #[arg(long)]
     json: bool,
@@ -399,9 +369,13 @@ struct GraphSchema {
 
 #[derive(Subcommand)]
 enum ProviderCommand {
+    /// List configured AI tools.
     List(ProviderVerbose),
+    /// Check one AI tool's availability.
     Probe(ProviderProbe),
+    /// Save a provider profile in the project's configuration.
     Add(ProviderAdd),
+    /// Check all configured AI tools and report setup problems.
     Doctor(ProviderVerbose),
 }
 
@@ -436,9 +410,6 @@ struct StatusCommand {
     )]
     run_id: Option<String>,
 
-    #[arg(long = "repo", value_name = "PATH", default_value = ".")]
-    repo: PathBuf,
-
     #[arg(
         long,
         default_value_t = 10,
@@ -464,27 +435,12 @@ struct StatusCommand {
 }
 
 #[derive(Args)]
-struct InspectCommand {
-    #[arg(default_value = ".", value_name = "PATH")]
-    path: PathBuf,
-
-    #[arg(long)]
-    json: bool,
-}
-
-#[derive(Args)]
-struct LogsCommand {
-    #[arg(default_value = ".", value_name = "PATH")]
-    path: PathBuf,
-
-    #[arg(long)]
-    json: bool,
-}
-
-#[derive(Args)]
-struct ReplayCommand {
-    #[arg(default_value = ".", value_name = "PATH")]
-    path: PathBuf,
+struct RunDirectory {
+    #[arg(
+        value_name = "PATH",
+        help = "Run directory (default: project directory)"
+    )]
+    path: Option<PathBuf>,
 
     #[arg(long)]
     json: bool,
@@ -493,13 +449,13 @@ struct ReplayCommand {
 impl Command {
     fn json_mode(&self) -> bool {
         match self {
-            Self::Tui(_) | Self::Ui(_) => false,
+            Self::Tui | Self::Ui(_) => false,
             Self::Start(c) => c.json,
             Self::Tasks(c) => c.json,
             Self::Stop(c) | Self::TaskWorker(c) => c.json,
             Self::Run(c) => c.json,
             Self::Graph(c) => c.command.as_ref().is_some_and(|command| match command {
-                GraphSubcommand::Tui(_) => false,
+                GraphSubcommand::Tui => false,
                 GraphSubcommand::List(c) => c.json,
                 GraphSubcommand::New(c) => c.json,
                 GraphSubcommand::Init(c) => c.json,
@@ -511,33 +467,35 @@ impl Command {
             Self::Provider(ProviderCommand::List(c) | ProviderCommand::Doctor(c)) => c.json,
             Self::Provider(ProviderCommand::Probe(c)) => c.json,
             Self::Provider(ProviderCommand::Add(c)) => c.json,
-            Self::Status(c) => c.json,
-            Self::Inspect(c) => c.json,
-            Self::Logs(c) => c.json,
-            Self::Replay(c) => c.json,
+            Self::Status(c) | Self::Debug(DebugCommand::Status(c)) => c.json,
+            Self::Inspect(c)
+            | Self::Logs(c)
+            | Self::Replay(c)
+            | Self::Debug(
+                DebugCommand::Inspect(c) | DebugCommand::Logs(c) | DebugCommand::Replay(c),
+            ) => c.json,
         }
     }
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run_workspace_command(command: Command, trusted: bool, json_mode: bool) -> Result<()> {
+async fn run_workspace_command(
+    command: Command,
+    repo: PathBuf,
+    lang: Language,
+    trusted: bool,
+    json_mode: bool,
+) -> Result<()> {
     use crate::jobs;
     let mut wait_for_result = false;
     let result: Result<Option<serde_json::Value>> = async {
         Ok(match command {
-            Command::Tui(c) => {
-                crate::task_tui::launch(c.repo, trusted, c.lang.unwrap_or_else(Language::detect))
-                    .await?;
+            Command::Tui => {
+                crate::task_tui::launch(repo, trusted, lang).await?;
                 None
             }
             Command::Ui(c) => {
-                crate::workspace::launch(
-                    c.repo,
-                    trusted,
-                    c.lang.unwrap_or_else(Language::detect),
-                    c.no_open,
-                )
-                .await?;
+                crate::workspace::launch(repo, trusted, lang, c.no_open).await?;
                 None
             }
             Command::Start(c) => {
@@ -549,7 +507,7 @@ async fn run_workspace_command(command: Command, trusted: bool, json_mode: bool)
                 });
                 Some(
                     jobs::start(
-                        &c.repo,
+                        &repo,
                         jobs::StartRequest {
                             kind: if c.plan {
                                 jobs::TaskKind::Planning
@@ -576,17 +534,17 @@ async fn run_workspace_command(command: Command, trusted: bool, json_mode: bool)
                 wait_for_result = c.wait;
                 Some(if let Some(id) = c.id {
                     if c.wait {
-                        jobs::wait(&c.repo, &id, std::time::Duration::from_secs(c.timeout)).await?
+                        jobs::wait(&repo, &id, std::time::Duration::from_secs(c.timeout)).await?
                     } else {
-                        jobs::detail(&c.repo, &id).await?
+                        jobs::detail(&repo, &id).await?
                     }
                 } else {
-                    jobs::list(&c.repo)?
+                    jobs::list(&repo)?
                 })
             }
-            Command::Stop(c) => Some(jobs::cancel(&c.repo, &c.id).await?),
+            Command::Stop(c) => Some(jobs::cancel(&repo, &c.id).await?),
             Command::TaskWorker(c) => {
-                jobs::worker(&c.repo, &c.id).await?;
+                jobs::worker(&repo, &c.id).await?;
                 None
             }
             _ => unreachable!("only workspace commands"),
@@ -646,28 +604,26 @@ async fn run_workspace_command(command: Command, trusted: bool, json_mode: bool)
 #[allow(clippy::too_many_lines)]
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
-    let command = cli.command.unwrap_or_else(|| {
-        Command::Tui(TuiCommand {
-            repo: PathBuf::from("."),
-            lang: None,
-        })
-    });
+    let lang = cli.lang.unwrap_or_else(Language::detect);
+    let repo = cli.repo;
+    let command = cli.command.unwrap_or(Command::Tui);
     let json_mode = command.json_mode();
 
     if matches!(
         command,
-        Command::Tui(_)
+        Command::Tui
             | Command::Ui(_)
             | Command::Start(_)
             | Command::Tasks(_)
             | Command::Stop(_)
             | Command::TaskWorker(_)
     ) {
-        return run_workspace_command(command, cli.trust_project_profiles, json_mode).await;
+        return run_workspace_command(command, repo, lang, cli.trust_project_profiles, json_mode)
+            .await;
     }
 
     let result = match command {
-        Command::Tui(_)
+        Command::Tui
         | Command::Ui(_)
         | Command::Start(_)
         | Command::Tasks(_)
@@ -679,7 +635,7 @@ pub async fn run() -> Result<()> {
                 cmd.graph,
                 cmd.profile,
                 cmd.model,
-                cmd.repo,
+                repo,
                 cmd.json,
                 cmd.dry_run,
                 cmd.non_interactive,
@@ -690,141 +646,127 @@ pub async fn run() -> Result<()> {
             )
             .await
         }
-        Command::Graph(cmd) => {
-            let repo = cmd.repo;
-            let cmd_lang = cmd.language;
-            match cmd.command {
-                None => {
-                    match tui::launch(
-                        repo,
-                        cli.trust_project_profiles,
-                        cmd_lang.unwrap_or_else(Language::detect),
-                    )
-                    .await
-                    {
-                        Ok(()) => CommandResult {
-                            code: crate::commands::ExitCode::Success,
-                            output: None,
-                            text: None,
-                        },
-                        Err(error) => CommandResult::failure_text(
-                            crate::commands::ExitCode::Internal,
-                            format!("graph TUI failed: {error}"),
-                        ),
-                    }
+        Command::Graph(cmd) => match cmd.command {
+            None | Some(GraphSubcommand::Tui) => {
+                match tui::launch(repo, cli.trust_project_profiles, lang).await {
+                    Ok(()) => CommandResult {
+                        code: crate::commands::ExitCode::Success,
+                        output: None,
+                        text: None,
+                    },
+                    Err(error) => CommandResult::failure_text(
+                        crate::commands::ExitCode::Internal,
+                        format!("graph TUI failed: {error}"),
+                    ),
                 }
-                Some(GraphSubcommand::Tui(c)) => {
-                    match tui::launch(
-                        repo,
-                        cli.trust_project_profiles,
-                        c.language.or(cmd_lang).unwrap_or_else(Language::detect),
-                    )
-                    .await
-                    {
-                        Ok(()) => CommandResult {
-                            code: crate::commands::ExitCode::Success,
-                            output: None,
-                            text: None,
-                        },
-                        Err(error) => CommandResult::failure_text(
-                            crate::commands::ExitCode::Internal,
-                            format!("graph TUI failed: {error}"),
-                        ),
-                    }
-                }
-                Some(GraphSubcommand::List(c)) => {
-                    graph_list(repo, c.language.unwrap_or_else(Language::detect), c.json).await
-                }
-                Some(GraphSubcommand::New(c)) => {
-                    graph_new(
-                        c.name,
-                        c.goal,
-                        c.template,
-                        repo,
-                        c.request,
-                        c.provider_profiles,
-                        c.loop_cap,
-                        c.interactive,
-                        c.path,
-                        c.force,
-                        c.json,
-                        cli.trust_project_profiles,
-                    )
-                    .await
-                }
-                Some(GraphSubcommand::Init(c)) => {
-                    graph_init(
-                        c.name,
-                        c.from,
-                        c.description,
-                        c.request,
-                        c.provider_profiles,
-                        c.loop_cap,
-                        c.list,
-                        c.force,
-                        repo,
-                        c.json,
-                        cli.trust_project_profiles,
-                        c.gui,
-                        c.language.unwrap_or_else(Language::detect),
-                    )
-                    .await
-                }
-                Some(GraphSubcommand::Edit(c)) => {
-                    graph_edit(
-                        c.target,
-                        repo,
-                        c.gui,
-                        c.language.unwrap_or_else(Language::detect),
-                        c.json,
-                        false,
-                        cli.trust_project_profiles,
-                    )
-                    .await
-                }
-                Some(GraphSubcommand::Update(c)) => {
-                    graph_edit(
-                        c.target,
-                        repo,
-                        c.gui,
-                        c.language.unwrap_or_else(Language::detect),
-                        c.json,
-                        true,
-                        cli.trust_project_profiles,
-                    )
-                    .await
-                }
-                Some(GraphSubcommand::Validate(c)) => graph_validate(c.path, c.json).await,
-                Some(GraphSubcommand::Explain(c)) => graph_explain(c.path, c.json).await,
-                Some(GraphSubcommand::Render(c)) => graph_render(c.path, c.format, c.json).await,
-                Some(GraphSubcommand::Schema(c)) => graph_schema(c.json),
             }
-        }
+            Some(GraphSubcommand::List(c)) => graph_list(repo, lang, c.json).await,
+            Some(GraphSubcommand::New(c)) => {
+                graph_new(
+                    c.name,
+                    c.goal,
+                    c.template,
+                    repo,
+                    c.request,
+                    c.provider_profiles,
+                    c.loop_cap,
+                    c.interactive,
+                    c.path,
+                    c.force,
+                    c.json,
+                    cli.trust_project_profiles,
+                )
+                .await
+            }
+            Some(GraphSubcommand::Init(c)) => {
+                graph_init(
+                    c.name,
+                    c.from,
+                    c.description,
+                    c.request,
+                    c.provider_profiles,
+                    c.loop_cap,
+                    c.list,
+                    c.force,
+                    repo,
+                    c.json,
+                    cli.trust_project_profiles,
+                    c.gui,
+                    lang,
+                )
+                .await
+            }
+            Some(GraphSubcommand::Edit(c)) => {
+                graph_edit(
+                    c.target,
+                    repo,
+                    c.gui,
+                    lang,
+                    c.json,
+                    false,
+                    cli.trust_project_profiles,
+                )
+                .await
+            }
+            Some(GraphSubcommand::Update(c)) => {
+                graph_edit(
+                    c.target,
+                    repo,
+                    c.gui,
+                    lang,
+                    c.json,
+                    true,
+                    cli.trust_project_profiles,
+                )
+                .await
+            }
+            Some(GraphSubcommand::Validate(c)) => graph_validate(c.path, c.json).await,
+            Some(GraphSubcommand::Explain(c)) => graph_explain(c.path, c.json).await,
+            Some(GraphSubcommand::Render(c)) => graph_render(c.path, c.format, c.json).await,
+            Some(GraphSubcommand::Schema(c)) => graph_schema(c.json),
+        },
         Command::Provider(cmd) => match cmd {
-            ProviderCommand::List(c) => provider_list(c.json, cli.trust_project_profiles).await,
+            ProviderCommand::List(c) => {
+                provider_list(&repo, c.json, cli.trust_project_profiles).await
+            }
             ProviderCommand::Probe(c) => {
-                provider_probe(c.profile, c.json, cli.trust_project_profiles).await
+                provider_probe(&repo, c.profile, c.json, cli.trust_project_profiles).await
             }
             ProviderCommand::Add(c) => {
-                provider_add(c.profile, c.definition, c.json, cli.trust_project_profiles).await
+                provider_add(
+                    &repo,
+                    c.profile,
+                    c.definition,
+                    c.json,
+                    cli.trust_project_profiles,
+                )
+                .await
             }
-            ProviderCommand::Doctor(c) => provider_doctor(c.json, cli.trust_project_profiles).await,
+            ProviderCommand::Doctor(c) => {
+                provider_doctor(&repo, c.json, cli.trust_project_profiles).await
+            }
         },
-        Command::Status(c) => {
+        Command::Status(c) | Command::Debug(DebugCommand::Status(c)) => {
             run_status(
                 c.run_id,
-                c.repo,
+                repo,
                 c.events,
                 c.wait,
                 c.interval_ms,
                 c.json,
-                Language::detect(),
+                lang,
             )
             .await
         }
-        Command::Inspect(c) => inspect_run_at(c.path, c.json).await,
-        Command::Logs(c) => run_logs(c.path, c.json).await,
-        Command::Replay(c) => replay_run(c.path, c.json).await,
+        Command::Inspect(c) | Command::Debug(DebugCommand::Inspect(c)) => {
+            inspect_run_at(c.path.unwrap_or(repo), c.json).await
+        }
+        Command::Logs(c) | Command::Debug(DebugCommand::Logs(c)) => {
+            run_logs(c.path.unwrap_or(repo), c.json).await
+        }
+        Command::Replay(c) | Command::Debug(DebugCommand::Replay(c)) => {
+            replay_run(c.path.unwrap_or(repo), c.json).await
+        }
     };
 
     let code = present(result, json_mode)?;
