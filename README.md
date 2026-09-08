@@ -8,6 +8,22 @@ Underneath, gloop runs configurable agent and command graphs with deterministic 
 
 Compose provider-backed agents and commands into a graph, fan out work in parallel, merge results, and replay the run locally.
 
+## See it in motion
+
+**The real terminal — launch, run three checks, combine their results.**
+
+[![Actual gloop terminal: three parallel checks and a combined result](assets/videos/gloop-terminal.gif)](https://github.com/moto-taka/gloop/releases/download/v0.8.1/gloop-terminal.mp4)
+
+[Watch the 31-second video](https://github.com/moto-taka/gloop/releases/download/v0.8.1/gloop-terminal.mp4).
+Recorded from an actual gloop 0.8.1 terminal session with local sample commands and no model calls.
+
+**The idea — three independent lanes, one combined result.**
+
+[![Three independent lanes finish and merge into one result](assets/videos/gloop-parallel.gif)](https://github.com/moto-taka/gloop/releases/download/v0.8.1/gloop-parallel.mp4)
+
+[Watch the 21-second animation](https://github.com/moto-taka/gloop/releases/download/v0.8.1/gloop-parallel.mp4).
+Both videos are silent. [Remotion source and recording details](media/README.md).
+
 ## Install
 
 Install the latest version directly from the public GitHub repository (works from any directory):

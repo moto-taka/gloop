@@ -1,0 +1,87 @@
+{
+  "gloop_version": "0.8.1",
+  "source_revision": "cd920a0c0e14ca9088a324db060574a24c19eeb2",
+  "run_id": "01m1zzxkadqt298cpmfzpp4emv",
+  "capture": "terminal.cast",
+  "events": [
+    {
+      "sequence": 1,
+      "timestamp": "2026-09-08T07:50:00.274995Z",
+      "kind": "run_started"
+    },
+    {
+      "sequence": 5,
+      "timestamp": "2026-09-08T07:50:00.289364Z",
+      "node_id": "quality",
+      "kind": "node_started"
+    },
+    {
+      "sequence": 6,
+      "timestamp": "2026-09-08T07:50:00.293055Z",
+      "node_id": "coverage",
+      "kind": "node_started"
+    },
+    {
+      "sequence": 7,
+      "timestamp": "2026-09-08T07:50:00.296108Z",
+      "node_id": "release",
+      "kind": "node_started"
+    },
+    {
+      "sequence": 9,
+      "timestamp": "2026-09-08T07:50:05.353126Z",
+      "node_id": "quality",
+      "kind": "node_succeeded"
+    },
+    {
+      "sequence": 11,
+      "timestamp": "2026-09-08T07:50:08.346064Z",
+      "node_id": "coverage",
+      "kind": "node_succeeded"
+    },
+    {
+      "sequence": 13,
+      "timestamp": "2026-09-08T07:50:11.355758Z",
+      "node_id": "release",
+      "kind": "node_succeeded"
+    },
+    {
+      "sequence": 15,
+      "timestamp": "2026-09-08T07:50:11.362977Z",
+      "node_id": "merge",
+      "kind": "node_started"
+    },
+    {
+      "sequence": 17,
+      "timestamp": "2026-09-08T07:50:14.418987Z",
+      "node_id": "merge",
+      "kind": "node_succeeded"
+    },
+    {
+      "sequence": 18,
+      "timestamp": "2026-09-08T07:50:14.426158Z",
+      "kind": "run_finished"
+    }
+  ],
+  "report": {
+    "status": "ready",
+    "checks": [
+      {
+        "check": "quality",
+        "passed": true,
+        "modules": 3
+      },
+      {
+        "check": "coverage",
+        "passed": true,
+        "tests": 78
+      },
+      {
+        "check": "release",
+        "passed": true,
+        "packages": 3
+      }
+    ]
+  },
+  "capture_sha256": "34de527306d4eb0109027925961a0de5f548ce075c3147ce76f3140f27efae12"
+}

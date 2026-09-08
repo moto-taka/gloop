@@ -1,0 +1,5 @@
+node_modules/
+out/
+public/terminal-frames.json
+out-terminal-inspection.txt
+__pycache__/
