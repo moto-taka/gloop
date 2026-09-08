@@ -189,6 +189,7 @@ impl ProviderInvoker for TestInvoker {
                 model,
             } => {
                 let response = AdapterResponse {
+                    resolved_model_alias: None,
                     output,
                     stdout: String::new(),
                     stderr: String::new(),

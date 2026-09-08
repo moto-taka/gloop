@@ -5,7 +5,11 @@ use std::process::Command;
 fn gui_client_state_js_tests() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let output = match Command::new("node")
-        .args(["--test", "tests/gui_client_state.test.mjs"])
+        .args([
+            "--test",
+            "tests/gui_client_state.test.mjs",
+            "tests/workspace_client_state.test.mjs",
+        ])
         .current_dir(manifest_dir)
         .output()
     {

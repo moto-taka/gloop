@@ -67,6 +67,10 @@ impl Default for ServerTuning {
 
 #[derive(Debug, Clone)]
 pub enum GuiTarget {
+    Workspace {
+        repo: PathBuf,
+        trust_project_profiles: bool,
+    },
     GraphFile {
         path: PathBuf,
         expected_sha256: Option<String>,
@@ -173,11 +177,24 @@ pub fn launch(
     target: GuiTarget,
     language: Language,
 ) -> Result<GuiResult> {
+    launch_with_browser(graph, profiles, target, language, true)
+}
+
+pub(crate) fn launch_with_browser(
+    graph: Graph,
+    profiles: &[ProfileOption],
+    target: GuiTarget,
+    language: Language,
+    open: bool,
+) -> Result<GuiResult> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).context("bind local GUI server")?;
     let address = listener.local_addr().context("read local GUI address")?;
     let token = Ulid::new().to_string().to_lowercase();
     let url = format!("http://127.0.0.1:{}/#{token}", address.port());
-    open_browser(&url)?;
+    eprintln!("gloop: {url}");
+    if open {
+        open_browser(&url)?;
+    }
 
     serve(
         &listener,
@@ -543,6 +560,17 @@ fn serve(
     let address = listener.local_addr().context("read local GUI address")?;
     let origin = format!("http://{address}");
     let mut current_graph = graph;
+    let mut workspace = match &target {
+        GuiTarget::Workspace {
+            repo,
+            trust_project_profiles,
+        } => Some(crate::workspace::Workspace::new(
+            repo.clone(),
+            *trust_project_profiles,
+            language,
+        )?),
+        _ => None,
+    };
     let mut written = None;
     listener
         .set_nonblocking(true)
@@ -637,6 +665,18 @@ fn serve(
                     "application/json",
                     br#"{"error":"unauthorized"}"#,
                 );
+                if is_save {
+                    in_flight_saves.remove(&order);
+                }
+                continue;
+            }
+
+            if let Some(workspace) = &mut workspace
+                && route_path(&request.path) != "/api/close"
+            {
+                let (status, content_type, payload) =
+                    workspace.dispatch(&request.method, route_path(&request.path), &request.body);
+                let _ = write_response(&mut stream, status, content_type, &payload);
                 if is_save {
                     in_flight_saves.remove(&order);
                 }
@@ -747,10 +787,12 @@ fn serve(
 fn is_save_request(incoming: &IncomingRequest) -> bool {
     match incoming {
         IncomingRequest::Ready(request) => {
-            request.method == "POST" && route_path(&request.path) == "/api/save"
+            request.method == "POST"
+                && matches!(route_path(&request.path), "/api/save" | "/api/tasks")
         }
         IncomingRequest::NeedsBody(headers) => {
-            headers.method == "POST" && route_path(&headers.path) == "/api/save"
+            headers.method == "POST"
+                && matches!(route_path(&headers.path), "/api/save" | "/api/tasks")
         }
         IncomingRequest::Rejected { .. } => false,
     }
@@ -898,12 +940,14 @@ fn build_state(
         models: models.into_iter().collect(),
         language: language.as_str(),
         target: match target {
+            GuiTarget::Workspace { .. } => "workspace",
             GuiTarget::GraphFile { .. } => "graph",
             GuiTarget::ProjectTemplate { .. } => "template",
         },
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn save_graph(body: &[u8], target: &mut GuiTarget) -> Result<(Graph, PathBuf)> {
     let request: SaveRequest = serde_json::from_slice(body).context("parse GUI save request")?;
     let graph: Graph = serde_json::from_value(request.graph).context("parse graph from GUI")?;
@@ -924,6 +968,9 @@ fn save_graph(body: &[u8], target: &mut GuiTarget) -> Result<(Graph, PathBuf)> {
     }
     let yaml = graph.to_yaml().context("serialize graph YAML")?;
     let path = match target {
+        GuiTarget::Workspace { .. } => {
+            return Err(anyhow!("use the graph editor to save workflows"));
+        }
         GuiTarget::GraphFile {
             path,
             expected_sha256,
@@ -1023,7 +1070,7 @@ fn build_incoming_request(headers: RequestHeaders, token: &str, origin: &str) ->
     let route = route_path(&headers.path);
     let is_root = headers.method == "GET" && route == "/";
     let authorized = is_root || authorized_headers(&headers, token, origin);
-    let allows_body = headers.method == "POST" && route == "/api/save";
+    let allows_body = headers.method == "POST" && matches!(route, "/api/save" | "/api/tasks");
     if headers.content_length > MAX_REQUEST_BYTES {
         return IncomingRequest::Rejected {
             status: 400,
@@ -1248,6 +1295,36 @@ mod tests {
         time::Duration,
     };
     use tempfile::tempdir;
+
+    #[test]
+    fn task_submission_requires_authentication_before_its_body_is_read() {
+        for (token, origin, rejected) in [
+            ("secret", "http://127.0.0.1:1234", false),
+            ("wrong", "http://127.0.0.1:1234", true),
+            ("secret", "https://unrelated.example", true),
+        ] {
+            let incoming = build_incoming_request(
+                RequestHeaders {
+                    method: "POST".to_owned(),
+                    path: "/api/tasks".to_owned(),
+                    content_length: 100,
+                    token: Some(token.to_owned()),
+                    origin: Some(origin.to_owned()),
+                },
+                "secret",
+                "http://127.0.0.1:1234",
+            );
+            if rejected {
+                assert!(matches!(
+                    incoming,
+                    IncomingRequest::Rejected { status: 401, .. }
+                ));
+            } else {
+                assert!(is_save_request(&incoming));
+                assert!(matches!(incoming, IncomingRequest::NeedsBody(_)));
+            }
+        }
+    }
 
     fn save_body() -> Vec<u8> {
         let graph =

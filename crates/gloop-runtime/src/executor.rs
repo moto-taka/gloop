@@ -2676,6 +2676,7 @@ async fn normalize_provider_response(
         stderr,
         exit_code,
         reported_model,
+        resolved_model_alias,
         reported_model_informational,
         ..
     } = response;
@@ -2709,6 +2710,7 @@ async fn normalize_provider_response(
 
     if let (Some(reported), Some(requested)) = (&reported_model, &effective_model)
         && !reported_model_informational
+        && resolved_model_alias.as_deref() != Some(requested.as_str())
         && reported != requested
     {
         return Err(provider_response_failure(
@@ -3174,6 +3176,7 @@ mod tests {
                 },
                 model_origin: ModelOrigin::ProviderDefault,
                 response: AdapterResponse {
+                    resolved_model_alias: None,
                     output,
                     stdout: String::new(),
                     stderr: String::new(),

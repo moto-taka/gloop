@@ -89,6 +89,7 @@ impl ProviderInvoker for TestInvoker {
             selection_origin: SelectionOrigin::Explicit,
             model_origin: ModelOrigin::ProviderDefault,
             response: AdapterResponse {
+                resolved_model_alias: None,
                 output: invocation.output,
                 stdout: String::new(),
                 stderr: String::new(),

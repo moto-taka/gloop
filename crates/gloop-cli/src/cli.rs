@@ -23,11 +23,23 @@ struct Cli {
     trust_project_profiles: bool,
 
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Open the task TUI (also the default command).
+    Tui(TuiCommand),
+    /// Open the optional local browser workspace.
+    Ui(UiCommand),
+    /// Start an independent task and return its id immediately.
+    Start(StartCommand),
+    /// List tasks or read one task's complete result.
+    Tasks(TasksCommand),
+    /// Request cancellation of an independent task.
+    Stop(StopCommand),
+    #[command(hide = true)]
+    TaskWorker(StopCommand),
     /// Run a graph or create a one-node graph from a goal.
     Run(RunCommand),
     /// Create, validate, explain, render, or inspect the graph schema.
@@ -43,6 +55,80 @@ enum Command {
     Logs(LogsCommand),
     /// Replay scheduler state from a run journal.
     Replay(ReplayCommand),
+}
+
+#[derive(Args)]
+struct TuiCommand {
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    #[arg(long, value_enum)]
+    lang: Option<Language>,
+}
+
+#[derive(Args, Default)]
+struct UiCommand {
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    #[arg(long, value_enum)]
+    lang: Option<Language>,
+    #[arg(long, help = "Print the local URL without opening a browser")]
+    no_open: bool,
+}
+
+#[derive(Args)]
+struct StartCommand {
+    #[arg(long, conflicts_with_all = ["graph", "review_profile", "after", "max_calls"], help = "Create a reviewable work plan with one AI call; do not execute the plan")]
+    plan: bool,
+    #[arg(required_unless_present = "graph", conflicts_with = "graph")]
+    goal: Option<String>,
+    #[arg(long, required_unless_present = "graph", conflicts_with = "graph")]
+    profile: Option<String>,
+    #[arg(long, conflicts_with = "graph")]
+    model: Option<String>,
+    #[arg(long, conflicts_with = "graph")]
+    review_profile: Option<String>,
+    #[arg(long, requires = "review_profile")]
+    review_model: Option<String>,
+    #[arg(
+        long,
+        conflicts_with = "graph",
+        help = "Pass a finished task's bounded result to this new task"
+    )]
+    after: Option<String>,
+    #[arg(long)]
+    graph: Option<PathBuf>,
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    #[arg(long, default_value_t = crate::jobs::default_timeout())]
+    timeout: u64,
+    #[arg(long, default_value_t = crate::jobs::default_calls())]
+    max_calls: u32,
+    #[arg(long, help = "Stable id for idempotent submission")]
+    id: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct TasksCommand {
+    id: Option<String>,
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    #[arg(long, requires = "id")]
+    wait: bool,
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    timeout: u64,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct StopCommand {
+    id: String,
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -407,6 +493,10 @@ struct ReplayCommand {
 impl Command {
     fn json_mode(&self) -> bool {
         match self {
+            Self::Tui(_) | Self::Ui(_) => false,
+            Self::Start(c) => c.json,
+            Self::Tasks(c) => c.json,
+            Self::Stop(c) | Self::TaskWorker(c) => c.json,
             Self::Run(c) => c.json,
             Self::Graph(c) => c.command.as_ref().is_some_and(|command| match command {
                 GraphSubcommand::Tui(_) => false,
@@ -430,11 +520,159 @@ impl Command {
 }
 
 #[allow(clippy::too_many_lines)]
+async fn run_workspace_command(command: Command, trusted: bool, json_mode: bool) -> Result<()> {
+    use crate::jobs;
+    let mut wait_for_result = false;
+    let result: Result<Option<serde_json::Value>> = async {
+        Ok(match command {
+            Command::Tui(c) => {
+                crate::task_tui::launch(c.repo, trusted, c.lang.unwrap_or_else(Language::detect))
+                    .await?;
+                None
+            }
+            Command::Ui(c) => {
+                crate::workspace::launch(
+                    c.repo,
+                    trusted,
+                    c.lang.unwrap_or_else(Language::detect),
+                    c.no_open,
+                )
+                .await?;
+                None
+            }
+            Command::Start(c) => {
+                let graph = c.graph.map(gloop_core::Graph::from_path).transpose()?;
+                let goal = c.goal.unwrap_or_else(|| {
+                    graph
+                        .as_ref()
+                        .map_or_else(String::new, |graph| graph.spec.goal.clone())
+                });
+                Some(
+                    jobs::start(
+                        &c.repo,
+                        jobs::StartRequest {
+                            kind: if c.plan {
+                                jobs::TaskKind::Planning
+                            } else {
+                                jobs::TaskKind::Task
+                            },
+                            goal,
+                            profile: c.profile,
+                            model: c.model,
+                            review_profile: c.review_profile,
+                            review_model: c.review_model,
+                            after: c.after,
+                            graph,
+                            timeout_seconds: c.timeout,
+                            max_calls: if c.plan { 1 } else { c.max_calls },
+                        },
+                        trusted,
+                        c.id,
+                    )
+                    .await?,
+                )
+            }
+            Command::Tasks(c) => {
+                wait_for_result = c.wait;
+                Some(if let Some(id) = c.id {
+                    if c.wait {
+                        jobs::wait(&c.repo, &id, std::time::Duration::from_secs(c.timeout)).await?
+                    } else {
+                        jobs::detail(&c.repo, &id).await?
+                    }
+                } else {
+                    jobs::list(&c.repo)?
+                })
+            }
+            Command::Stop(c) => Some(jobs::cancel(&c.repo, &c.id).await?),
+            Command::TaskWorker(c) => {
+                jobs::worker(&c.repo, &c.id).await?;
+                None
+            }
+            _ => unreachable!("only workspace commands"),
+        })
+    }
+    .await;
+    match result {
+        Ok(Some(value)) => {
+            if json_mode {
+                println!("{}", serde_json::to_string(&value)?);
+            } else if let Some(tasks) = value["tasks"].as_array() {
+                if tasks.is_empty() {
+                    println!(
+                        "No tasks yet. Open `gloop` or use `gloop start TASK --profile TOOL`."
+                    );
+                }
+                for task in tasks {
+                    print!("{}", jobs::format_task(task));
+                }
+                if let Some(errors) = value["errors"].as_array() {
+                    for error in errors {
+                        eprintln!("{}: {}", error["id"], error["error"]);
+                    }
+                }
+            } else {
+                print!("{}", jobs::format_task(&value));
+            }
+            if wait_for_result {
+                let code =
+                    value["exit_code"]
+                        .as_i64()
+                        .unwrap_or_else(|| match value["status"].as_str() {
+                            Some("completed") => 0,
+                            Some("blocked") => 2,
+                            Some("budget_exhausted") => 5,
+                            Some("cancelled") => 130,
+                            _ => 3,
+                        });
+                std::process::exit(i32::try_from(code).unwrap_or(3));
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            if json_mode {
+                println!(
+                    "{}",
+                    serde_json::json!({"success": false, "error": format!("{error:#}")})
+                );
+                std::process::exit(1);
+            }
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
-    let json_mode = cli.command.json_mode();
+    let command = cli.command.unwrap_or_else(|| {
+        Command::Tui(TuiCommand {
+            repo: PathBuf::from("."),
+            lang: None,
+        })
+    });
+    let json_mode = command.json_mode();
 
-    let result = match cli.command {
+    if matches!(
+        command,
+        Command::Tui(_)
+            | Command::Ui(_)
+            | Command::Start(_)
+            | Command::Tasks(_)
+            | Command::Stop(_)
+            | Command::TaskWorker(_)
+    ) {
+        return run_workspace_command(command, cli.trust_project_profiles, json_mode).await;
+    }
+
+    let result = match command {
+        Command::Tui(_)
+        | Command::Ui(_)
+        | Command::Start(_)
+        | Command::Tasks(_)
+        | Command::Stop(_)
+        | Command::TaskWorker(_) => unreachable!("workspace commands dispatched above"),
         Command::Run(cmd) => {
             run_foreground(
                 cmd.goal,

@@ -167,6 +167,7 @@ impl ProviderInvoker for TestInvoker {
                 },
                 model_origin: ModelOrigin::ProviderDefault,
                 response: AdapterResponse {
+                    resolved_model_alias: None,
                     output,
                     stdout: String::new(),
                     stderr: String::new(),
@@ -194,6 +195,7 @@ impl ProviderInvoker for TestInvoker {
                 },
                 model_origin: ModelOrigin::Request,
                 response: AdapterResponse {
+                    resolved_model_alias: None,
                     output,
                     stdout,
                     stderr,

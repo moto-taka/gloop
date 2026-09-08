@@ -1,4 +1,35 @@
-# gloop Graph Agent CLI TUI
+# gloop terminal interfaces
+
+The default `gloop` / `gloop tui` home lists recently saved graphs. Enter opens
+one directly and `r` runs it. **+ Graph · Manual** opens a blank canvas with no
+setup wizard. `a` opens an instruction input; Enter adds the AI step, connects it
+after the selection, and returns to the graph. Later steps reuse the selected AI's
+binding. `A` adds a sibling sharing prerequisites; `c` selects a connection target.
+
+The canvas shows numbered arrows, tool/model assignments, and the selected
+instruction. The same canvas shows status symbols and output during execution.
+`Enter` edits directly; `s` saves; `O` opens files; `Tab` holds less frequent options.
+Run limits remain visible. `r` validates and runs immediately, without another
+confirmation. Full node/edge YAML editing preserves advanced graph functionality.
+No planning call or graph conversion takes place in Manual mode.
+
+Auto guides the user through a goal and planner tool/model, submits one independent
+planning invocation, and opens the validated proposal for review. No proposed step
+executes until the user chooses **Run these steps** and confirms.
+
+The plan editor uses named menu actions for instructions, completion criteria,
+per-step tool/model choices, prerequisites, addition, removal, and saving. It
+converts the reviewed plan to the existing Graph IR. Scheduling stays deterministic;
+the UI does not maintain a supervisor AI conversation. **1 AI**
+keeps the single-task and optional second-opinion path. See [TASKS.md](TASKS.md)
+for lifecycle, budgets, and durable result handoff.
+
+The following sections describe the advanced editor opened by `gloop graph`.
+Its builder now displays the authoring sequence at the top, shows each node's
+human-readable name or instruction preview, and lets Enter edit the selected
+node (or finish a connection while connecting). The selected node stays in view.
+
+## Advanced graph editor
 
 This document describes the resident terminal UX added around gloop's existing
 Graph IR and deterministic runtime. The TUI is a presentation layer: it does
@@ -186,9 +217,13 @@ not maintain a second schema.
 
 ### Edges and conditions
 
-`a` inserts a new agent immediately after the selected node and creates a data
-edge from the selected node automatically. Builder rows show each node's
-outgoing targets, so the resulting flow remains visible while editing.
+`a` inserts a new AI node immediately after the selected node and creates a
+data edge from the selected node automatically. `K` cycles its role through
+`agent`, `reduce`, and `synthesize` while preserving its prompt and provider
+binding. The detail panel explains the selected kind's purpose, including
+whether AI, a local command, or a person performs the work. Builder rows show
+each node's outgoing targets, so the resulting flow remains visible while
+editing.
 
 `c` starts an edge, then the target is selected. The edge editor chooses one of
 the existing kinds: `data`, `control`, `resource`, `conditional`, or `failure`.

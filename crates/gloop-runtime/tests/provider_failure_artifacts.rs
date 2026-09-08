@@ -85,6 +85,7 @@ fn build_graph_and_bad_response() -> (gloop_core::Graph, serde_json::Value, Adap
     let graph = gloop_core::Graph::new("provider_failure_artifacts", "schema failure", vec![node]);
     let bad_output = json!({"answer": 123});
     let response = AdapterResponse {
+        resolved_model_alias: None,
         output: AdapterOutput::Json(bad_output.clone()),
         stdout: "provider stdout sample\n".to_owned(),
         stderr: "provider stderr sample\n".to_owned(),
