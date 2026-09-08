@@ -24,11 +24,11 @@
 
 ## PR checklist
 
-- Validate requested features against README's execution model and known limitations.
+- Validate requested features against the [execution model](docs/ADVANCED.md#execution-model) and [known limitations](docs/ADVANCED.md#known-limitations).
 - If changing graph schema, update:
   - `docs/SCHEMA.md`
   - example graphs as needed
-  - schema compatibility notes in README
+  - schema compatibility notes in `docs/ADVANCED.md`
 - If changing provider config, update:
   - config examples
   - validation/error handling text
@@ -44,3 +44,23 @@
 - Use existing crate lints.
 - Prefer small, explicit changes in public API.
 - Avoid `unwrap()` in non-test code.
+
+## Install from a local checkout
+
+Run from the repository root:
+
+```bash
+cargo install --path crates/gloop-cli --locked
+```
+
+## Automated publishing
+
+Pushes to `main` run [`.github/workflows/release.yml`](.github/workflows/release.yml).
+After `cargo test --workspace` succeeds, it creates a `vX.Y.Z` tag and GitHub Release
+when that workspace version has not been released yet, then updates
+`moto-taka/homebrew-tap/Formula/gloop.rb` automatically.
+
+To enable the cross-repository update, add a fine-grained GitHub token as the
+`HOMEBREW_TAP_TOKEN` Actions secret on this repository. The token only needs
+`Contents: Read and write` access to `moto-taka/homebrew-tap`. Update the workspace
+version and the internal path-dependency versions together before merging to `main`.
