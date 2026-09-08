@@ -55,7 +55,7 @@ fn graph_help_contains_only_supported_commands() {
         .success()
         .stdout(predicate::str::contains("graph"))
         .stdout(predicate::str::contains("provider"))
-        .stdout(predicate::str::contains("inspect"))
+        .stdout(predicate::str::contains("debug"))
         .stdout(predicate::str::contains("daemon").not())
         .stdout(predicate::str::contains("queue").not())
         .get_output()

@@ -447,7 +447,12 @@ fn run_command_foreground_can_be_inspected_logged_and_replayed_with_ready_for_hu
     let run_root = repo.join(".gloop").join("runs").join(run_id);
 
     let inspect_output = gloop_cmd()
-        .args(["inspect", run_root.to_str().expect("run root"), "--json"])
+        .args([
+            "debug",
+            "inspect",
+            run_root.to_str().expect("run root"),
+            "--json",
+        ])
         .assert()
         .success()
         .get_output()
@@ -462,7 +467,12 @@ fn run_command_foreground_can_be_inspected_logged_and_replayed_with_ready_for_hu
     assert_eq!(inspect_status, Some("ready_for_human"));
 
     let logs_output = gloop_cmd()
-        .args(["logs", run_root.to_str().expect("run root"), "--json"])
+        .args([
+            "debug",
+            "logs",
+            run_root.to_str().expect("run root"),
+            "--json",
+        ])
         .assert()
         .success()
         .get_output()
@@ -480,7 +490,12 @@ fn run_command_foreground_can_be_inspected_logged_and_replayed_with_ready_for_hu
     assert!(has_finished);
 
     let replay_output = gloop_cmd()
-        .args(["replay", run_root.to_str().expect("run root"), "--json"])
+        .args([
+            "debug",
+            "replay",
+            run_root.to_str().expect("run root"),
+            "--json",
+        ])
         .assert()
         .success()
         .get_output()
@@ -493,6 +508,73 @@ fn run_command_foreground_can_be_inspected_logged_and_replayed_with_ready_for_hu
         .or_else(|| replay_json["summary"]["status"].as_str())
         .or_else(|| replay_json["success"].as_str());
     assert_eq!(replay_status, Some("ready_for_human"));
+
+    assert_diagnostic_aliases(
+        repo,
+        &run_root,
+        run_id,
+        [
+            ("inspect", inspect_json),
+            ("logs", logs_json),
+            ("replay", replay_json),
+        ],
+    );
+}
+
+fn assert_diagnostic_aliases(
+    repo: &Path,
+    run_root: &Path,
+    run_id: &str,
+    expected: [(&str, Value); 3],
+) {
+    // Old public spellings must keep their JSON and exit-code contracts.
+    for (command, expected) in expected {
+        let legacy = gloop_cmd()
+            .args([command, run_root.to_str().expect("run root"), "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        assert_eq!(parse_json_output(&legacy), expected);
+        let default_path = gloop_cmd()
+            .args(["debug", command, "--json", "--repo"])
+            .arg(run_root)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        assert_eq!(parse_json_output(&default_path), expected);
+    }
+    let legacy = gloop_cmd()
+        .args(["status", run_id, "--json", "--repo"])
+        .arg(repo)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let canonical = gloop_cmd()
+        .args(["debug", "status", run_id, "--json", "--repo"])
+        .arg(repo)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let mut legacy = parse_json_output(&legacy);
+    let mut canonical = parse_json_output(&canonical);
+    // The observation age advances between queries; the execution evidence must match.
+    legacy["run"]
+        .as_object_mut()
+        .expect("run")
+        .remove("last_event_age_ms");
+    canonical["run"]
+        .as_object_mut()
+        .expect("run")
+        .remove("last_event_age_ms");
+    assert_eq!(legacy, canonical);
 }
 
 #[test]
@@ -531,7 +613,12 @@ fn run_with_max_parallel_cap_does_not_raise_graph_policy() {
     assert!(authored_graph.contains("max_parallel: 1"));
 
     let logs_output = gloop_cmd()
-        .args(["logs", run_root.to_str().expect("run root"), "--json"])
+        .args([
+            "debug",
+            "logs",
+            run_root.to_str().expect("run root"),
+            "--json",
+        ])
         .assert()
         .success()
         .get_output()
@@ -595,7 +682,12 @@ fn run_logs_rejects_symlinked_journal() {
     symlink(&target, &link).expect("create symlinked journal");
 
     let output = gloop_cmd()
-        .args(["logs", run_root.to_str().expect("run root"), "--json"])
+        .args([
+            "debug",
+            "logs",
+            run_root.to_str().expect("run root"),
+            "--json",
+        ])
         .output()
         .expect("logs command");
 
@@ -620,7 +712,12 @@ fn run_logs_rejects_symlinked_run_directory() {
     symlink(&actual_run, &linked_run).expect("create symlinked run directory");
 
     let output = gloop_cmd()
-        .args(["logs", linked_run.to_str().expect("run root"), "--json"])
+        .args([
+            "debug",
+            "logs",
+            linked_run.to_str().expect("run root"),
+            "--json",
+        ])
         .output()
         .expect("logs command");
 
@@ -641,7 +738,12 @@ fn run_logs_rejects_non_regular_journal() {
     fs::create_dir(run_root.join("journal.jsonl")).expect("create non-regular journal path");
 
     let output = gloop_cmd()
-        .args(["logs", run_root.to_str().expect("run root"), "--json"])
+        .args([
+            "debug",
+            "logs",
+            run_root.to_str().expect("run root"),
+            "--json",
+        ])
         .output()
         .expect("logs command");
 
@@ -706,7 +808,12 @@ fn run_logs_incomplete_journal_is_a_local_cli_error() {
     write_incomplete_journal(dir.path());
 
     let output = gloop_cmd()
-        .args(["logs", dir.path().to_str().expect("temp dir"), "--json"])
+        .args([
+            "debug",
+            "logs",
+            dir.path().to_str().expect("temp dir"),
+            "--json",
+        ])
         .assert()
         .code(6)
         .get_output()
@@ -728,7 +835,12 @@ fn run_logs_tampered_journal_is_a_local_cli_error() {
     write_tampered_journal(dir.path());
 
     let output = gloop_cmd()
-        .args(["logs", dir.path().to_str().expect("temp dir"), "--json"])
+        .args([
+            "debug",
+            "logs",
+            dir.path().to_str().expect("temp dir"),
+            "--json",
+        ])
         .assert()
         .code(6)
         .get_output()
@@ -776,7 +888,12 @@ fn run_logs_missing_final_run_finished_row_is_a_local_cli_error() {
     remove_last_journal_row(&run_root);
 
     let logs_output = gloop_cmd()
-        .args(["logs", run_root.to_str().expect("run root"), "--json"])
+        .args([
+            "debug",
+            "logs",
+            run_root.to_str().expect("run root"),
+            "--json",
+        ])
         .assert()
         .code(6)
         .get_output()
@@ -821,7 +938,7 @@ fn status_reports_live_progress_then_final_result() {
     for _ in 0..100 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         let output = gloop_cmd()
-            .args(["status", run_id, "--repo", repo_arg, "--json"])
+            .args(["debug", "status", run_id, "--repo", repo_arg, "--json"])
             .output()
             .expect("status runs");
         if !output.status.success() {
@@ -843,7 +960,7 @@ fn status_reports_live_progress_then_final_result() {
     assert!(exit.success(), "foreground run succeeds");
 
     let output = gloop_cmd()
-        .args(["status", run_id, "--repo", repo_arg, "--json"])
+        .args(["debug", "status", run_id, "--repo", repo_arg, "--json"])
         .output()
         .expect("status after finish");
     assert!(output.status.success());
@@ -879,7 +996,7 @@ fn status_query_exits_zero_and_wait_returns_run_exit_code() {
     // A successful query exits 0 even when the run itself failed: polling
     // loops must distinguish query errors from run state via phase/final_status.
     gloop_cmd()
-        .args(["status", "--repo", repo_arg, "--json"])
+        .args(["debug", "status", "--repo", repo_arg, "--json"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"phase\": \"finished\""))
@@ -887,14 +1004,14 @@ fn status_query_exits_zero_and_wait_returns_run_exit_code() {
 
     // --wait on an already finished run returns the run's exit code.
     gloop_cmd()
-        .args(["status", "--wait", "--repo", repo_arg, "--json"])
+        .args(["debug", "status", "--wait", "--repo", repo_arg, "--json"])
         .assert()
         .code(3)
         .stdout(predicate::str::contains("\"phase\": \"finished\""));
 
     // Text mode keeps the same contract.
     gloop_cmd()
-        .args(["status", "--repo", repo_arg])
+        .args(["debug", "status", "--repo", repo_arg])
         .assert()
         .success()
         .stdout(predicate::str::contains("phase"));
@@ -987,7 +1104,7 @@ fn status_newest_run_is_chosen_by_mtime_not_name() {
 
     // The id-less query must pick the newest by mtime, not by name.
     gloop_cmd()
-        .args(["status", "--repo", repo_arg, "--json"])
+        .args(["debug", "status", "--repo", repo_arg, "--json"])
         .assert()
         .success()
         .stdout(predicate::str::contains(
@@ -1003,7 +1120,14 @@ fn status_unknown_run_fails_with_error() {
     fs::create_dir_all(repo.join(".gloop").join("runs")).expect("create runs dir");
 
     gloop_cmd()
-        .args(["status", "does-not-exist", "--repo", repo_arg, "--json"])
+        .args([
+            "debug",
+            "status",
+            "does-not-exist",
+            "--repo",
+            repo_arg,
+            "--json",
+        ])
         .assert()
         .code(6)
         .stdout(predicate::str::contains("run not found"));

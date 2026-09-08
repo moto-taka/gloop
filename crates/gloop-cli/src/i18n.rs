@@ -412,7 +412,7 @@ pub const EN: Strings = Strings {
     status_edit_cancelled: "Edit cancelled.",
     status_cancel_requested: "Cancellation requested; waiting for the runtime to finish...",
     status_run_started: "Run started. The runtime owns scheduling; this screen only observes events.",
-    status_run_dir: "Run {run_id}: .gloop/runs/{run_id} — poll it with 'gloop status {run_id}'",
+    status_run_dir: "Run {run_id}: .gloop/runs/{run_id} — poll it with 'gloop debug status {run_id}'",
     status_gate_waiting: "Human gate waiting: press y to approve, n to reject, Enter for default.",
     status_run_finished: "Run finished: {status}. Press o on a node to view its output.",
     status_run_failed: "Run failed: {error}",
@@ -571,7 +571,7 @@ pub const EN: Strings = Strings {
     event_run_finished: "run finished",
     output_title: " Output · {node} · j/k scroll · Esc close ",
     output_unavailable: "No output for this node yet.",
-    output_live_hint: "While a run is in flight, poll intermediate results with: gloop status {run_id} --json",
+    output_live_hint: "While a run is in flight, poll intermediate results with: gloop debug status {run_id} --json",
     issues_title: " Validation issues · j/k scroll · Esc close ",
     issues_none: "No issues: the graph is valid.",
     issue_error: "error",
@@ -584,7 +584,7 @@ pub const EN: Strings = Strings {
     help_step_validate: "4. v        validate; the issue list opens automatically on errors",
     help_step_run: "5. s / r    save the YAML, or run immediately (r auto-saves)",
     help_step_monitor: "6. 3        watch node states; o opens a node's full output",
-    help_step_status: "Outside the TUI, any agent can poll a run: gloop status --json",
+    help_step_status: "Outside the TUI, any agent can poll a run: gloop debug status --json",
     help_keys_title: "KEYS",
 };
 
@@ -660,7 +660,7 @@ pub const JA: Strings = Strings {
     status_edit_cancelled: "編集をキャンセルしました。",
     status_cancel_requested: "停止を要求しました。ランタイムの終了を待っています…",
     status_run_started: "実行を開始しました。進行管理はランタイムが担当し、この画面は観察のみ行います。",
-    status_run_dir: "実行 {run_id}: .gloop/runs/{run_id} — 'gloop status {run_id}' で進行を確認できます",
+    status_run_dir: "実行 {run_id}: .gloop/runs/{run_id} — 'gloop debug status {run_id}' で進行を確認できます",
     status_gate_waiting: "承認ゲートが待機中: y=承認、n=拒否、Enter=既定値。",
     status_run_finished: "実行終了: {status}。ノードを選んで o を押すと全出力を見られます。",
     status_run_failed: "実行失敗: {error}",
@@ -819,7 +819,7 @@ pub const JA: Strings = Strings {
     event_run_finished: "実行終了",
     output_title: " 出力 · {node} · j/k スクロール · Esc 閉じる ",
     output_unavailable: "このノードにはまだ出力がありません。",
-    output_live_hint: "実行中の中間結果は別ターミナルから確認できます: gloop status {run_id} --json",
+    output_live_hint: "実行中の中間結果は別ターミナルから確認できます: gloop debug status {run_id} --json",
     issues_title: " 検証結果 · j/k スクロール · Esc 閉じる ",
     issues_none: "問題はありません。グラフは妥当です。",
     issue_error: "エラー",
@@ -832,7 +832,7 @@ pub const JA: Strings = Strings {
     help_step_validate: "4. v        検証。エラーがあれば一覧が自動で開きます",
     help_step_run: "5. s / r    YAMLを保存、または即実行（r は直前に自動保存）",
     help_step_monitor: "6. 3        ノードの状態を監視。o でノードの全出力を表示",
-    help_step_status: "TUIの外からは任意のagentが進行をポーリングできます: gloop status --json",
+    help_step_status: "TUIの外からは任意のagentが進行をポーリングできます: gloop debug status --json",
     help_keys_title: "キー一覧",
 };
 

@@ -8,7 +8,15 @@ description: Use gloop to find, create, edit, validate, and run agent graphs for
 Use this skill when a person asks to make a gloop workflow, change its nodes,
 choose a harness or model, or run an existing graph.
 
-## Safe beginner flow
+## Terminal workspace
+
+For everyday interactive use, start `gloop` (Japanese: `gloop --lang ja`).
+Open a saved graph with Enter, or choose **+ Graph · Manual** and use
+`a` → instruction → Enter to add connected steps. `r` validates and runs;
+`s` saves. Use the command flow below for scripts or when a browser editor is
+requested. The optional browser workspace is `gloop ui`.
+
+## Command authoring
 
 Run these commands from the project directory. Do not invent a filename before
 checking the list.
@@ -58,10 +66,10 @@ Or start from a known template:
 gloop graph init --name my-flow --from plan-implement-verify --gui
 ~~~
 
-For a saved project template, update is the friendly alias:
+Edit a saved project template by its name:
 
 ~~~text
-gloop graph update my-flow --gui
+gloop graph edit my-flow --gui
 ~~~
 
 ## When there is no browser
@@ -85,7 +93,7 @@ with `--lang`:
 ~~~text
 gloop graph edit NAME --gui --lang en
 gloop graph edit NAME --gui --lang ja
-gloop graph tui --lang ja
+gloop graph --lang ja
 ~~~
 
 Inside the TUI, press `l` to switch English/日本語 live.
@@ -122,14 +130,14 @@ holding the run open:
 1. Start the run with a stable id you choose, in the background:
    gloop run --graph PATH --repo . --run-id my-task &
 2. Poll live status (safe while the run is in flight):
-   gloop status my-task --json
+   gloop debug status my-task --json
 3. Or block until the run finishes and get the run's exit code:
-   gloop status my-task --wait --json
+   gloop debug status my-task --wait --json
 4. For full post-run inspection:
-   gloop inspect .gloop/runs/my-task
+   gloop debug inspect .gloop/runs/my-task
 ~~~
 
-`gloop status --json` fields that matter to a supervisor:
+`gloop debug status --json` fields that matter to a supervisor:
 
 - `run.phase`: `initializing`, `running`, or `finished`.
 - `run.nodes[]`: per-node `status`, `attempts`, intermediate `output`, `error`.
@@ -141,7 +149,7 @@ holding the run open:
 Querying status always exits 0 when the query itself succeeds; use
 `--wait` when the exit code must reflect the run outcome (`0` success,
 `2` blocked/human gate, `3` verification/execution failure, `5` budget
-exhausted, `130` cancelled). With no run id, `gloop status` reports the
+exhausted, `130` cancelled). With no run id, `gloop debug status` reports the
 newest run under `.gloop/runs/`.
 
 The resident TUI (`gloop graph`) is the human-friendly equivalent: it shows
