@@ -359,6 +359,10 @@ pub struct AdapterResponse {
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reported_model: Option<String>,
+    /// A provider-native selection alias that resolved to `reported_model`.
+    /// Concrete model ids still require exact equality in the runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model_alias: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reported_model_informational: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

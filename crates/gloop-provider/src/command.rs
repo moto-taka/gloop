@@ -386,6 +386,11 @@ impl ProviderAdapter for CommandAdapter {
         );
 
         Ok(AdapterResponse {
+            resolved_model_alias: resolved_claude_alias(
+                &executable,
+                request.model.as_deref(),
+                reported_model.as_deref(),
+            ),
             output,
             stdout,
             stderr,
@@ -397,6 +402,26 @@ impl ProviderAdapter for CommandAdapter {
             usage,
         })
     }
+}
+
+fn resolved_claude_alias(
+    executable: &str,
+    requested: Option<&str>,
+    reported: Option<&str>,
+) -> Option<String> {
+    if crate::models::executable_basename(executable) != Some("claude") || reported.is_none() {
+        return None;
+    }
+    let requested = requested?;
+    let base = requested.strip_suffix("[1m]").unwrap_or(requested);
+    // Native aliases are version- and account-dependent, and may be customized
+    // in Claude Code. Keep the returned concrete identity, not a guessed pin.
+    // https://code.claude.com/docs/en/model-config#model-aliases
+    (matches!(
+        base,
+        "default" | "best" | "haiku" | "sonnet" | "opus" | "fable" | "opusplan"
+    ) || (base != requested && reported == Some(base)))
+    .then(|| requested.to_owned())
 }
 
 fn render_arguments(
@@ -776,6 +801,54 @@ mod tests {
     use super::*;
     use crate::adapter::AdapterCapability;
     use crate::config::{ProfileKind, ProfileStore};
+
+    #[test]
+    fn resolved_claude_alias_keeps_native_aliases_distinct_from_pinned_models() {
+        for alias in [
+            "haiku",
+            "sonnet",
+            "opus",
+            "default",
+            "best",
+            "fable",
+            "opusplan",
+            "sonnet[1m]",
+        ] {
+            assert_eq!(
+                resolved_claude_alias(
+                    "/bin/claude",
+                    Some(alias),
+                    Some("claude-haiku-4-5-20251001")
+                ),
+                Some(alias.to_owned())
+            );
+        }
+        assert_eq!(
+            resolved_claude_alias(
+                "claude",
+                Some("claude-sonnet-4-6[1m]"),
+                Some("claude-sonnet-4-6")
+            ),
+            Some("claude-sonnet-4-6[1m]".to_owned())
+        );
+        for (executable, requested, reported) in [
+            ("codex", Some("haiku"), Some("another-model")),
+            (
+                "claude",
+                Some("claude-haiku-4-5-20251001"),
+                Some("another-model"),
+            ),
+            (
+                "claude",
+                Some("claude-sonnet-4-6[1m]"),
+                Some("another-model"),
+            ),
+            ("claude", Some("haiku"), None),
+            ("claude", None, Some("claude-haiku-4-5-20251001")),
+        ] {
+            assert_eq!(resolved_claude_alias(executable, requested, reported), None);
+        }
+    }
 
     fn adapter(command: CommandProfile, capabilities: AdapterCapabilities) -> CommandAdapter {
         CommandAdapter::new("test", None, capabilities, command)

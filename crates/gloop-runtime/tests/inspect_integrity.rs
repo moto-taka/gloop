@@ -59,6 +59,7 @@ impl ProviderInvoker for TestInvoker {
             selection_origin: SelectionOrigin::Explicit,
             model_origin: ModelOrigin::ProviderDefault,
             response: AdapterResponse {
+                resolved_model_alias: None,
                 output: AdapterOutput::Json(json!({"value": 1})),
                 stdout: String::new(),
                 stderr: String::new(),
@@ -107,6 +108,7 @@ impl ProviderInvoker for RetryInvoker {
             selection_origin: SelectionOrigin::Explicit,
             model_origin: ModelOrigin::ProviderDefault,
             response: AdapterResponse {
+                resolved_model_alias: None,
                 output: AdapterOutput::Text("retry succeeded".to_owned()),
                 stdout: String::new(),
                 stderr: String::new(),

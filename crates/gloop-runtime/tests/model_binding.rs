@@ -102,6 +102,7 @@ impl ProviderInvoker for FakeProviderInvoker {
             selection_origin: SelectionOrigin::Explicit,
             model_origin: ModelOrigin::ProviderDefault,
             response: AdapterResponse {
+                resolved_model_alias: None,
                 output: AdapterOutput::Text("ok".to_owned()),
                 stdout: String::new(),
                 stderr: String::new(),

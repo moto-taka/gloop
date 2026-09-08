@@ -383,6 +383,7 @@ fn parse_openai_response(
     let reported_model = parse_reported_model(profile, raw)?;
     emit_http_completion(events, profile, &text, usage.as_ref());
     Ok(AdapterResponse {
+        resolved_model_alias: None,
         output,
         stdout: String::new(),
         stderr: String::new(),
@@ -410,6 +411,7 @@ fn parse_anthropic_response(
     let reported_model = parse_reported_model(profile, raw)?;
     emit_http_completion(events, profile, &text, usage.as_ref());
     Ok(AdapterResponse {
+        resolved_model_alias: None,
         output,
         stdout: String::new(),
         stderr: String::new(),

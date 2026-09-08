@@ -4,6 +4,9 @@
 //! scheduling, retries, artifacts, and journal persistence remain in the
 //! existing core/provider/runtime crates.
 
+mod canvas;
+mod manual;
+
 use std::{
     collections::{HashMap, VecDeque},
     fs,
@@ -34,7 +37,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs},
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -141,11 +144,15 @@ enum InputTarget {
     Model(BindingTarget),
     NodePrompt,
     TemplateName,
+    Manual(manual::Field),
 }
 
 impl InputTarget {
     const fn multiline(self) -> bool {
-        !matches!(self, Self::Model(_) | Self::TemplateName)
+        match self {
+            Self::Manual(field) => field.multiline(),
+            _ => !matches!(self, Self::Model(_) | Self::TemplateName),
+        }
     }
 }
 
@@ -171,6 +178,7 @@ struct TemplatePreview {
 
 #[derive(Debug)]
 enum Modal {
+    Manual(manual::Menu),
     Input(InputState),
     TemplatePicker {
         selected: usize,
@@ -315,11 +323,23 @@ struct App {
     /// from a template would replace user content. Task edits then update the
     /// goal only instead of rebuilding.
     manual_edits: bool,
+    manual_mode: bool,
 }
 
 impl App {
-    #[allow(clippy::too_many_lines)]
     fn new(repo: PathBuf, trust_project_profiles: bool, lang: Language) -> Result<Self> {
+        let graph_path = templates::graph_path(&repo, "work");
+        Self::new_with_graph(repo, trust_project_profiles, lang, graph_path, false)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn new_with_graph(
+        repo: PathBuf,
+        trust_project_profiles: bool,
+        lang: Language,
+        graph_path: PathBuf,
+        blank: bool,
+    ) -> Result<Self> {
         let profiles = build_profile_choices(&repo, trust_project_profiles).map_err(|error| {
             anyhow!(
                 "{}",
@@ -329,41 +349,52 @@ impl App {
                 )
             )
         })?;
-        let graph_path = templates::graph_path(&repo, "work");
         templates::ensure_managed_directory(&repo, Path::new(templates::GRAPHS_DIR))
             .map_err(|error| anyhow!("managed graph directory is unsafe: {error}"))?;
-        let (graph, expected_sha256, create_only) = match fs::symlink_metadata(&graph_path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(anyhow!(
-                    "graph save target is a symlink: {}",
-                    graph_path.display()
-                ));
-            }
-            Ok(metadata) if !metadata.is_file() => {
-                return Err(anyhow!(
-                    "graph save target is not a regular file: {}",
-                    graph_path.display()
-                ));
-            }
-            Ok(_) => {
-                let graph = Graph::from_path(&graph_path)
-                    .map_err(|error| anyhow!("failed to load {}: {error}", graph_path.display()))?;
-                let expected_sha256 = file_sha256(&graph_path)?;
-                (graph, Some(expected_sha256), false)
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let template = GraphTemplate::Direct;
-                let task = lang.strings().default_task.to_owned();
-                let mut graph = Self::build_graph(template, &task, None, None);
-                graph.metadata.name = String::from("work");
-                graph.spec.goal.clone_from(&task);
-                (graph, None, true)
-            }
-            Err(error) => {
-                return Err(anyhow!(
-                    "failed to inspect graph save target {}: {error}",
-                    graph_path.display()
-                ));
+        let (graph, expected_sha256, create_only) = if blank {
+            let name = graph_path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("workflow");
+            let mut graph = Graph::new(name, "", vec![]);
+            graph.spec.budgets.model_calls = Some(16);
+            graph.spec.budgets.wall_time_seconds = Some(1800);
+            (graph, None, true)
+        } else {
+            match fs::symlink_metadata(&graph_path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(anyhow!(
+                        "graph save target is a symlink: {}",
+                        graph_path.display()
+                    ));
+                }
+                Ok(metadata) if !metadata.is_file() => {
+                    return Err(anyhow!(
+                        "graph save target is not a regular file: {}",
+                        graph_path.display()
+                    ));
+                }
+                Ok(_) => {
+                    let graph = Graph::from_path(&graph_path).map_err(|error| {
+                        anyhow!("failed to load {}: {error}", graph_path.display())
+                    })?;
+                    let expected_sha256 = file_sha256(&graph_path)?;
+                    (graph, Some(expected_sha256), false)
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    let template = GraphTemplate::Direct;
+                    let task = lang.strings().default_task.to_owned();
+                    let mut graph = Self::build_graph(template, &task, None, None);
+                    graph.metadata.name = String::from("work");
+                    graph.spec.goal.clone_from(&task);
+                    (graph, None, true)
+                }
+                Err(error) => {
+                    return Err(anyhow!(
+                        "failed to inspect graph save target {}: {error}",
+                        graph_path.display()
+                    ));
+                }
             }
         };
         let task = graph.spec.goal.clone();
@@ -388,7 +419,7 @@ impl App {
         let template = TemplateChoice::Builtin(GraphTemplate::Direct);
         // A graph loaded from disk is treated as user content: applying a
         // template replaces it, so the pickers warn about it.
-        let manual_edits = expected_sha256.is_some();
+        let manual_edits = blank || expected_sha256.is_some();
 
         Ok(Self {
             repo,
@@ -424,6 +455,7 @@ impl App {
             status: lang.strings().status_ready.to_owned(),
             dirty: false,
             manual_edits,
+            manual_mode: blank,
         })
     }
 
@@ -757,6 +789,30 @@ impl App {
         true
     }
 
+    fn toggle_selected_node_kind(&mut self) {
+        let Some(node) = self.graph.spec.nodes.get_mut(self.selected_node) else {
+            self.set_status(self.strings().status_no_node);
+            return;
+        };
+        let id = node.id.clone();
+        let Some(kind) = next_provider_kind(&node.kind) else {
+            let current_kind = node_kind_label(node);
+            self.status = fill(
+                self.strings().status_kind_toggle_not_applicable,
+                &[("id", &id), ("kind", current_kind)],
+            );
+            return;
+        };
+        let label = node_kind_label_from_kind(&kind);
+        node.kind = kind;
+        self.dirty = true;
+        self.manual_edits = true;
+        self.status = fill(
+            self.strings().status_kind_toggled,
+            &[("id", &id), ("kind", label)],
+        );
+    }
+
     /// The profile whose discovered catalog feeds the model picker: the
     /// explicit binding for the target, otherwise the runtime default.
     fn catalog_profile(&self, target: BindingTarget) -> Option<String> {
@@ -948,6 +1004,9 @@ impl App {
             return;
         }
         let id = node.id.clone();
+        if self.manual_mode && node.profile() != name.as_deref() {
+            set_node_model(node, None);
+        }
         set_node_profile(node, name.clone());
         self.dirty = true;
         self.manual_edits = true;
@@ -1017,6 +1076,13 @@ impl App {
 
     fn begin_input(&mut self, target: InputTarget) {
         let value = match target {
+            InputTarget::Manual(field) => match self.manual_value(field) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.status = error.to_string();
+                    return;
+                }
+            },
             InputTarget::Task => self.task.clone(),
             InputTarget::TemplateName => String::new(),
             InputTarget::Model(BindingTarget::Graph) => self.model.clone().unwrap_or_default(),
@@ -1058,6 +1124,12 @@ impl App {
         };
         let value = input.value.trim().to_owned();
         match input.target {
+            InputTarget::Manual(field) => {
+                if let Err(error) = self.manual_commit(field, &value) {
+                    self.status = error.to_string();
+                    self.modal = Some(Modal::Input(input));
+                }
+            }
             InputTarget::Task => {
                 if value.is_empty() {
                     self.set_status(self.strings().status_task_empty);
@@ -1238,6 +1310,11 @@ impl App {
             }
             KeyCode::Char('s' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.commit_input();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                input.value.clear();
+                input.cursor = 0;
+                input.preferred_col = None;
             }
             KeyCode::Enter => {
                 let newline_modifier = key
@@ -1511,6 +1588,9 @@ impl App {
     }
 
     fn handle_modal_key(&mut self, key: KeyEvent) -> Action {
+        if matches!(self.modal, Some(Modal::Manual(_))) {
+            return self.handle_manual_menu_key(key);
+        }
         if let Some(Modal::LaneBinding { selected }) = &self.modal {
             let selected = *selected;
             return self.handle_lane_key(key, selected);
@@ -1596,6 +1676,7 @@ impl App {
             // LaneBinding and the profile/model pickers return early above.
             Some(
                 Modal::LaneBinding { .. }
+                | Modal::Manual(_)
                 | Modal::ProfilePicker { .. }
                 | Modal::ModelPicker { .. }
                 | Modal::ModelLoading { .. }
@@ -1668,6 +1749,11 @@ impl App {
                 _ => {}
             }
             return Action::Continue;
+        }
+        if self.manual_mode
+            && let Some(action) = self.handle_manual_shortcut(key)
+        {
+            return action;
         }
         match key.code {
             KeyCode::Char('q') => Action::Quit,
@@ -1754,8 +1840,8 @@ impl App {
                 self.remove_node();
                 Action::Continue
             }
-            KeyCode::Char('e') if self.screen == Screen::Builder => {
-                self.begin_input(InputTarget::NodePrompt);
+            KeyCode::Char('K') if self.screen == Screen::Builder => {
+                self.toggle_selected_node_kind();
                 Action::Continue
             }
             KeyCode::Char('c') if self.screen == Screen::Builder => {
@@ -1768,6 +1854,10 @@ impl App {
             }
             KeyCode::Esc if self.connect_from.take().is_some() => {
                 self.set_status(self.strings().status_connect_cancelled);
+                Action::Continue
+            }
+            KeyCode::Enter | KeyCode::Char('e') if self.screen == Screen::Builder => {
+                self.begin_input(InputTarget::NodePrompt);
                 Action::Continue
             }
             _ => Action::Continue,
@@ -2098,6 +2188,13 @@ impl App {
                     strings.status_run_finished,
                     &[("status", final_status_label(summary.status, self.lang))],
                 );
+                if self.manual_mode {
+                    self.status = if summary.status == gloop_core::FinalStatus::ReadyForHuman {
+                        self.manual_text("✓ Finished", "✓ 完了").to_owned()
+                    } else {
+                        final_status_label(summary.status, self.lang).to_owned()
+                    };
+                }
                 self.last_summary = Some(summary);
             }
             Ok(Err(error)) => {
@@ -2268,6 +2365,13 @@ impl App {
             self.strings().status_saved,
             &[("path", &path.display().to_string())],
         );
+        if self.manual_mode {
+            self.status = format!(
+                "{}: {}",
+                self.manual_text("Saved", "保存済み"),
+                self.graph.metadata.name
+            );
+        }
         Ok(())
     }
 }
@@ -2623,7 +2727,11 @@ impl EffectiveBinding {
 }
 
 fn node_kind_label(node: &Node) -> &'static str {
-    match &node.kind {
+    node_kind_label_from_kind(&node.kind)
+}
+
+fn node_kind_label_from_kind(kind: &NodeKind) -> &'static str {
+    match kind {
         NodeKind::Agent { .. } => "agent",
         NodeKind::Command { .. } => "command",
         NodeKind::Reduce { .. } => "reduce",
@@ -2632,6 +2740,62 @@ fn node_kind_label(node: &Node) -> &'static str {
         NodeKind::Gate { .. } => "gate",
         NodeKind::Loop { .. } => "loop",
         NodeKind::Subgraph { .. } => "subgraph",
+    }
+}
+
+fn next_provider_kind(kind: &NodeKind) -> Option<NodeKind> {
+    match kind {
+        NodeKind::Agent {
+            prompt,
+            profile,
+            model,
+            output,
+            ..
+        } => Some(NodeKind::Reduce {
+            prompt: prompt.clone(),
+            profile: profile.clone(),
+            model: model.clone(),
+            output: output.clone(),
+        }),
+        NodeKind::Reduce {
+            prompt,
+            profile,
+            model,
+            output,
+            ..
+        } => Some(NodeKind::Synthesize {
+            prompt: prompt.clone(),
+            profile: profile.clone(),
+            model: model.clone(),
+            output: output.clone(),
+        }),
+        NodeKind::Synthesize {
+            prompt,
+            profile,
+            model,
+            output,
+            ..
+        } => Some(NodeKind::Agent {
+            prompt: prompt.clone(),
+            profile: profile.clone(),
+            model: model.clone(),
+            fan_out: 1,
+            output: output.clone(),
+        }),
+        _ => None,
+    }
+}
+
+fn node_kind_purpose(node: &Node, strings: &Strings) -> &'static str {
+    match &node.kind {
+        NodeKind::Agent { .. } => strings.builder_purpose_agent,
+        NodeKind::Reduce { .. } => strings.builder_purpose_reduce,
+        NodeKind::Synthesize { .. } => strings.builder_purpose_synthesize,
+        NodeKind::Command { .. } => strings.builder_purpose_command,
+        NodeKind::Verify { .. } => strings.builder_purpose_verify,
+        NodeKind::Gate { .. } => strings.builder_purpose_gate,
+        NodeKind::Loop { .. } => strings.builder_purpose_loop,
+        NodeKind::Subgraph { .. } => strings.builder_purpose_subgraph,
     }
 }
 
@@ -2696,10 +2860,15 @@ fn render(frame: &mut Frame, app: &App) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         );
-    frame.render_widget(tabs, root[0]);
+    if app.manual_mode {
+        canvas::render_header(frame, app, root[0]);
+    } else {
+        frame.render_widget(tabs, root[0]);
+    }
 
     match app.screen {
         Screen::Overview => render_overview(frame, app, root[1]),
+        Screen::Builder | Screen::Run if app.manual_mode => canvas::render(frame, app, root[1]),
         Screen::Builder => render_builder(frame, app, root[1]),
         Screen::Run => render_run(frame, app, root[1]),
     }
@@ -2739,6 +2908,29 @@ fn render(frame: &mut Frame, app: &App) {
             }
         )),
     ];
+    let footer_keys = if app.manual_mode && matches!(app.modal, Some(Modal::Input(_))) {
+        vec![Span::raw(app.manual_text(
+            "Enter apply · Alt+Enter newline · Ctrl+U clear · Esc back",
+            "Enter 反映 · Alt+Enter 改行 · Ctrl+U 消去 · Esc 戻る",
+        ))]
+    } else if app.manual_mode && app.active_run.is_some() {
+        vec![Span::raw(app.manual_text(
+            "↑↓ step · o output · y/n approve/reject · q stop",
+            "↑↓ 作業を選ぶ · o 出力 · y/n 承認・拒否 · q 停止",
+        ))]
+    } else if app.manual_mode && app.screen == Screen::Run {
+        vec![Span::raw(app.manual_text(
+            "↑↓ step · o output · Esc graph · r run again · q home",
+            "↑↓ 選択 · o 出力 · Esc グラフ · r 再実行 · q ホーム",
+        ))]
+    } else if app.manual_mode {
+        vec![Span::raw(app.manual_text(
+            "↑↓ select · p AI · m model · s save · O open · Tab more · q home",
+            "↑↓ 選択 · p AI · m モデル · s 保存 · O 開く · Tab 詳細 · q ホーム",
+        ))]
+    } else {
+        footer_keys
+    };
     let footer = Paragraph::new(Text::from(vec![
         Line::from(vec![
             Span::styled(strings.status_prefix, Style::default().fg(Color::DarkGray)),
@@ -2750,6 +2942,7 @@ fn render(frame: &mut Frame, app: &App) {
     frame.render_widget(footer, root[2]);
 
     match &app.modal {
+        Some(Modal::Manual(menu)) => manual::render_menu(frame, app, menu, area),
         Some(Modal::Input(input)) => {
             let height = input_height(input, area);
             let title = match input.target {
@@ -2761,6 +2954,7 @@ fn render(frame: &mut Frame, app: &App) {
                 ),
                 InputTarget::NodePrompt => strings.input_prompt.to_owned(),
                 InputTarget::TemplateName => strings.input_template_name.to_owned(),
+                InputTarget::Manual(field) => app.manual_field_title(field).to_owned(),
             };
             render_input(frame, input, &title, centered_rect(90, height, area));
         }
@@ -2784,6 +2978,10 @@ fn render(frame: &mut Frame, app: &App) {
                 &lanes,
                 centered_rect(80, height, area),
             );
+        }
+        Some(Modal::ProfilePicker { selected, .. }) if app.manual_mode => {
+            let height = u16::try_from(app.profiles.len().max(1) + 5).unwrap_or(u16::MAX);
+            canvas::render_profiles(frame, app, *selected, centered_rect(70, height, area));
         }
         Some(Modal::ProfilePicker { selected, target }) => {
             let height = u16::try_from(app.profiles.len().max(1) + 5).unwrap_or(u16::MAX);
@@ -3040,6 +3238,17 @@ fn render_overview(frame: &mut Frame, app: &App, area: Rect) {
 #[allow(clippy::too_many_lines)]
 fn render_builder(frame: &mut Frame, app: &App, area: Rect) {
     let strings = app.strings();
+    let sections = Layout::vertical([Constraint::Length(4), Constraint::Min(5)]).split(area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(if app.manual_mode { app.manual_text("Manual: build your own graph. Connected steps receive the preceding results.", "Manual：自分でグラフを組みます。接続した作業へ結果を渡して進みます。") } else { strings.builder_intro }),
+            Line::from(if app.manual_mode { app.manual_text("Tab opens named actions: add, connect, open, save, run. Enter edits the selected step.", "Tab で追加・接続・開く・保存・実行のメニュー。作業を選んで Enter で編集。") } else { strings.builder_next }),
+        ])
+        .style(Style::default().fg(Color::Cyan))
+        .wrap(ratatui::widgets::Wrap { trim: false }),
+        sections[0],
+    );
+    let area = sections[1];
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
@@ -3068,7 +3277,7 @@ fn render_builder(frame: &mut Frame, app: &App, area: Rect) {
                 .filter_map(|edge| (edge.from == node.id).then_some(edge.to.as_str()))
                 .collect::<Vec<_>>();
             let selected = index == app.selected_node;
-            let item = ListItem::new(Line::from(Span::raw(builder_node_row(
+            let row = Line::from(Span::raw(builder_node_row(
                 &node.id,
                 node_kind_label(node),
                 &outgoing,
@@ -3076,7 +3285,22 @@ fn render_builder(frame: &mut Frame, app: &App, area: Rect) {
                 id_columns,
                 selected,
                 max_list_width,
-            ))));
+            )));
+            let label = node
+                .label
+                .as_deref()
+                .or_else(|| node_prompt(node))
+                .unwrap_or_default();
+            let item = ListItem::new(vec![
+                row,
+                Line::from(format!(
+                    "  {}",
+                    clip_to_columns(
+                        label.lines().next().unwrap_or_default(),
+                        max_list_width.saturating_sub(2)
+                    )
+                )),
+            ]);
             if selected {
                 item.style(
                     Style::default()
@@ -3093,9 +3317,10 @@ fn render_builder(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         strings.builder_nodes_title.to_owned()
     };
-    frame.render_widget(
+    frame.render_stateful_widget(
         List::new(items).block(Block::default().borders(Borders::ALL).title(title)),
         columns[0],
+        &mut ListState::default().with_selected(Some(app.selected_node)),
     );
 
     let Some(node) = app.graph.spec.nodes.get(app.selected_node) else {
@@ -3121,6 +3346,11 @@ fn render_builder(frame: &mut Frame, app: &App, area: Rect) {
         .collect::<Vec<_>>();
     let prompt = node_prompt(node).unwrap_or(strings.builder_not_prompt);
     let binding = app.effective_binding(node);
+    let kind_toggle_hint = if binds_provider(node) {
+        strings.builder_kind_toggle_hint
+    } else {
+        ""
+    };
     let detail = vec![
         Line::from(vec![
             Span::styled(
@@ -3132,9 +3362,15 @@ fn render_builder(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(&node.id),
         ]),
         Line::from(format!(
-            "{}: {}",
+            "{}: {}{}",
             strings.builder_label_kind,
-            node_kind_label(node)
+            node_kind_label(node),
+            kind_toggle_hint
+        )),
+        Line::from(format!(
+            "{}: {}",
+            strings.builder_label_purpose,
+            node_kind_purpose(node, strings)
         )),
         Line::from(format!(
             "{}: {}",
@@ -3937,6 +4173,21 @@ fn render_model_picker(
     models: &[CatalogModel],
     area: Rect,
 ) {
+    if app.manual_mode {
+        let title = app
+            .catalog_profile(target)
+            .unwrap_or_else(|| "AI".to_owned());
+        canvas::render_picker(
+            frame,
+            app,
+            &title,
+            models.iter().map(|model| model.id.clone()).collect(),
+            selected,
+            area,
+            true,
+        );
+        return;
+    }
     let strings = app.strings();
     let bound = match target {
         BindingTarget::Graph => app.model.clone(),
@@ -4266,14 +4517,44 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
 }
 
 pub async fn launch(repo: PathBuf, trust_project_profiles: bool, lang: Language) -> Result<()> {
+    launch_mode(repo, trust_project_profiles, lang, false, None).await
+}
+
+pub async fn launch_manual(
+    repo: PathBuf,
+    trust_project_profiles: bool,
+    lang: Language,
+    path: Option<PathBuf>,
+) -> Result<()> {
+    launch_mode(repo, trust_project_profiles, lang, true, path).await
+}
+
+async fn launch_mode(
+    repo: PathBuf,
+    trust_project_profiles: bool,
+    lang: Language,
+    manual: bool,
+    path: Option<PathBuf>,
+) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(anyhow!("graph TUI requires an interactive terminal"));
     }
     let guard = TerminalGuard;
     let mut terminal = setup_terminal()?;
-    let result = match App::new(repo, trust_project_profiles, lang) {
+    let app = if manual {
+        let blank = path.is_none();
+        path.map_or_else(|| manual::fresh_path(&repo), Ok)
+            .and_then(|path| App::new_with_graph(repo, trust_project_profiles, lang, path, blank))
+    } else {
+        App::new(repo, trust_project_profiles, lang)
+    };
+    let result = match app {
         Ok(mut app) => {
             app.start_binding_discovery();
+            if manual {
+                app.manual_mode = true;
+                app.open_manual_start();
+            }
             run_loop(&mut terminal, app).await
         }
         Err(error) => Err(error),
@@ -4478,6 +4759,217 @@ mod tests {
 
     fn only_node(app: &App) -> &Node {
         app.graph.spec.nodes.first().expect("template has a node")
+    }
+
+    fn provider_fields(
+        kind: &NodeKind,
+    ) -> (
+        &PromptSpec,
+        Option<&str>,
+        Option<&str>,
+        &gloop_core::OutputSpec,
+    ) {
+        match kind {
+            NodeKind::Agent {
+                prompt,
+                profile,
+                model,
+                output,
+                ..
+            }
+            | NodeKind::Reduce {
+                prompt,
+                profile,
+                model,
+                output,
+            }
+            | NodeKind::Synthesize {
+                prompt,
+                profile,
+                model,
+                output,
+            } => (prompt, profile.as_deref(), model.as_deref(), output),
+            _ => panic!("expected an AI node kind"),
+        }
+    }
+
+    fn representative_nodes() -> Vec<Node> {
+        let agent = Node::agent("agent", "standard task");
+        let mut reduce = agent.clone();
+        reduce.id = "reduce".to_owned();
+        reduce.kind = next_provider_kind(&agent.kind).expect("agent switches to reduce");
+        let mut synthesize = reduce.clone();
+        synthesize.id = "synthesize".to_owned();
+        synthesize.kind = next_provider_kind(&reduce.kind).expect("reduce switches to synthesize");
+
+        let command = Node::command("command", vec!["printf".to_owned()]);
+        let verify = App::build_graph(GraphTemplate::PlanImplementVerify, "task", None, None)
+            .spec
+            .nodes
+            .into_iter()
+            .find(|node| matches!(node.kind, NodeKind::Verify { .. }))
+            .expect("template has a verify node");
+
+        let mut gate = Node::agent("gate", "unused");
+        gate.kind = NodeKind::Gate {
+            message: "approve?".to_owned(),
+            default: gloop_core::GateDefault::default(),
+        };
+
+        let loop_node = App::build_graph(GraphTemplate::ImplementTestLoop, "task", None, None)
+            .spec
+            .nodes
+            .into_iter()
+            .find(|node| matches!(node.kind, NodeKind::Loop { .. }))
+            .expect("template has a loop node");
+
+        let mut subgraph = Node::agent("subgraph", "unused");
+        subgraph.kind = NodeKind::Subgraph {
+            graph: Box::new(Graph::new(
+                "nested",
+                "nested task",
+                vec![Node::agent("nested_agent", "work")],
+            )),
+        };
+
+        vec![
+            agent, reduce, synthesize, command, verify, gate, loop_node, subgraph,
+        ]
+    }
+
+    fn rendered_builder_text(app: &App) -> String {
+        let backend = ratatui::backend::TestBackend::new(220, 30);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_builder(frame, app, area);
+            })
+            .expect("render builder");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    #[test]
+    fn uppercase_k_cycles_ai_kinds_and_preserves_provider_fields() {
+        let (_repo, mut app) = temp_app();
+        app.screen = Screen::Builder;
+        let node = app.graph.spec.nodes.first_mut().expect("direct node");
+        let NodeKind::Agent {
+            prompt,
+            profile,
+            model,
+            fan_out,
+            output,
+        } = &mut node.kind
+        else {
+            panic!("direct node is an agent");
+        };
+        *prompt = PromptSpec::Inline("keep this prompt".to_owned());
+        *profile = Some("codex".to_owned());
+        *model = Some("gpt-5.6-sol".to_owned());
+        *fan_out = 8;
+        output.max_bytes = 123_456;
+
+        let expected_prompt = prompt.clone();
+        let expected_output = output.clone();
+        let expected_fields = (
+            &expected_prompt,
+            Some("codex"),
+            Some("gpt-5.6-sol"),
+            &expected_output,
+        );
+
+        for expected_kind in ["reduce", "synthesize", "agent"] {
+            app.handle_key(key(KeyCode::Char('K')));
+            let node = only_node(&app);
+            assert_eq!(node_kind_label(node), expected_kind);
+            assert_eq!(provider_fields(&node.kind), expected_fields);
+            assert_eq!(node.fan_out(), 1, "{expected_kind} uses one lane");
+            assert!(app.status.contains(&node.id));
+            assert!(app.status.contains(expected_kind));
+        }
+        assert!(app.dirty && app.manual_edits);
+    }
+
+    #[test]
+    fn uppercase_k_leaves_every_non_ai_kind_unchanged() {
+        let (_repo, mut app) = temp_app();
+        app.screen = Screen::Builder;
+        app.graph.spec.nodes = representative_nodes()
+            .into_iter()
+            .filter(|node| !binds_provider(node))
+            .collect();
+        app.graph.spec.edges.clear();
+
+        for selected in 0..app.graph.spec.nodes.len() {
+            app.selected_node = selected;
+            app.dirty = false;
+            app.manual_edits = false;
+            let before = app.graph.spec.nodes[selected].kind.clone();
+            let id = app.graph.spec.nodes[selected].id.clone();
+            let kind = node_kind_label(&app.graph.spec.nodes[selected]);
+
+            app.handle_key(key(KeyCode::Char('K')));
+
+            assert_eq!(app.graph.spec.nodes[selected].kind, before, "{kind}");
+            assert!(!app.dirty && !app.manual_edits, "{kind}");
+            assert_eq!(
+                app.status,
+                fill(
+                    Language::En.strings().status_kind_toggle_not_applicable,
+                    &[("id", &id), ("kind", kind)],
+                ),
+                "{kind} explains that only AI steps can switch"
+            );
+        }
+    }
+
+    #[test]
+    fn every_node_kind_has_a_localized_beginner_purpose() {
+        for node in representative_nodes() {
+            let kind = node_kind_label(&node);
+            let en = node_kind_purpose(&node, Language::En.strings());
+            let ja = node_kind_purpose(&node, Language::Ja.strings());
+            assert!(!en.trim().is_empty(), "{kind} English purpose");
+            assert!(!ja.trim().is_empty(), "{kind} Japanese purpose");
+            assert_ne!(en, ja, "{kind} purpose is localized");
+        }
+    }
+
+    #[tokio::test]
+    async fn toggled_kind_and_purpose_are_rendered_and_saved() {
+        let (_repo, mut app) = temp_app();
+        app.screen = Screen::Builder;
+        app.lang = Language::Ja;
+
+        app.handle_key(key(KeyCode::Char('K')));
+
+        let rendered = rendered_builder_text(&app);
+        let compact = rendered
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        assert!(
+            compact.contains("種類:reduce[K:AI工程を切替]"),
+            "{rendered}"
+        );
+        assert!(
+            compact.contains("目的:AIが複数の前工程の結果を1つに整理・統合します。"),
+            "{rendered}"
+        );
+
+        app.save().await.expect("save toggled graph");
+        let saved = Graph::from_path(&app.graph_path).expect("load saved graph");
+        assert!(matches!(
+            saved.spec.nodes.first().map(|node| &node.kind),
+            Some(NodeKind::Reduce { .. })
+        ));
     }
 
     #[test]

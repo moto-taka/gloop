@@ -1,6 +1,8 @@
 # gloop
 
-`gloop` is a foreground-only Rust CLI for running configurable agent and command graphs. It combines a versioned DAG/loop IR, deterministic non-LLM scheduling, provider profiles, local artifacts, and journal replay without a daemon or cross-project queue.
+`gloop` is a local workspace for giving independent AI tools a task, watching their progress, and passing results to another model. Open the terminal workspace with `gloop`, use the CLI from any coding agent, or open the optional GUI with `gloop ui`. An AI can propose the steps; scheduling and result handoff use no LLM. Selected providers consume their own usage.
+
+Underneath, gloop runs configurable agent and command graphs with deterministic scheduling, provider profiles, local artifacts, and journal replay. Independent tasks need no resident daemon; the existing `gloop run` command remains available for foreground execution.
 
 ![gloop graph orchestration](assets/gloop-graph-hero.png)
 
@@ -39,6 +41,75 @@ cargo install --path crates/gloop-cli --locked
 ```
 
 ## Quickstart
+
+Open gloop in the project you want to work on:
+
+```bash
+cd /path/to/project
+gloop
+# explicit form:
+gloop tui --lang ja
+```
+
+Saved graphs appear on the home screen. **Enter** opens one; **r** runs it.
+
+For a new graph, choose **+ Graph · Manual**:
+
+1. Press **a**, type an instruction, and Enter. Repeat to add the next AI step;
+   it connects automatically and reuses the selected step's tool/model.
+2. Change an assignment with **p** (tool) or **m** (model). **A** adds a sibling
+   branch; **c**, select a target, Enter connects two existing steps.
+3. Press **r** to run. The graph stays visible with live status and output.
+   **s** saves it for reuse; **q** stops an active run.
+
+Enter edits an instruction directly. **O** opens a saved graph or YAML path.
+**Tab** holds commands, tests, approval steps, connection conditions, limits,
+and full node settings. The editor shows limits before you press **r**; there is
+no additional run confirmation. Authoring makes no planning call, and opening
+an existing graph preserves its nodes, connections, conditions, and bindings.
+
+Choose **Auto** when you want an AI to propose
+the workflow. Describe the goal, select a model, generate a proposal with one
+invocation, then review/edit the steps before execution. For a small request needing no
+decomposition, choose **1 AI**. Its optional **Second opinion** step
+runs another tool on the first result. Tool availability and model suggestions are
+shown during setup.
+
+Auto and direct tasks continue when you close the TUI or the launching terminal. Reopen gloop
+in the same project to see saved results. **Ask another model / follow up** creates a
+new task; choose a different tool or model to hand the work over. Only the previous
+request and results are attached, up to 24 KiB, with truncation recorded explicitly.
+To run your saved graph independently, select **Background run** from home or use
+`gloop start --graph PATH --max-calls 16`. Use the Manual monitor for graphs with
+interactive approval steps.
+
+The browser workspace is optional: `gloop ui`. The advanced graph editor remains
+available from the TUI home menu or `gloop graph`.
+
+For an AI agent or script, submission returns immediately:
+
+```bash
+gloop start "Explain the recent changes" --profile codex --model gpt-5.6-luna --json
+gloop tasks                         # recent tasks
+gloop tasks TASK_ID --json           # complete result and execution evidence
+gloop tasks TASK_ID --wait --timeout 60 --json
+gloop start "Check the conclusions" --profile claude --after TASK_ID --json
+gloop stop TASK_ID --json
+```
+
+An independent task has a time limit (30 minutes by default) and an AI call limit.
+Planning uses one call, followed by at most one call per reviewed step (up to eight)
+when you start execution. Direct TUI/browser tasks use one call or two for a second
+opinion; the CLI defaults to at most three. These limits count gloop invocations, not a provider CLI's
+internal turns, tokens, or charges. Same-project independent tasks cannot overlap
+file edits. See [docs/TASKS.md](docs/TASKS.md) for lifecycle, failure recovery, and
+the JSON contract.
+
+### Building reusable workflows
+
+Both Manual and Auto can save reusable workflows. Manual also opens your existing
+YAML files for editing and execution. `gloop graph` retains the shortcut-driven
+editor; the default TUI's Manual mode uses a compact graph canvas.
 
 Create a graph from a template, validate it, and inspect its shape:
 
@@ -123,11 +194,13 @@ Overview / Graph Builder / Run Monitor, `i` for the natural-language task
 reports it) inserts a newline, `Esc` cancels),
 `t/p/m` to pick template/profile/model from preview pickers, `v` to validate
 (the issue list opens automatically), `s` to save, and `r` to run (auto-saves
-first). In Graph Builder, `a` inserts a node after the selected node and
-connects it automatically; each row shows its outgoing connections. Use `c`,
-move to a target, and press `Enter` to add another connection. During a run,
-`o` opens the selected node's output, and `?` opens help. `q` or `Ctrl-C`
-cancels an active run; `q` exits when idle.
+first). In Graph Builder, `a` inserts an AI node after the selected node and
+connects it automatically. Press `K` to switch that node between `agent`,
+`reduce`, and `synthesize`; the detail panel explains the selected purpose.
+Each row shows its outgoing connections. Use `c`, move to a target, and press
+`Enter` to add another connection. During a run, `o` opens the selected node's
+output, and `?` opens help. `q` or `Ctrl-C` cancels an active run; `q` exits
+when idle.
 
 Model catalogs are read from each configured harness in the background. If
 `m` is pressed while discovery is still running, the picker waits and opens
