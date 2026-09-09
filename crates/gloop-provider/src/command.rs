@@ -97,6 +97,18 @@ impl CommandAdapter {
             )?);
         }
 
+        if let Some(cache_key) = &request.cache_key
+            && !self.command.cache_key_args.is_empty()
+        {
+            arguments.extend(render_arguments(
+                &self.command.cache_key_args,
+                "{cache_key}",
+                cache_key,
+                &self.name,
+                "cache_key_args",
+            )?);
+        }
+
         let mut prompt = request.prompt.clone();
         if let Some(system_prompt) = &request.system_prompt {
             if self.command.system_prompt_args.is_empty() {
@@ -574,6 +586,47 @@ fn parse_output(
         return Ok(AdapterOutput::JsonLines(values));
     }
 
+    // Pi may put a thinking block before text, and emits user messages too.
+    // Interpret its existing built-in pointer as the final assistant text.
+    if pointer == Some("/message/content/0/text")
+        && values.iter().any(|value| value["type"] == "message_end")
+    {
+        let message = values
+            .iter()
+            .rev()
+            .find_map(|value| {
+                (value["type"] == "message_end" && value["message"]["role"] == "assistant")
+                    .then_some(&value["message"])
+            })
+            .ok_or_else(|| AdapterError::InvalidOutput {
+                profile: profile.to_owned(),
+                format: raw_format,
+                message: "Pi output has no completed assistant message".to_owned(),
+            })?;
+        if matches!(message["stopReason"].as_str(), Some("error" | "aborted")) {
+            return Err(AdapterError::InvalidOutput {
+                profile: profile.to_owned(),
+                format: raw_format,
+                message: format!(
+                    "Pi generation ended with {}: {}",
+                    message["stopReason"],
+                    message["errorMessage"]
+                        .as_str()
+                        .unwrap_or("provider did not return a complete answer")
+                ),
+            });
+        }
+        let text = message["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|part| part["type"] == "text")
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return parse_text_output(profile, &text, requested_format);
+    }
+
     let selected = if let Some(pointer) = pointer {
         let selected = values
             .iter()
@@ -716,6 +769,7 @@ fn extract_metadata(
                 "/usage/input_tokens",
                 "/usage/prompt_tokens",
                 "/message/usage/input_tokens",
+                "/message/usage/input",
             ],
         );
         let output_tokens = first_u64(
@@ -724,11 +778,66 @@ fn extract_metadata(
                 "/usage/output_tokens",
                 "/usage/completion_tokens",
                 "/message/usage/output_tokens",
+                "/message/usage/output",
             ],
         );
+        let cached_input_tokens = first_u64(
+            value,
+            &[
+                "/usage/cached_input_tokens",
+                "/usage/input_tokens_details/cached_tokens",
+                "/usage/prompt_tokens_details/cached_tokens",
+                "/usage/cache_read_input_tokens",
+                "/message/usage/cache_read_input_tokens",
+                "/message/usage/cacheRead",
+            ],
+        );
+        let cache_write_input_tokens = first_u64(
+            value,
+            &[
+                "/usage/cache_write_input_tokens",
+                "/usage/input_tokens_details/cache_write_tokens",
+                "/usage/prompt_tokens_details/cache_write_tokens",
+                "/usage/cache_creation_input_tokens",
+                "/message/usage/cache_creation_input_tokens",
+                "/message/usage/cacheWrite",
+            ],
+        );
+        let separate_cache = value.pointer("/message/usage/input").is_some()
+            || value.pointer("/usage/cache_read_input_tokens").is_some()
+            || value
+                .pointer("/usage/cache_creation_input_tokens")
+                .is_some()
+            || value
+                .pointer("/message/usage/cache_read_input_tokens")
+                .is_some()
+            || value
+                .pointer("/message/usage/cache_creation_input_tokens")
+                .is_some();
+        let input_tokens = if separate_cache {
+            input_tokens.and_then(|input| {
+                input
+                    .checked_add(cached_input_tokens.unwrap_or(0))
+                    .and_then(|total| total.checked_add(cache_write_input_tokens.unwrap_or(0)))
+            })
+        } else {
+            input_tokens
+        };
         (input_tokens.is_some() || output_tokens.is_some()).then_some(TokenUsage {
             input_tokens,
             output_tokens,
+            cached_input_tokens,
+            cache_write_input_tokens,
+            reasoning_output_tokens: first_u64(
+                value,
+                &[
+                    "/usage/reasoning_output_tokens",
+                    "/message/usage/reasoning",
+                    "/usage/output_tokens_details/reasoning_tokens",
+                    "/usage/output_tokens_details/thinking_tokens",
+                    "/usage/completion_tokens_details/reasoning_tokens",
+                ],
+            ),
         })
     });
     let model = extract_reported_model(&values).map_err(|message| AdapterError::InvalidOutput {
@@ -992,8 +1101,30 @@ mod tests {
             TokenUsage {
                 input_tokens: Some(2),
                 output_tokens: Some(3),
+                ..TokenUsage::default()
             }
         );
+    }
+
+    #[test]
+    fn codex_cache_partition_is_not_added_to_total_input_twice() {
+        let raw = r#"{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":800,"cache_write_input_tokens":0,"output_tokens":50,"reasoning_output_tokens":20}}"#;
+        let (usage, _) = extract_metadata("codex", raw, OutputFormat::JsonLines).expect("metadata");
+        let usage = usage.expect("usage");
+        assert_eq!(usage.input_tokens, Some(1000));
+        assert_eq!(usage.cached_input_tokens, Some(800));
+        assert_eq!(usage.output_tokens, Some(50));
+        assert_eq!(usage.reasoning_output_tokens, Some(20));
+    }
+
+    #[test]
+    fn anthropic_separate_cache_fields_are_included_in_total_input() {
+        let raw = r#"{"usage":{"input_tokens":100,"cache_read_input_tokens":800,"cache_creation_input_tokens":50,"output_tokens":30}}"#;
+        let (usage, _) = extract_metadata("claude", raw, OutputFormat::Json).expect("metadata");
+        let usage = usage.expect("usage");
+        assert_eq!(usage.input_tokens, Some(950));
+        assert_eq!(usage.cached_input_tokens, Some(800));
+        assert_eq!(usage.cache_write_input_tokens, Some(50));
     }
 
     #[tokio::test]
@@ -1036,6 +1167,75 @@ mod tests {
         )
         .expect("Pi output parses");
         assert_eq!(output, AdapterOutput::Text("final answer".to_owned()));
+    }
+
+    #[test]
+    fn pi_thinking_is_not_output_and_cache_partitions_are_counted_once() {
+        let source = json!({
+            "type": "message_end",
+            "message": {
+                "role": "assistant", "model": "test-model", "stopReason": "stop",
+                "content": [
+                    {"type": "thinking", "thinking": "private reasoning"},
+                    {"type": "text", "text": "{\"answer\":\"done\"}"}
+                ],
+                "usage": {"input": 450, "cacheRead": 1792, "cacheWrite": 100,
+                          "output": 29, "reasoning": 9}
+            }
+        })
+        .to_string();
+        let output = parse_output(
+            "pi",
+            &source,
+            OutputFormat::JsonLines,
+            Some("/message/content/0/text"),
+            OutputFormat::Json,
+        )
+        .expect("assistant JSON");
+        assert_eq!(output, AdapterOutput::Json(json!({"answer": "done"})));
+        let (usage, _) = extract_metadata("pi", &source, OutputFormat::JsonLines).unwrap();
+        let usage = usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(2342));
+        assert_eq!(usage.cached_input_tokens, Some(1792));
+        assert_eq!(usage.cache_write_input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(29));
+        assert_eq!(usage.reasoning_output_tokens, Some(9));
+    }
+
+    #[test]
+    fn pi_provider_error_or_user_echo_cannot_be_a_successful_answer() {
+        for message in [
+            json!({"role":"assistant", "stopReason":"error", "errorMessage":"rejected",
+                "content":[{"type":"text", "text":"partial answer"}]}),
+            json!({"role":"user", "content":[{"type":"text", "text":"echoed prompt"}]}),
+        ] {
+            let source = json!({"type":"message_end", "message":message}).to_string();
+            assert!(
+                parse_output(
+                    "pi",
+                    &source,
+                    OutputFormat::JsonLines,
+                    Some("/message/content/0/text"),
+                    OutputFormat::Text
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn cache_routing_argument_does_not_resume_conversation_or_change_prompt() {
+        let mut command = CommandProfile::new(vec!["pi".into(), "--no-session".into()]);
+        command.cache_key_args = vec!["--session-id".into(), "{cache_key}".into()];
+        let adapter = adapter(command, AdapterCapabilities::text());
+        let mut request = AdapterRequest::new("shared context and task");
+        request.cache_key = Some("a".repeat(64));
+        let (_, args, stdin) = adapter.render_command(&request).unwrap();
+        assert_eq!(args, vec!["--no-session", "--session-id", &"a".repeat(64)]);
+        assert_eq!(stdin.as_deref(), Some("shared context and task"));
+        request.cache_key = None;
+        let (_, args, _) = adapter.render_command(&request).unwrap();
+        assert_eq!(args, vec!["--no-session"]);
     }
 
     #[test]

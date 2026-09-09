@@ -758,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "gloop-cli"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -792,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "gloop-core"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "hex",
@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "gloop-provider"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -832,7 +832,7 @@ dependencies = [
 
 [[package]]
 name = "gloop-runtime"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-trait",

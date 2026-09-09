@@ -159,6 +159,7 @@ pub enum RunEventKind {
     NodeReady,
     NodeStarted,
     NodeOutput,
+    NodeUsage,
     NodeSucceeded,
     NodeFailed,
     NodeSkipped,

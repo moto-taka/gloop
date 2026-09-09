@@ -1,0 +1,49 @@
+apiVersion: gloop.dev/v1alpha1
+kind: Graph
+metadata:
+  name: pi-shared-context-cache
+  version: "1.0.0"
+spec:
+  goal: Answer two documentation questions using the same cached source context
+  budgets:
+    wall_time_seconds: 300
+    model_calls: 2
+  policies:
+    max_parallel: 1
+  nodes:
+    - id: context_rules
+      kind: agent
+      profile: pi-context
+      model: gpt-5.5
+      prompt: Explain how context files and dependency outputs are assembled. Return a JSON object with one brief answer string.
+      context:
+        files: [docs/SCHEMA.md]
+      output:
+        format: json
+        max_bytes: 262144
+        inline_schema:
+          type: object
+          required: [answer]
+          additionalProperties: false
+          properties:
+            answer: {type: string}
+    - id: output_rules
+      kind: agent
+      profile: pi-context
+      model: gpt-5.5
+      prompt: Explain when output schemas are sent and when they are validated. Return a JSON object with one brief answer string.
+      context:
+        files: [docs/SCHEMA.md]
+      output:
+        format: json
+        max_bytes: 262144
+        inline_schema:
+          type: object
+          required: [answer]
+          additionalProperties: false
+          properties:
+            answer: {type: string}
+  edges:
+    - from: context_rules
+      to: output_rules
+      kind: control

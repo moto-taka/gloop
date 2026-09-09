@@ -1,0 +1,11 @@
+# Merge this profile into <project>/.gloop/profiles.toml.
+# Set OPENAI_API_KEY outside this file. Requires the OpenAI Responses API;
+# a ChatGPT/Codex subscription login is not an API key.
+[profiles.openai-context]
+kind = "openai"
+api = "responses"
+cache_prefix = true
+model = "gpt-5.6-luna"
+api_key_env = "OPENAI_API_KEY"
+timeout_seconds = 120
+parameters = { max_output_tokens = 2048, reasoning = { effort = "low" } }

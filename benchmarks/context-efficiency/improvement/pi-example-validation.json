@@ -1,0 +1,28 @@
+[
+  {
+    "arguments": [
+      "graph",
+      "validate",
+      "<local-workspace>/examples/pi-cache-prefix.yaml",
+      "--json"
+    ],
+    "exit_code": 0,
+    "success": true,
+    "stderr": ""
+  },
+  {
+    "arguments": [
+      "run",
+      "--repo",
+      "<local-fixture>/gloop-pi-example-check-sjp43h8d",
+      "--graph",
+      "<local-workspace>/examples/pi-cache-prefix.yaml",
+      "--trust-project-profiles",
+      "--dry-run",
+      "--json"
+    ],
+    "exit_code": 0,
+    "success": true,
+    "stderr": ""
+  }
+]

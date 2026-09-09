@@ -233,7 +233,9 @@ pub struct ProgressEvent {
 impl From<&RunEvent> for ProgressEvent {
     fn from(event: &RunEvent) -> Self {
         let data = match event.kind {
-            RunEventKind::RunStarted | RunEventKind::NodeStarted => event.data.clone(),
+            RunEventKind::RunStarted | RunEventKind::NodeStarted | RunEventKind::NodeUsage => {
+                event.data.clone()
+            }
             RunEventKind::NodeOutput => event.data.get("artifacts_written").cloned().map_or(
                 Value::Null,
                 |artifacts_written| json!({ "artifacts_written": artifacts_written }),
@@ -2259,6 +2261,7 @@ async fn validate_resolved_workspace(
     Ok(())
 }
 
+#[cfg(test)]
 async fn render_prompt(
     prompt: &PromptSpec,
     context: &ContextSpec,
@@ -2266,6 +2269,27 @@ async fn render_prompt(
     workspace: &Path,
     node_id: &str,
 ) -> Result<String, String> {
+    render_prompt_parts(prompt, context, dependencies, workspace, node_id)
+        .await
+        .map(|(text, _)| text)
+}
+
+fn context_cache_key(workspace: &Path, prefix: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"gloop-context-cache-v1\0");
+    hash.update(workspace.as_os_str().as_encoded_bytes());
+    hash.update(b"\0");
+    hash.update(prefix.as_bytes());
+    hex::encode(hash.finalize())
+}
+
+async fn render_prompt_parts(
+    prompt: &PromptSpec,
+    context: &ContextSpec,
+    dependencies: &IndexMap<String, Value>,
+    workspace: &Path,
+    node_id: &str,
+) -> Result<(String, usize), String> {
     let (mut rendered, variables) = match prompt {
         PromptSpec::Inline(value) => (value.clone(), IndexMap::new()),
         PromptSpec::Package {
@@ -2283,13 +2307,16 @@ async fn render_prompt(
     }
     rendered = rendered.replace("{{node_id}}", node_id);
 
-    let dependency_text = serde_json::to_string_pretty(dependencies)
+    // Stable context precedes per-node instructions so sibling/follow-up nodes
+    // can reuse a provider's prefix cache. Compact JSON is lossless; do not
+    // summarize or truncate verification evidence to save tokens.
+    let dependency_text = serde_json::to_string(dependencies)
         .map_err(|error| format!("failed to render dependency context: {error}"))?;
     if rendered.contains("{{dependencies}}") {
         rendered = rendered.replace("{{dependencies}}", &dependency_text);
     } else if context.include_dependencies && !dependencies.is_empty() {
-        rendered.push_str("\n\nDependency outputs (JSON):\n");
-        rendered.push_str(&dependency_text);
+        rendered =
+            format!("Dependency outputs (JSON):\n{dependency_text}\n\nCurrent task:\n{rendered}");
     }
 
     if rendered.len() > context.max_bytes {
@@ -2299,12 +2326,15 @@ async fn render_prompt(
         ));
     }
 
+    let mut prefix = String::new();
     for file in &context.files {
         let path = contained_file(workspace, file).await?;
-        let header = format!("\n\nContext file: {}\n", file.to_string_lossy());
+        let header = format!("Context file: {}\n", file.to_string_lossy());
         let used = rendered
             .len()
-            .checked_add(header.len())
+            .checked_add(prefix.len())
+            .and_then(|used| used.checked_add(2))
+            .and_then(|used| used.checked_add(header.len()))
             .ok_or_else(|| "rendered context byte count overflowed".to_owned())?;
         let remaining = context.max_bytes.checked_sub(used).ok_or_else(|| {
             format!(
@@ -2315,10 +2345,13 @@ async fn render_prompt(
         let bytes = read_bounded_file(&path, remaining, "context file").await?;
         let text = String::from_utf8(bytes)
             .map_err(|_| format!("context file {} is not UTF-8", path.display()))?;
-        rendered.push_str(&header);
-        rendered.push_str(&text);
+        prefix.push_str(&header);
+        prefix.push_str(&text);
+        prefix.push_str("\n\n");
     }
-    Ok(rendered)
+    let prefix_bytes = prefix.len();
+    prefix.push_str(&rendered);
+    Ok((prefix, prefix_bytes))
 }
 
 async fn read_bounded_file(
@@ -2983,18 +3016,8 @@ async fn validate_schema(
     output: &OutputSpec,
     workspace: &Path,
 ) -> Result<(), String> {
-    let schema = match (&output.inline_schema, &output.schema) {
-        (None, None) => return Ok(()),
-        (Some(_), Some(_)) => {
-            return Err("output declares both inline_schema and schema file".into());
-        }
-        (Some(schema), None) => schema.clone(),
-        (None, Some(path)) => {
-            let path = contained_file(workspace, path).await?;
-            let bytes = read_bounded_file(&path, MAX_SCHEMA_BYTES, "output schema").await?;
-            serde_json::from_slice(&bytes)
-                .map_err(|error| format!("schema {} is not valid JSON: {error}", path.display()))?
-        }
+    let Some(schema) = read_output_schema(output, workspace).await? else {
+        return Ok(());
     };
     let validator = jsonschema::validator_for(&schema)
         .map_err(|error| format!("invalid output JSON Schema: {error}"))?;
@@ -3011,6 +3034,26 @@ async fn validate_schema(
             errors.join("; ")
         ))
     }
+}
+
+async fn read_output_schema(
+    output: &OutputSpec,
+    workspace: &Path,
+) -> Result<Option<Value>, String> {
+    let schema = match (&output.inline_schema, &output.schema) {
+        (None, None) => return Ok(None),
+        (Some(_), Some(_)) => {
+            return Err("output declares both inline_schema and schema file".into());
+        }
+        (Some(schema), None) => schema.clone(),
+        (None, Some(path)) => {
+            let path = contained_file(workspace, path).await?;
+            let bytes = read_bounded_file(&path, MAX_SCHEMA_BYTES, "output schema").await?;
+            serde_json::from_slice(&bytes)
+                .map_err(|error| format!("schema {} is not valid JSON: {error}", path.display()))?
+        }
+    };
+    Ok(Some(schema))
 }
 
 #[derive(Debug, Error)]
@@ -3051,6 +3094,160 @@ mod tests {
     use gloop_provider::TokenUsage;
 
     use super::*;
+
+    #[tokio::test]
+    async fn cache_boundary_and_key_cover_only_shared_file_context() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("brief.md"), "変わらない要件")
+            .await
+            .unwrap();
+        let workspace = fs::canonicalize(dir.path()).await.unwrap();
+        let context = ContextSpec {
+            files: vec!["brief.md".into()],
+            ..ContextSpec::default()
+        };
+        let mut keys = Vec::new();
+        for task in ["implement", "review"] {
+            let (prompt, boundary) = render_prompt_parts(
+                &PromptSpec::Inline(task.into()),
+                &context,
+                &IndexMap::from([("result".into(), json!({"stage":task}))]),
+                &workspace,
+                task,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                &prompt[..boundary],
+                "Context file: brief.md\n変わらない要件\n\n"
+            );
+            assert!(prompt[boundary..].contains(task));
+            keys.push(context_cache_key(&workspace, &prompt[..boundary]));
+        }
+        assert_eq!(keys[0], keys[1]);
+        assert_eq!(keys[0].len(), 64);
+        assert_ne!(
+            keys[0],
+            context_cache_key(&workspace, "changed requirement")
+        );
+        assert_ne!(
+            keys[0],
+            context_cache_key(
+                Path::new("/different-workspace"),
+                "Context file: brief.md\n変わらない要件\n\n"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_context_is_a_stable_prefix_and_dependencies_are_lossless() {
+        let dir = tempfile::tempdir().expect("workspace");
+        fs::write(
+            dir.path().join("requirements.md"),
+            "Required API: solve(value).\n",
+        )
+        .await
+        .expect("requirements");
+        let workspace = fs::canonicalize(dir.path())
+            .await
+            .expect("canonical workspace");
+        let context = ContextSpec {
+            files: vec!["requirements.md".into()],
+            ..ContextSpec::default()
+        };
+        let dependencies = IndexMap::from([(
+            "verify".to_owned(),
+            json!({
+                "passed": false, "failures": ["first failure", "last failure"],
+                "code": "def solve(value):\n    return value\n"
+            }),
+        )]);
+        let first = render_prompt(
+            &PromptSpec::Inline("Repair all failures.".into()),
+            &context,
+            &dependencies,
+            &workspace,
+            "repair",
+        )
+        .await
+        .expect("prompt");
+        let next = render_prompt(
+            &PromptSpec::Inline("Draft a PR.".into()),
+            &context,
+            &IndexMap::new(),
+            &workspace,
+            "pr",
+        )
+        .await
+        .expect("prompt");
+        let prefix = "Context file: requirements.md\nRequired API: solve(value).\n\n\n";
+        assert!(first.starts_with(prefix));
+        assert!(next.starts_with(prefix));
+        assert!(first.ends_with("Current task:\nRepair all failures."));
+        let encoded = first
+            .split("Dependency outputs (JSON):\n")
+            .nth(1)
+            .expect("evidence")
+            .split("\n\nCurrent task:")
+            .next()
+            .expect("JSON");
+        assert_eq!(
+            serde_json::from_str::<IndexMap<String, Value>>(encoded).expect("JSON"),
+            dependencies
+        );
+        assert!(!encoded.contains('\n'));
+        let tight = ContextSpec {
+            max_bytes: first.len() - 1,
+            ..context
+        };
+        assert!(
+            render_prompt(
+                &PromptSpec::Inline("Repair all failures.".into()),
+                &tight,
+                &dependencies,
+                &workspace,
+                "repair"
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_dependency_placement_and_disabled_context_remain_supported() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let context = ContextSpec {
+            include_dependencies: false,
+            ..ContextSpec::default()
+        };
+        let dependencies =
+            IndexMap::from([("plan".to_owned(), json!({"decision": "preserve API"}))]);
+        assert_eq!(
+            render_prompt(
+                &PromptSpec::Inline("Task only".into()),
+                &context,
+                &dependencies,
+                dir.path(),
+                "work"
+            )
+            .await
+            .expect("prompt"),
+            "Task only"
+        );
+        let prompt = render_prompt(
+            &PromptSpec::Inline("Before {{dependencies}} after".into()),
+            &context,
+            &dependencies,
+            dir.path(),
+            "work",
+        )
+        .await
+        .expect("prompt");
+        assert_eq!(
+            prompt,
+            "Before {\"plan\":{\"decision\":\"preserve API\"}} after"
+        );
+    }
 
     #[derive(Debug, Clone, Copy)]
     enum FakeMode {
@@ -3973,6 +4170,7 @@ impl Runtime {
                     output,
                     profile,
                     model.as_deref(),
+                    attempt,
                     *fan_out,
                     workspace_path,
                     workspace_string,
@@ -3999,6 +4197,7 @@ impl Runtime {
                     output,
                     profile,
                     model.as_deref(),
+                    attempt,
                     1,
                     workspace_path,
                     workspace_string,
@@ -4078,6 +4277,7 @@ impl Runtime {
         output: &OutputSpec,
         preferred_profile: Option<&str>,
         requested_model: Option<&str>,
+        attempt: u32,
         fan_out: usize,
         workspace: &Path,
         workspace_string: Option<String>,
@@ -4085,7 +4285,7 @@ impl Runtime {
     ) -> Result<AttemptSuccess, AttemptFailure> {
         let candidate_output_limit =
             fanout_candidate_output_limit(output.max_bytes, fan_out, output.format)?;
-        let prompt = render_prompt(
+        let (mut prompt, cache_prefix_bytes) = render_prompt_parts(
             prompt_spec,
             &input.node.context,
             &input.dependencies,
@@ -4094,6 +4294,16 @@ impl Runtime {
         )
         .await
         .map_err(AttemptFailure::deterministic)?;
+        if let Some(schema) = read_output_schema(output, workspace)
+            .await
+            .map_err(AttemptFailure::deterministic)?
+        {
+            jsonschema::validator_for(&schema).map_err(|error| {
+                AttemptFailure::deterministic(format!("invalid output JSON Schema: {error}"))
+            })?;
+            prompt.push_str("\n\nYour output must satisfy this JSON Schema:\n");
+            prompt.push_str(&schema.to_string());
+        }
         enforce_fanout_prompt_limit(&prompt, fan_out, input.node.context.max_bytes)?;
         let required = required_capabilities(&input.node, output)?;
         context.reserve_model_calls(fan_out)?;
@@ -4108,6 +4318,11 @@ impl Runtime {
             } else {
                 format!("{prompt}\n\nFan-out candidate: {}/{}", index + 1, fan_out)
             });
+            request.cache_prefix_bytes = cache_prefix_bytes;
+            if cache_prefix_bytes > 0 {
+                request.cache_key =
+                    Some(context_cache_key(workspace, &prompt[..cache_prefix_bytes]));
+            }
             request.working_directory = Some(workspace.to_path_buf());
             request.model = requested_model.map(ToOwned::to_owned);
             request.output_format = provider_output_format(output.format);
@@ -4184,6 +4399,22 @@ impl Runtime {
                 .selected_model
                 .clone()
                 .or_else(|| requested_model.map(ToOwned::to_owned));
+            // Record the provider receipt before output/schema validation: a
+            // rejected answer still consumed tokens. Keep receipts per candidate
+            // and attempt instead of silently summing across different models.
+            if let Some(usage) = &invocation.response.usage {
+                context
+                    .emit(
+                        RunEventKind::NodeUsage,
+                        Some(&input.qualified_id),
+                        Some(attempt),
+                        None,
+                        json!({"profile": invocation.profile, "model": effective_model,
+                        "candidate": index + 1, "usage": usage}),
+                    )
+                    .await
+                    .map_err(|error| AttemptFailure::deterministic(error.to_string()))?;
+            }
             let normalized = match normalize_provider_response(
                 invocation.response,
                 invocation.profile.clone(),

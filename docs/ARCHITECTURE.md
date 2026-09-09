@@ -35,6 +35,21 @@ The scheduler contains no model calls of its own. Models only run inside agent-l
 
 An agent-like node can name an optional `profile` and `model`. An explicit profile is validated and probed; otherwise the registry selects the highest-priority available profile satisfying the node/request capabilities. Project configuration overlays user configuration, which overlays built-ins.
 
+The runtime renders ordered context files before compact dependency JSON and the
+current task. It supplies the exact shared-prefix byte boundary and a
+workspace/prefix-derived routing key to the adapter. OpenAI profiles opt into
+Responses with `api = "responses"` and explicit prefix caching with
+`cache_prefix = true`; command profiles may pass the key using `cache_key_args`.
+Existing profiles retain their default behavior. Cache routing does not resume
+provider conversations, and the adapter records provider-reported cache usage
+without assuming a hit.
+
+Configured output schemas are sent before generation and validated afterward.
+The runtime journals `node_usage` before output validation so rejected answers
+retain their token receipts. Input totals include cache reads and writes once;
+reasoning tokens are a subset of output. Pi extraction selects completed
+assistant text and excludes thinking blocks, prompt echoes, and error responses.
+
 Provider errors retain a stable class through the runtime so the CLI can distinguish unresolved profiles, unavailable adapters, cancellation, budgets, and ordinary execution failures without matching human error text.
 Verification failures retain their class through nested subgraphs and loops. Failure/failed-status edges receive a bounded metadata object containing the predecessor status, redacted error class/message, and artifact references when no normalized output exists.
 

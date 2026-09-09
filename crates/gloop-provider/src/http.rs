@@ -16,7 +16,7 @@ use crate::{
         AdapterOutput, AdapterRequest, AdapterResponse, MAX_REPORTED_MODEL_BYTES, OutputFormat,
         ProviderAdapter, TokenUsage, emit, validate_request_limits,
     },
-    config::{AnthropicProfile, OpenAiProfile, SecretRef},
+    config::{AnthropicProfile, OpenAiApi, OpenAiProfile, SecretRef},
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -80,17 +80,15 @@ impl ProviderAdapter for OpenAiAdapter {
             .model
             .clone()
             .unwrap_or_else(|| self.profile.model.clone());
-        let endpoint = endpoint(&self.profile.base_url, "chat/completions", &self.name)?;
-        let mut messages = Vec::new();
-        if let Some(system) = &request.system_prompt {
-            messages.push(json!({ "role": "system", "content": system }));
-        }
-        messages.push(json!({ "role": "user", "content": request.prompt }));
-
-        let mut body = request_body_from_parameters(&self.profile.parameters);
-        body.insert("model".to_owned(), Value::String(model));
-        body.insert("messages".to_owned(), Value::Array(messages));
-        body.insert("stream".to_owned(), Value::Bool(false));
+        let endpoint = endpoint(
+            &self.profile.base_url,
+            match self.profile.api {
+                OpenAiApi::ChatCompletions => "chat/completions",
+                OpenAiApi::Responses => "responses",
+            },
+            &self.name,
+        )?;
+        let body = openai_request_body(&self.profile, &request, model);
         let body = serialize_request_body(&self.name, body, MAX_SERIALIZED_REQUEST_BYTES)?;
 
         let (mut headers, mut redactions) = secret_headers(&self.name, &self.profile.headers_from)?;
@@ -137,7 +135,14 @@ impl ProviderAdapter for OpenAiAdapter {
             events.as_ref(),
         )
         .await?;
-        parse_openai_response(&self.name, &raw, request.output_format, events.as_ref())
+        match self.profile.api {
+            OpenAiApi::ChatCompletions => {
+                parse_openai_response(&self.name, &raw, request.output_format, events.as_ref())
+            }
+            OpenAiApi::Responses => {
+                parse_responses_response(&self.name, &raw, request.output_format, events.as_ref())
+            }
+        }
     }
 }
 
@@ -366,6 +371,98 @@ async fn send_json(
     }
 }
 
+fn openai_request_body(
+    profile: &OpenAiProfile,
+    request: &AdapterRequest,
+    model: String,
+) -> Map<String, Value> {
+    let mut body = request_body_from_parameters(&profile.parameters);
+    body.insert("model".to_owned(), Value::String(model));
+    body.insert("stream".to_owned(), Value::Bool(false));
+    if profile.api == OpenAiApi::Responses {
+        body.entry("store".to_owned()).or_insert(Value::Bool(false));
+    }
+    let mut messages = Vec::new();
+    if let Some(system) = &request.system_prompt {
+        messages.push(json!({ "role": if profile.api == OpenAiApi::Responses { "developer" } else { "system" }, "content": system }));
+    }
+    if profile.api == OpenAiApi::Responses && profile.cache_prefix && request.cache_prefix_bytes > 0
+    {
+        let (prefix, suffix) = request.prompt.split_at(request.cache_prefix_bytes);
+        let mut content = vec![
+            json!({"type":"input_text", "text":prefix, "prompt_cache_breakpoint":{"mode":"explicit"}}),
+        ];
+        if !suffix.is_empty() {
+            content.push(json!({"type":"input_text", "text":suffix}));
+        }
+        messages.push(json!({"role":"user", "content":content}));
+        body.insert(
+            "prompt_cache_options".to_owned(),
+            json!({"mode":"explicit"}),
+        );
+        if let Some(key) = &request.cache_key {
+            body.entry("prompt_cache_key".to_owned())
+                .or_insert_with(|| json!(key));
+        }
+    } else {
+        messages.push(json!({ "role":"user", "content":request.prompt }));
+    }
+    body.insert(
+        if profile.api == OpenAiApi::Responses {
+            "input"
+        } else {
+            "messages"
+        }
+        .to_owned(),
+        Value::Array(messages),
+    );
+    body
+}
+
+fn parse_responses_response(
+    profile: &str,
+    raw: &Value,
+    format: OutputFormat,
+    events: Option<&AdapterEventSender>,
+) -> Result<AdapterResponse, AdapterError> {
+    if raw.get("status").and_then(Value::as_str) != Some("completed") {
+        return Err(invalid_response(
+            profile,
+            "Responses API did not complete the response",
+        ));
+    }
+    let output = raw
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_response(profile, "missing Responses API output"))?;
+    let text = output
+        .iter()
+        .filter(|item| {
+            item.get("type").and_then(Value::as_str) == Some("message")
+                && item.get("role").and_then(Value::as_str) == Some("assistant")
+        })
+        .filter_map(|item| item.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("");
+    let text = validate_assistant_text(profile, text)?;
+    let usage = usage_from_pointers(raw, "/usage/input_tokens", "/usage/output_tokens");
+    let reported_model = parse_reported_model(profile, raw)?;
+    emit_http_completion(events, profile, &text, usage.as_ref());
+    Ok(AdapterResponse {
+        output: response_output(profile, &text, format)?,
+        stdout: String::new(),
+        stderr: String::new(),
+        exit_code: None,
+        reported_model,
+        resolved_model_alias: None,
+        reported_model_informational: false,
+        usage,
+    })
+}
+
 fn parse_openai_response(
     profile: &str,
     raw: &Value,
@@ -472,9 +569,37 @@ fn content_text(content: &Value) -> Option<String> {
 }
 
 fn usage_from_pointers(raw: &Value, input: &str, output: &str) -> Option<TokenUsage> {
+    let cached_input_tokens = raw
+        .pointer("/usage/prompt_tokens_details/cached_tokens")
+        .or_else(|| raw.pointer("/usage/input_tokens_details/cached_tokens"))
+        .or_else(|| raw.pointer("/usage/cache_read_input_tokens"))
+        .and_then(Value::as_u64);
+    let cache_write_input_tokens = raw
+        .pointer("/usage/cache_creation_input_tokens")
+        .or_else(|| raw.pointer("/usage/input_tokens_details/cache_write_tokens"))
+        .or_else(|| raw.pointer("/usage/prompt_tokens_details/cache_write_tokens"))
+        .and_then(Value::as_u64);
+    let input_tokens = raw.pointer(input).and_then(Value::as_u64);
+    let input_tokens = if raw.pointer("/usage/cache_read_input_tokens").is_some()
+        || raw.pointer("/usage/cache_creation_input_tokens").is_some()
+    {
+        input_tokens.and_then(|tokens| {
+            tokens
+                .checked_add(cached_input_tokens.unwrap_or(0))
+                .and_then(|total| total.checked_add(cache_write_input_tokens.unwrap_or(0)))
+        })
+    } else {
+        input_tokens
+    };
     let usage = TokenUsage {
-        input_tokens: raw.pointer(input).and_then(Value::as_u64),
+        input_tokens,
         output_tokens: raw.pointer(output).and_then(Value::as_u64),
+        cached_input_tokens,
+        cache_write_input_tokens,
+        reasoning_output_tokens: raw
+            .pointer("/usage/completion_tokens_details/reasoning_tokens")
+            .or_else(|| raw.pointer("/usage/output_tokens_details/reasoning_tokens"))
+            .and_then(Value::as_u64),
     };
     (usage.input_tokens.is_some() || usage.output_tokens.is_some()).then_some(usage)
 }
@@ -785,6 +910,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responses_cache_prefix_is_separate_from_dynamic_input_and_usage_is_not_double_counted()
+    {
+        let (base_url, captured) = server(200, json!({
+            "status":"completed", "model":"test-model", "output":[
+                {"type":"reasoning", "summary":[]},
+                {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"{\"ok\":true}"}]}
+            ], "usage":{"input_tokens":10000,"input_tokens_details":{"cached_tokens":8000,"cache_write_tokens":1200},"output_tokens":50,"output_tokens_details":{"reasoning_tokens":10}}
+        })).await;
+        let profile = OpenAiProfile {
+            api: OpenAiApi::Responses,
+            cache_prefix: true,
+            base_url,
+            model: "test-model".into(),
+            api_key_env: None,
+            organization_env: None,
+            headers_from: IndexMap::new(),
+            parameters: IndexMap::new(),
+        };
+        let adapter = OpenAiAdapter::new(
+            "responses",
+            None,
+            http_capabilities(),
+            profile,
+            Client::new(),
+        );
+        let mut request = AdapterRequest::new("共通の要件\n\n今回の作業");
+        request.cache_prefix_bytes = "共通の要件\n\n".len();
+        request.cache_key = Some("stable-key".into());
+        request.output_format = OutputFormat::Json;
+        let response = adapter
+            .execute(request, CancellationToken::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(response.output, AdapterOutput::Json(json!({"ok":true})));
+        let usage = response.usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(10000));
+        assert_eq!(usage.cached_input_tokens, Some(8000));
+        assert_eq!(usage.cache_write_input_tokens, Some(1200));
+        assert_eq!(usage.reasoning_output_tokens, Some(10));
+        let (body, _) = captured.await.unwrap();
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["store"], false);
+        assert_eq!(body["prompt_cache_key"], "stable-key");
+        assert_eq!(body["prompt_cache_options"], json!({"mode":"explicit"}));
+        assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(
+            body["input"][0]["content"],
+            json!([
+                {"type":"input_text","text":"共通の要件\n\n","prompt_cache_breakpoint":{"mode":"explicit"}},
+                {"type":"input_text","text":"今回の作業"}
+            ])
+        );
+        assert!(body.get("messages").is_none());
+    }
+
+    #[test]
+    fn responses_reject_incomplete_output_and_do_not_cache_without_a_prefix() {
+        let raw = json!({"status":"incomplete","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial answer"}]}]});
+        assert!(parse_responses_response("test", &raw, OutputFormat::Text, None).is_err());
+        let profile: OpenAiProfile =
+            toml::from_str("api='responses'\ncache_prefix=true\nmodel='test'").unwrap();
+        let body = openai_request_body(&profile, &AdapterRequest::new("task only"), "test".into());
+        assert!(!body.contains_key("prompt_cache_options"));
+        assert!(!body.contains_key("prompt_cache_key"));
+    }
+
+    #[tokio::test]
     async fn openai_adapter_sends_secret_from_environment_and_normalizes_response() {
         let (base_url, captured) = server(
             200,
@@ -796,6 +988,8 @@ mod tests {
         )
         .await;
         let profile = OpenAiProfile {
+            api: OpenAiApi::ChatCompletions,
+            cache_prefix: false,
             base_url,
             model: "test-model".to_owned(),
             api_key_env: Some(SecretRef::environment("PATH")),
@@ -879,6 +1073,8 @@ mod tests {
         )
         .await;
         let profile = OpenAiProfile {
+            api: OpenAiApi::ChatCompletions,
+            cache_prefix: false,
             base_url,
             model: "test-model".to_owned(),
             api_key_env: Some(SecretRef::environment("PATH")),
@@ -912,6 +1108,8 @@ mod tests {
         )
         .await;
         let profile = OpenAiProfile {
+            api: OpenAiApi::ChatCompletions,
+            cache_prefix: false,
             base_url,
             model: "test-model".to_owned(),
             api_key_env: Some(SecretRef::environment("PATH")),
@@ -936,6 +1134,8 @@ mod tests {
     async fn http_request_timeout_is_not_retryable() {
         let (base_url, server_task) = delayed_server().await;
         let profile = OpenAiProfile {
+            api: OpenAiApi::ChatCompletions,
+            cache_prefix: false,
             base_url,
             model: "test-model".to_owned(),
             api_key_env: Some(SecretRef::environment("PATH")),
@@ -964,6 +1164,8 @@ mod tests {
     #[tokio::test]
     async fn http_transport_error_is_not_retryable() {
         let profile = OpenAiProfile {
+            api: OpenAiApi::ChatCompletions,
+            cache_prefix: false,
             base_url: Url::parse("http://127.0.0.1:65534/v1/").expect("test URL"),
             model: "test-model".to_owned(),
             api_key_env: None,
@@ -996,6 +1198,8 @@ mod tests {
         )
         .await;
         let profile = OpenAiProfile {
+            api: OpenAiApi::ChatCompletions,
+            cache_prefix: false,
             base_url,
             model: "test-model".to_owned(),
             api_key_env: None,
@@ -1032,6 +1236,8 @@ mod tests {
         )
         .await;
         let profile = OpenAiProfile {
+            api: OpenAiApi::ChatCompletions,
+            cache_prefix: false,
             base_url,
             model: "test-model".to_owned(),
             api_key_env: None,
@@ -1101,6 +1307,8 @@ mod tests {
         )
         .await;
         let profile = OpenAiProfile {
+            api: OpenAiApi::ChatCompletions,
+            cache_prefix: false,
             base_url,
             model: "test-model".to_owned(),
             api_key_env: None,

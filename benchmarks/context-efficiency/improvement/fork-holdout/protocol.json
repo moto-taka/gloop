@@ -1,0 +1,80 @@
+{
+  "name": "gloop-fixed-base-fork-holdout",
+  "dataset": "Aider-AI/polyglot-benchmark",
+  "dataset_url": "https://github.com/Aider-AI/polyglot-benchmark",
+  "dataset_revision": "7e0611e77b54e2dea774cdc0aa00cf9f7ed6144f",
+  "population": "python/exercises/practice (34 exercises)",
+  "sampling": "random.Random(20260909).sample(sorted(original population minus six development tasks), 6); selection recorded before development results",
+  "tasks": [
+    "book-store",
+    "zipper",
+    "dot-dsl",
+    "variable-length-quantity",
+    "robot-name",
+    "bottle-song"
+  ],
+  "model": "gpt-5.6-luna",
+  "cli_version": "0.153.4",
+  "effort": "low",
+  "arms": [
+    "retained_conversation",
+    "gloop_artifact_handoff"
+  ],
+  "stages": [
+    "design",
+    "implement",
+    "test_initial",
+    "review_or_repair_once",
+    "test_final",
+    "pr_draft"
+  ],
+  "max_model_calls": 48,
+  "max_repairs_per_task": 1,
+  "model_call_timeout_seconds": 120,
+  "test_timeout_seconds": 30,
+  "max_total_reported_api_equivalent_usd": 6,
+  "test_image": "python@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea",
+  "test_network": "none",
+  "model_tools": "Shell, unified exec, web search, multi-agent, hooks, plugins, memories and host skill discovery disabled; read-only sandbox; reject any observed tool event. Built-in CLI preamble remains the same in both arms.",
+  "input": "public instructions including appendices and starter source; reference implementations and full tests are not sent to the model",
+  "feedback": "same unmodified upstream tests after implementation, output capped at 12000 UTF-8 bytes; one review stage may replace code if tests failed",
+  "retained_conversation": "one persistent Codex session per task; subsequent stages receive only new instructions and test feedback, without redundant task/source repetition",
+  "gloop_artifact_handoff": "real gloop runtime; design starts one persistent session; implement, review and PR draft each fork that immutable design session with only selected later artifacts; no accumulating conversation resume",
+  "ordering": "paired tasks; alternate arm order, as in first pilot",
+  "primary_metrics": [
+    "CLI-reported input tokens (already includes cached inputs; never add cached tokens again)",
+    "CLI-reported output tokens",
+    "initial and final test pass",
+    "calculated API list-price equivalent",
+    "wall time",
+    "repair count"
+  ],
+  "caveats": [
+    "Custom workflow adaptation of six public Python exercises, not an official Aider leaderboard score",
+    "One run per task and arm; no statistical superiority claim",
+    "PR draft is local; no benchmark PRs are sent to GitHub",
+    "Codex ChatGPT subscription is used; calculated API list-price equivalents are not actual billing",
+    "Caches are measured, not claimed cold or identical",
+    "This two-arm pilot does not measure native subagent orchestration",
+    "Small exercise workflows do not establish results on large repository engineering tasks",
+    "Model alias fixed for this run; server-side snapshot ID is not exposed by this CLI",
+    "Provider changed from Claude to Codex after pre-inference HTTP 429; zero Claude solutions were generated, and all exclusions are retained",
+    "Prior gpt-5.4-mini results are historical, not a model-matched baseline; compare against the retained arm measured here with Luna."
+  ],
+  "provider": "Codex CLI with existing ChatGPT authentication",
+  "budget_policy": "At most 48 calls; stop if prior calculated API equivalent plus 0.20 USD reserve exceeds 6 USD; each call has 120s timeout. CLI has no dollar cap; reserve is not a hard per-call billing limit.",
+  "pricing_per_million_tokens_usd": {
+    "input": 0.2,
+    "cached_input": 0.02,
+    "cache_write": 0.25,
+    "output": 1.2
+  },
+  "pricing_source": "https://developers.openai.com/api/docs/models/gpt-5.6-luna",
+  "pricing_verified_date": "2026-09-09",
+  "purpose": "Independent confirmation after freezing session-fork implementation; one run per task and arm; no tuning on holdout",
+  "changes_under_test": [
+    "context.fork_from with immutable design session",
+    "compact lossless selected artifacts, no repeated task brief after design",
+    "provider session and token receipts persisted in runtime evidence"
+  ]
+}

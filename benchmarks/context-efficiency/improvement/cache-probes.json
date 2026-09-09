@@ -1,0 +1,272 @@
+{
+  "pi_version": "0.85.1",
+  "probes": [
+    {
+      "name": "luna_stable_key",
+      "raw_directory": "/tmp/gloop-pi-cache-probe-20260909",
+      "calls": [
+        {
+          "case": "first",
+          "model": "gpt-5.6-luna",
+          "stop_reason": "stop",
+          "error": null,
+          "usage_is_successful_measurement": true,
+          "reported_usage": {
+            "input": 1412,
+            "output": 13,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "reasoning": 0,
+            "totalTokens": 1425,
+            "cost": {
+              "input": 0.00028240000000000003,
+              "output": 1.56e-05,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0.00029800000000000003
+            }
+          },
+          "raw_sha256": "90b0e92785175a995f4924ef66a47e9241101bd5148c9aa095a9419694f59cf3",
+          "process": {
+            "returncode": 0,
+            "timed_out": false,
+            "wall_seconds": 5.768049541977234
+          }
+        },
+        {
+          "case": "same_key",
+          "model": "gpt-5.6-luna",
+          "stop_reason": "stop",
+          "error": null,
+          "usage_is_successful_measurement": true,
+          "reported_usage": {
+            "input": 1413,
+            "output": 14,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "reasoning": 0,
+            "totalTokens": 1427,
+            "cost": {
+              "input": 0.00028260000000000004,
+              "output": 1.68e-05,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0.0002994
+            }
+          },
+          "raw_sha256": "b14f9505167b828f341431cf5ae21f4b73f822d035ae9e3e3209dfe52ed20cb9",
+          "process": {
+            "returncode": 0,
+            "timed_out": false,
+            "wall_seconds": 6.038863041030709
+          }
+        },
+        {
+          "case": "different_key",
+          "model": "gpt-5.6-luna",
+          "stop_reason": "stop",
+          "error": null,
+          "usage_is_successful_measurement": true,
+          "reported_usage": {
+            "input": 1413,
+            "output": 14,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "reasoning": 0,
+            "totalTokens": 1427,
+            "cost": {
+              "input": 0.00028260000000000004,
+              "output": 1.68e-05,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0.0002994
+            }
+          },
+          "raw_sha256": "80314536c9afd978bb652768df8a66e8c9202e267530d8dab1c1cb6106bf6ba5",
+          "process": {
+            "returncode": 0,
+            "timed_out": false,
+            "wall_seconds": 5.486623417004012
+          }
+        }
+      ]
+    },
+    {
+      "name": "luna_explicit_breakpoint",
+      "raw_directory": "/tmp/gloop-pi-explicit-cache-probe-20260909",
+      "calls": [
+        {
+          "case": "first",
+          "model": "gpt-5.6-luna",
+          "stop_reason": "error",
+          "error": "Codex error: Unsupported parameter: prompt_cache_options",
+          "usage_is_successful_measurement": false,
+          "reported_usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "raw_sha256": "8cddee9c3ec60acf2015927557e71effb6744cee99cf8ffc52cbb8d96f36ddab",
+          "process": {
+            "returncode": 0,
+            "timed_out": false,
+            "wall_seconds": 4.252437416987959
+          }
+        },
+        {
+          "case": "same_key",
+          "model": "gpt-5.6-luna",
+          "stop_reason": "error",
+          "error": "Codex error: Unsupported parameter: prompt_cache_options",
+          "usage_is_successful_measurement": false,
+          "reported_usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "raw_sha256": "266ef206ed1ed9e1636135eb3e9a58076e7b884ea7cebe22c4452010ac2d10f8",
+          "process": {
+            "returncode": 0,
+            "timed_out": false,
+            "wall_seconds": 4.516668249969371
+          }
+        },
+        {
+          "case": "different_key",
+          "model": "gpt-5.6-luna",
+          "stop_reason": "error",
+          "error": "Codex error: Unsupported parameter: prompt_cache_options",
+          "usage_is_successful_measurement": false,
+          "reported_usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "raw_sha256": "c3a0b3ce7497a180abf900cdbbb642b895fc5e341e9fd4d2fdbd55340e1949e1",
+          "process": {
+            "returncode": 0,
+            "timed_out": false,
+            "wall_seconds": 4.456678999995347
+          }
+        }
+      ]
+    },
+    {
+      "name": "gpt55_short_prefix",
+      "raw_directory": "/tmp/gloop-pi-55-cache-probe-20260909",
+      "calls": [
+        {
+          "case": "first",
+          "model": "gpt-5.5",
+          "stop_reason": "stop",
+          "error": null,
+          "usage_is_successful_measurement": true,
+          "reported_usage": {
+            "input": 1414,
+            "output": 13,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "reasoning": 0,
+            "totalTokens": 1427,
+            "cost": {
+              "input": 0.007070000000000001,
+              "output": 0.00039,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0.0074600000000000005
+            }
+          },
+          "raw_sha256": "ea2acef36eec4840983e5beeeb0f7a484a807d16ca8652be498e64888eea2d1c",
+          "process": {
+            "returncode": 0,
+            "timed_out": false,
+            "wall_seconds": 6.10429720801767
+          }
+        },
+        {
+          "case": "same_key",
+          "model": "gpt-5.5",
+          "stop_reason": "stop",
+          "error": null,
+          "usage_is_successful_measurement": true,
+          "reported_usage": {
+            "input": 1415,
+            "output": 14,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "reasoning": 0,
+            "totalTokens": 1429,
+            "cost": {
+              "input": 0.0070750000000000006,
+              "output": 0.00042,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0.007495000000000001
+            }
+          },
+          "raw_sha256": "c6de4f44d1a529f0d3929e6e5f5def604b0ac13edb45cf5993ea6b1a49b9f913",
+          "process": {
+            "returncode": 0,
+            "timed_out": false,
+            "wall_seconds": 5.4792123339721
+          }
+        },
+        {
+          "case": "different_key",
+          "model": "gpt-5.5",
+          "stop_reason": "stop",
+          "error": null,
+          "usage_is_successful_measurement": true,
+          "reported_usage": {
+            "input": 1415,
+            "output": 14,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "reasoning": 0,
+            "totalTokens": 1429,
+            "cost": {
+              "input": 0.0070750000000000006,
+              "output": 0.00042,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0.007495000000000001
+            }
+          },
+          "raw_sha256": "83b58bb1abf349c8d60429c71a2ab223151326749fed189ac85b13663f4722b4",
+          "process": {
+            "returncode": 0,
+            "timed_out": false,
+            "wall_seconds": 8.337795459025074
+          }
+        }
+      ]
+    }
+  ]
+}

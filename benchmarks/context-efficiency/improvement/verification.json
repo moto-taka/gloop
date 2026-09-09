@@ -1,0 +1,19 @@
+{
+  "command": "PATH=/usr/bin:/bin:$PATH cargo test --workspace -- --test-threads=1",
+  "exit_code": 0,
+  "suites": 25,
+  "passed": 559,
+  "failed": 0,
+  "ignored": 0,
+  "log": "/tmp/gloop-pi-cache-workspace-tests.log",
+  "log_sha256": "d01bbc700b03fef01733072cd9e42ee6a19f17816cc6d13e97aa5ef9c2f06890",
+  "live_responses_api_tested": false,
+  "live_blocker": "Explicit Responses API route still lacks an API credential; Pi/GPT-5.5 cache reuse is independently verified in pi-cache-results.json.",
+  "example_graph_validate": true,
+  "example_dry_run": true,
+  "git_diff_check": true,
+  "live_pi_cache_tested": true,
+  "pi_raw_receipts_audited": 4,
+  "pi_example_graph_validate": true,
+  "pi_example_dry_run": true
+}
