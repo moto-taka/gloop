@@ -128,6 +128,10 @@ impl AdapterOutput {
 
 #[derive(Debug, Clone)]
 pub struct AdapterRequest {
+    /// Byte length of the stable file-context prefix within `prompt`.
+    pub cache_prefix_bytes: usize,
+    /// Non-secret routing hint; only supported adapters use it.
+    pub cache_key: Option<String>,
     pub prompt: String,
     pub system_prompt: Option<String>,
     pub model: Option<String>,
@@ -141,6 +145,8 @@ pub struct AdapterRequest {
 impl AdapterRequest {
     pub fn new(prompt: impl Into<String>) -> Self {
         Self {
+            cache_prefix_bytes: 0,
+            cache_key: None,
             prompt: prompt.into(),
             system_prompt: None,
             model: None,
@@ -225,6 +231,18 @@ pub(crate) fn validate_request_limits(
     profile: &str,
     request: &AdapterRequest,
 ) -> Result<(), AdapterError> {
+    if request.cache_prefix_bytes > request.prompt.len()
+        || !request.prompt.is_char_boundary(request.cache_prefix_bytes)
+        || request
+            .cache_key
+            .as_ref()
+            .is_some_and(|key| key.is_empty() || key.len() > 64 || key.contains('\0'))
+    {
+        return Err(AdapterError::InvalidRequest {
+            profile: profile.to_owned(),
+            message: "invalid cache prefix boundary or cache routing key".to_owned(),
+        });
+    }
     if request.max_prompt_bytes == 0 {
         return Err(AdapterError::InvalidRequest {
             profile: profile.to_owned(),
@@ -263,6 +281,17 @@ pub(crate) fn validate_request_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_cache_boundaries_inside_a_utf8_character_or_outside_the_prompt() {
+        let mut request = AdapterRequest::new("要件");
+        for boundary in [1, 100] {
+            request.cache_prefix_bytes = boundary;
+            assert!(validate_request_limits("test", &request).is_err());
+        }
+        request.cache_prefix_bytes = request.prompt.len();
+        assert!(validate_request_limits("test", &request).is_ok());
+    }
 
     #[test]
     fn validate_request_limits_rejects_large_max_prompt_bytes() {
@@ -342,10 +371,17 @@ mod tests {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
+    /// Total input, including cache reads and writes when reported separately.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

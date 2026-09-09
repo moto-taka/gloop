@@ -91,8 +91,79 @@ This document gives concise notes for machine-consuming or manual tooling.
 - `RunEventKind`: run start/finish, node lifecycle events, retry, and loop lifecycle markers.
 - `FinalStatus`: `ready_for_human`, `failed`, `blocked`, `verification_failed`, `budget_exhausted`, `cancelled`
 
+### Context assembly and output contracts
+
+Agent-like nodes place `context.files` first, in declared order, followed by
+compact dependency JSON and the current task. Keep shared requirements in the
+same files and order across related nodes to preserve a common prompt prefix.
+No dependency values are summarized or truncated. The complete prompt must fit
+`context.max_bytes`; exceeding it fails before a model call. An explicit
+`{{dependencies}}` placeholder still controls placement inside the task, and
+`include_dependencies: false` still omits implicitly attached dependencies.
+
+When an output schema is configured, it is checked and included in the model's
+instructions before invocation, and the returned value is validated afterward.
+Schema instructions count toward the prompt byte limit. Schemas constrain
+structure; they do not establish that an implementation passes its tests.
+
+`node_usage` journal events retain each provider receipt with node, attempt,
+candidate, profile, requested/selected model, and reported token counts. Receipts
+are recorded before output validation, so a rejected output still has usage
+evidence. Input counts include cache reads/writes when the provider reports them
+separately; cached input and reasoning output are subsets, not extra totals.
+Absent usage remains unknown. This is provider-reported usage, not a bill or a
+guarantee of cache hits. Provider failures without a usage receipt remain unknown.
+
+Old journals without `node_usage` continue to replay. Journals containing the new
+event require a version that recognizes it; older runtimes reject unknown events.
+
 ## Inline `gloop run --model`
 
 - `--model` belongs to inline run generation (`gloop run <goal> ...`) and is applied only when no `--graph` file is used.
 - In that path, `--model` is written to every generated `agent`/`reduce`/`synthesize` node before validation.
 - `--graph` conflicts with `--model` and `--profile`; a saved graph controls model/profile behavior through its node fields.
+
+### Caching a shared file prefix through the Responses API
+
+An OpenAI profile with `api = "responses"` and `cache_prefix = true` places an
+explicit cache breakpoint after `context.files`, before dependency outputs,
+the current task and output-schema instructions. The complete prompt is kept
+in user-role content, split at a UTF-8 byte boundary; file contents are not
+promoted to developer instructions. No content is summarized or padded.
+
+The runtime supplies a routing key derived from the workspace and exact shared
+prefix. Nodes with the same ordered files in that workspace get the same key,
+even when their task/dependency text differs. A profile's explicit
+`parameters.prompt_cache_key` takes precedence. With no file prefix, the
+adapter sends an ordinary Responses request without explicit cache options.
+Existing `openai` profiles default to `api = "chat_completions"` and do not opt
+into this behavior. Command profiles consume the routing key only when they
+declare `cache_key_args`; the built-in Codex CLI profile does not.
+
+Use this only with a model/API that supports explicit breakpoints. The OpenAI
+API documentation specifies a 1,024 visible-token minimum for GPT-5.6 and
+later; routing, expiry and server load still affect hits. A cache write can
+cost more than ordinary input, so compare both cache reads and cache writes in
+`node_usage`. The runtime records reported values rather than inferring hits.
+The API path is covered by local HTTP contract tests; live cache improvement is
+not yet verified. See [the improvement report](../benchmarks/context-efficiency/improvement/REPORT.md).
+
+### Routing shared context through Pi
+
+Command profiles may declare `cache_key_args = ["--session-id", "{cache_key}"]`
+to pass the same workspace/prefix-derived key to a compatible CLI. Without a
+file prefix, these arguments are omitted. This is only a routing hint; gloop
+does not resume a conversation or add messages to it.
+
+The [Pi example profile](../examples/pi-cache-profiles.toml) combines that hint
+with `--no-session` so each node starts with empty history, using the existing
+Pi ChatGPT login. It uses GPT-5.5's implicit prefix caching. The shared document
+must be long enough for the provider to cache it; gloop does not pad inputs.
+The example also disables tool and project-context discovery.
+
+Pi assistant text is extracted from completed assistant messages, skipping
+thinking blocks and user echoes. Provider error/aborted responses are rejected.
+Pi's ordinary input, cache reads and cache writes are summed into total input
+once; output already includes reasoning. Command output limits also bound the
+raw JSON event stream, which may contain the input prompt, so allow space for
+it in `output.max_bytes`.

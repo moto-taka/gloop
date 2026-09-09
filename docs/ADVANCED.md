@@ -110,6 +110,31 @@ model catalogs can change, so confirm their current model ids before a run.
 JSON-schema example. Reasoning models can consume output budget before emitting
 assistant text, so use practical `max_tokens` values.
 
+For the OpenAI Responses API, set `api = "responses"`. To cache the shared
+`context.files` prefix explicitly, also set `cache_prefix = true`; this requires
+a model supporting explicit prompt cache breakpoints, such as GPT-5.6 or later.
+See [examples/openai-cache-profiles.toml](../examples/openai-cache-profiles.toml)
+and [examples/openai-cache-prefix.yaml](../examples/openai-cache-prefix.yaml).
+Merge the profile into `.gloop/profiles.toml`, supply `OPENAI_API_KEY` through the
+environment, and run:
+
+```bash
+gloop run --graph examples/openai-cache-prefix.yaml --trust-project-profiles
+```
+
+This is an API-key connection, separate from the Codex CLI's ChatGPT login.
+Actual cache usage must be checked in `node_usage` events; configuration alone
+does not establish a cache hit. [Context/cache semantics](SCHEMA.md#caching-a-shared-file-prefix-through-the-responses-api)
+explain the boundary and routing key.
+
+With an existing Pi ChatGPT login, the alternative
+[Pi profile](../examples/pi-cache-profiles.toml) passes a stable routing key
+while starting each node with empty history. Merge it into `.gloop/profiles.toml`
+and run `gloop run --graph examples/pi-cache-prefix.yaml --trust-project-profiles`.
+This example uses GPT-5.5 and requires Pi's `--session-id` and `--no-session`
+options (tested with Pi 0.85.1). Check the actual `node_usage` receipts; a routing
+key alone does not guarantee a cache hit.
+
 Example Anthropic-compatible profile:
 
 ```toml

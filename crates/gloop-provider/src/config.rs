@@ -97,18 +97,21 @@ impl<'de> Deserialize<'de> for Profile {
 }
 
 const COMMON_KEYS: [&str; 4] = ["enabled", "priority", "timeout_seconds", "capabilities"];
-const COMMAND_KEYS: [&str; 9] = [
+const COMMAND_KEYS: [&str; 10] = [
     "argv",
     "prompt_mode",
     "prompt_args",
     "model_args",
+    "cache_key_args",
     "system_prompt_args",
     "version_args",
     "output",
     "output_pointer",
     "env_from",
 ];
-const OPENAI_KEYS: [&str; 6] = [
+const OPENAI_KEYS: [&str; 8] = [
+    "api",
+    "cache_prefix",
     "base_url",
     "model",
     "api_key_env",
@@ -330,6 +333,8 @@ pub struct CommandProfile {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_args: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache_key_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_prompt_args: Vec<String>,
     #[serde(default = "default_version_args")]
     pub version_args: Vec<String>,
@@ -348,6 +353,7 @@ impl CommandProfile {
             prompt_mode: CommandPromptMode::Stdin,
             prompt_args: Vec::new(),
             model_args: Vec::new(),
+            cache_key_args: Vec::new(),
             system_prompt_args: Vec::new(),
             version_args: default_version_args(),
             output: OutputFormat::Text,
@@ -372,6 +378,7 @@ impl CommandProfile {
             .iter()
             .chain(&self.prompt_args)
             .chain(&self.model_args)
+            .chain(&self.cache_key_args)
             .chain(&self.system_prompt_args)
             .chain(&self.version_args)
             .any(|argument| argument.contains('\0'))
@@ -386,6 +393,7 @@ impl CommandProfile {
             .iter()
             .chain(&self.prompt_args)
             .chain(&self.model_args)
+            .chain(&self.cache_key_args)
             .chain(&self.system_prompt_args)
             .chain(&self.version_args)
             .any(|argument| argument.len() > MAX_PROFILE_FIELD_BYTES)
@@ -409,6 +417,17 @@ impl CommandProfile {
             return Err(ConfigError::InvalidProfile {
                 profile: name.to_owned(),
                 message: "output_pointer must be an RFC 6901 JSON pointer".to_owned(),
+            });
+        }
+        if !self.cache_key_args.is_empty()
+            && !self
+                .cache_key_args
+                .iter()
+                .any(|argument| argument.contains("{cache_key}"))
+        {
+            return Err(ConfigError::InvalidProfile {
+                profile: name.to_owned(),
+                message: "cache_key_args must contain the {cache_key} placeholder".to_owned(),
             });
         }
         if !self.model_args.is_empty()
@@ -459,9 +478,21 @@ impl CommandProfile {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiApi {
+    #[default]
+    ChatCompletions,
+    Responses,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenAiProfile {
+    #[serde(default)]
+    pub api: OpenAiApi,
+    #[serde(default)]
+    pub cache_prefix: bool,
     #[serde(default = "default_openai_base_url")]
     pub base_url: Url,
     pub model: String,
@@ -477,6 +508,19 @@ pub struct OpenAiProfile {
 
 impl OpenAiProfile {
     fn validate(&self, name: &str) -> Result<(), ConfigError> {
+        if self.cache_prefix && self.api != OpenAiApi::Responses {
+            return Err(ConfigError::InvalidProfile {
+                profile: name.to_owned(),
+                message: "cache_prefix requires api = responses".to_owned(),
+            });
+        }
+        if self.cache_prefix && self.parameters.contains_key("prompt_cache_options") {
+            return Err(ConfigError::InvalidProfile {
+                profile: name.to_owned(),
+                message: "cache_prefix controls prompt_cache_options; do not set both".to_owned(),
+            });
+        }
+
         validate_http_profile(
             name,
             &self.base_url,
@@ -495,7 +539,11 @@ impl OpenAiProfile {
         }
         validate_header_env(name, &self.headers_from)?;
         validate_http_parameters(name, &self.parameters)?;
-        for reserved in ["model", "messages", "stream"] {
+        let reserved: &[&str] = match self.api {
+            OpenAiApi::ChatCompletions => &["model", "messages", "stream"],
+            OpenAiApi::Responses => &["model", "input", "instructions", "stream"],
+        };
+        for &reserved in reserved {
             if self.parameters.contains_key(reserved) {
                 return Err(ConfigError::InvalidProfile {
                     profile: name.to_owned(),
@@ -912,6 +960,7 @@ fn builtin_command(
         prompt_mode,
         prompt_args: prompt_args.into_iter().map(str::to_owned).collect(),
         model_args: model_args.into_iter().map(str::to_owned).collect(),
+        cache_key_args: Vec::new(),
         system_prompt_args: Vec::new(),
         version_args: default_version_args(),
         output,
@@ -1063,6 +1112,20 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn prefix_caching_requires_responses_and_owns_the_breakpoint_policy() {
+        for source in [
+            "cache_prefix=true\nmodel='test'",
+            "api='responses'\ncache_prefix=true\nmodel='test'\n[parameters]\nprompt_cache_options={mode='implicit'}",
+        ] {
+            let profile: OpenAiProfile = toml::from_str(source).unwrap();
+            assert!(profile.validate("test").is_err());
+        }
+        let profile: OpenAiProfile =
+            toml::from_str("api='responses'\ncache_prefix=true\nmodel='test'").unwrap();
+        profile.validate("test").unwrap();
+    }
 
     #[test]
     fn builtins_have_safe_argv_and_expected_names() {
@@ -1335,6 +1398,11 @@ api_key_env = "COMPATIBLE_API_KEY"
     #[test]
     fn rejects_command_templates_without_required_placeholders() {
         for (field, value, expected) in [
+            (
+                "cache_key_args",
+                "[\"--session-id\", \"fixed\"]",
+                "{cache_key}",
+            ),
             ("model_args", "[\"--model\", \"fixed\"]", "{model}"),
             (
                 "system_prompt_args",

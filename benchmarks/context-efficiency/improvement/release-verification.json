@@ -1,0 +1,11 @@
+{
+  "version": "0.9.0",
+  "command": "cargo test --workspace -- --test-threads=1",
+  "exit_code": 0,
+  "test_groups": 24,
+  "passed": 553,
+  "failed": 0,
+  "ignored": 0,
+  "log_sha256": "af107c51ada0da5295192b65bd16c18203a65cf79cd49264571f9cd0f130f105",
+  "scope": "Isolated release tree; no additional model comparison runs"
+}

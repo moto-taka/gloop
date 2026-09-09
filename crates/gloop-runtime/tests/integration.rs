@@ -510,7 +510,7 @@ async fn runtime_failure_edges_run_when_source_fails() {
             }),
         },
         ScriptedInvocation {
-            expect_prompt_fragment: Some("\"status\": \"failed\"".to_owned()),
+            expect_prompt_fragment: Some("\"status\":\"failed\"".to_owned()),
             wait_for_release: false,
             invocation: Invocation::Ok {
                 profile: "p".to_owned(),

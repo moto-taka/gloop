@@ -163,6 +163,11 @@ pub fn replay_events_partial(events: &[RunEvent]) -> Result<ReplayReport, Replay
                 outcome.attempts = outcome.attempts.max(attempt);
                 outcome.started_at.get_or_insert(event.timestamp);
             }
+            RunEventKind::NodeUsage => {
+                require_declared_root(event, &nodes, &root_nodes)?;
+                let outcome = outcome_for(event, &mut nodes)?;
+                require_status(event, outcome.status, &[NodeStatus::Running], "emit usage")?;
+            }
             RunEventKind::NodeOutput => {
                 require_declared_root(event, &nodes, &root_nodes)?;
                 let outcome = outcome_for(event, &mut nodes)?;

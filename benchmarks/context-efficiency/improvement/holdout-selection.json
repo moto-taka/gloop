@@ -1,0 +1,14 @@
+{
+  "selected_before_development_run_results": true,
+  "seed": 20260909,
+  "population": "34 Python exercises minus original six development tasks",
+  "tasks": [
+    "book-store",
+    "zipper",
+    "dot-dsl",
+    "variable-length-quantity",
+    "robot-name",
+    "bottle-song"
+  ],
+  "purpose": "Independent confirmation after freezing product changes; do not tune against these answers"
+}

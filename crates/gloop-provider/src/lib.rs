@@ -13,7 +13,7 @@ pub use adapter::{
     OutputFormat, ProviderAdapter, TokenUsage,
 };
 pub use config::{
-    AnthropicProfile, CommandProfile, CommandPromptMode, ConfigError, OpenAiProfile,
+    AnthropicProfile, CommandProfile, CommandPromptMode, ConfigError, OpenAiApi, OpenAiProfile,
     PROJECT_CONFIG_PATH, Profile, ProfileKind, ProfileStore, SecretRef, USER_CONFIG_FILE,
 };
 pub use models::{

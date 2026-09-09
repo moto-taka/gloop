@@ -1,0 +1,28 @@
+[
+  {
+    "command": [
+      "graph",
+      "validate",
+      "<local-workspace>/examples/openai-cache-prefix.yaml",
+      "--json"
+    ],
+    "exit_code": 0,
+    "stdout": "{\n  \"errors\": [],\n  \"graph\": \"shared-context-cache\",\n  \"success\": true,\n  \"validation_count\": 0,\n  \"warnings\": []\n}\n",
+    "stderr": ""
+  },
+  {
+    "command": [
+      "run",
+      "--repo",
+      "/var/folders/wq/wc2jcks94pb9m43mlwgdrd6w0000gn/T/gloop-api-cache-config-0ktgjj9z",
+      "--graph",
+      "<local-workspace>/examples/openai-cache-prefix.yaml",
+      "--trust-project-profiles",
+      "--dry-run",
+      "--json"
+    ],
+    "exit_code": 0,
+    "stdout": "{\n  \"dry_run\": true,\n  \"effective_max_parallel\": 1,\n  \"goal\": \"Answer two documentation questions using the same cached source context\",\n  \"graph\": \"shared-context-cache\",\n  \"max_parallel\": 1,\n  \"model\": null,\n  \"profile\": \"default\",\n  \"success\": true,\n  \"yaml\": \"apiVersion: gloop.dev/v1alpha1\\nkind: Graph\\nmetadata:\\n  name: shared-context-cache\\n  version: 1.0.0\\nspec:\\n  goal: Answer two documentation questions using the same cached source context\\n  policies:\\n    max_parallel: 1\\n    failure: fail_fast\\n  budgets:\\n    wall_time_seconds: 300\\n    model_calls: 2\\n  nodes:\\n  - id: context_rules\\n    requires: []\\n    resources: []\\n    retry:\\n      max_attempts: 1\\n      backoff_seconds: 0\\n      rebind_profiles: []\\n    workspace:\\n      mode: current\\n    context:\\n      include_dependencies: true\\n      files:\\n      - docs/SCHEMA.md\\n      max_bytes: 262144\\n    continue_on_failure: false\\n    kind: agent\\n    prompt: Explain how context files and dependency outputs are assembled. Return a JSON object with one brief answer string.\\n    profile: openai-context\\n    fan_out: 1\\n    output:\\n      format: json\\n      inline_schema:\\n        additionalProperties: false\\n        properties:\\n          answer:\\n            type: string\\n        required:\\n        - answer\\n        type: object\\n      max_bytes: 8192\\n  - id: output_rules\\n    requires: []\\n    resources: []\\n    retry:\\n      max_attempts: 1\\n      backoff_seconds: 0\\n      rebind_profiles: []\\n    workspace:\\n      mode: current\\n    context:\\n      include_dependencies: true\\n      files:\\n      - docs/SCHEMA.md\\n      max_bytes: 262144\\n    continue_on_failure: false\\n    kind: agent\\n    prompt: Explain when output schemas are sent and when they are validated. Return a JSON object with one brief answer string.\\n    profile: openai-context\\n    fan_out: 1\\n    output:\\n      format: json\\n      inline_schema:\\n        additionalProperties: false\\n        properties:\\n          answer:\\n            type: string\\n        required:\\n        - answer\\n        type: object\\n      max_bytes: 8192\\n  edges:\\n  - from: context_rules\\n    to: output_rules\\n    kind: control\\n\"\n}\n",
+    "stderr": ""
+  }
+]

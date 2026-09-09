@@ -2486,7 +2486,7 @@ fn event_kind_label(kind: RunEventKind, lang: Language) -> &'static str {
         RunEventKind::RunStarted => strings.event_run_started,
         RunEventKind::NodeReady => strings.event_ready,
         RunEventKind::NodeStarted => strings.event_running,
-        RunEventKind::NodeOutput => strings.event_output,
+        RunEventKind::NodeOutput | RunEventKind::NodeUsage => strings.event_output,
         RunEventKind::NodeSucceeded => strings.event_succeeded,
         RunEventKind::NodeFailed => strings.event_failed,
         RunEventKind::NodeSkipped => strings.event_skipped,

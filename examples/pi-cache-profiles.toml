@@ -1,0 +1,12 @@
+# Uses existing Pi ChatGPT authentication; each node starts with empty history.
+[profiles.pi-context]
+kind = "command"
+argv = ["pi", "--print", "--mode", "json", "--provider", "openai-codex", "--thinking", "low", "--no-session", "--no-tools", "--no-extensions", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-themes", "--no-approve", "--offline"]
+prompt_mode = "argument"
+prompt_args = ["{prompt}"]
+model_args = ["--model", "{model}"]
+system_prompt_args = ["--system-prompt", "{system_prompt}"]
+cache_key_args = ["--session-id", "{cache_key}"]
+output = "jsonl"
+output_pointer = "/message/content/0/text"
+timeout_seconds = 120

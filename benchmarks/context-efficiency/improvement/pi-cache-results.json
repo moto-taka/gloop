@@ -1,0 +1,174 @@
+{
+  "scope": "Documentation cache validation, not a coding quality benchmark",
+  "pi_version": "0.85.1",
+  "raw_directory": "benchmarks/context-efficiency/work/pi-cache-20260909",
+  "document_probe": {
+    "protocol": {
+      "monitor_owner": "/root",
+      "deadline_epoch": 1788955489.665965,
+      "terminal": [
+        "exit",
+        "timeout"
+      ],
+      "calls": 3,
+      "scope": "graph schema document cache probe; no benchmark pass-rate claims",
+      "source": "<local-workspace>/docs/SCHEMA.md",
+      "source_sha256": "f22420f8f33df90a8e1534ff46658c2419641c4dc38d48e9d296a626238538af",
+      "prefix_bytes": 9428,
+      "provider": "openai-codex",
+      "model": "gpt-5.5"
+    },
+    "calls": [
+      {
+        "case": "first",
+        "model": "gpt-5.5",
+        "reported_usage": {
+          "input": 2241,
+          "output": 47,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "reasoning": 0,
+          "totalTokens": 2288,
+          "cost": {
+            "input": 0.011205000000000001,
+            "output": 0.00141,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0.012615000000000001
+          }
+        },
+        "total_input_tokens": 2241,
+        "cache_hit_fraction": 0.0,
+        "raw_sha256": "27e8e47d1ab5b21df967d04b86f6f561ba4ba8ce83d83c9efeb1118bb5a92b5a"
+      },
+      {
+        "case": "same_key",
+        "model": "gpt-5.5",
+        "reported_usage": {
+          "input": 450,
+          "output": 29,
+          "cacheRead": 1792,
+          "cacheWrite": 0,
+          "reasoning": 9,
+          "totalTokens": 2271,
+          "cost": {
+            "input": 0.0022500000000000003,
+            "output": 0.00087,
+            "cacheRead": 0.000896,
+            "cacheWrite": 0,
+            "total": 0.0040160000000000005
+          }
+        },
+        "total_input_tokens": 2242,
+        "cache_hit_fraction": 0.7992863514719001,
+        "raw_sha256": "e989337f4ea4a707945415151baf69120f9c746f5c30bbba49c90860837c7bd4"
+      },
+      {
+        "case": "different_key",
+        "model": "gpt-5.5",
+        "reported_usage": {
+          "input": 2241,
+          "output": 19,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "reasoning": 0,
+          "totalTokens": 2260,
+          "cost": {
+            "input": 0.011205000000000001,
+            "output": 0.00057,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0.011775
+          }
+        },
+        "total_input_tokens": 2241,
+        "cache_hit_fraction": 0.0,
+        "raw_sha256": "3311fbfd3ce61ce5ded5e67030a55eb5a1d76eac05dcb3dcdefb4dbaab68bad1"
+      }
+    ]
+  },
+  "gloop_runs": [
+    {
+      "model": "gpt-5.5",
+      "run_id": "01m230yangdwychz5y8b9cvryp",
+      "graph_hash": "fb264707b6cb40c105724af7a3257c9c02f7f613e3b0d43d844686dd3d42e6d0",
+      "status": "ready_for_human",
+      "node_receipts": [
+        {
+          "node_id": "context_rules",
+          "usage": {
+            "cache_write_input_tokens": 0,
+            "cached_input_tokens": 0,
+            "input_tokens": 2635,
+            "output_tokens": 83,
+            "reasoning_output_tokens": 0
+          },
+          "cache_hit_fraction": 0.0,
+          "raw_sha256": "8b3811c2f7668099e21179620b02fa39d5f9d20eadace932c24bb9eaa5b6383d",
+          "output": {
+            "answer": "Agent-like nodes assemble context by placing context.files first in declared order, then compact dependency JSON, then the current task. Shared files/order preserve a common prompt prefix. Dependency outputs are included completely\u2014no summarization or truncation\u2014and the full prompt must fit context.max_bytes. A {{dependencies}} placeholder can control dependency placement, and include_dependencies: false omits implicit dependencies."
+          }
+        },
+        {
+          "node_id": "output_rules",
+          "usage": {
+            "cache_write_input_tokens": 0,
+            "cached_input_tokens": 1792,
+            "input_tokens": 2727,
+            "output_tokens": 42,
+            "reasoning_output_tokens": 0
+          },
+          "cache_hit_fraction": 0.6571323799046571,
+          "raw_sha256": "10cf430aec191053056a93886bf5d3f21b59e9dcb8dd87bf32e2c200b9f78058",
+          "output": {
+            "answer": "When an output schema is configured, it is included in the model instructions before invocation and counted toward the prompt byte limit; the returned output is validated against it after invocation."
+          }
+        }
+      ],
+      "journal_sha256": "368b793e3761b587b75287745da7d5605996b8ef55dd3cd802265cdcda03260d"
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "run_id": "01m23109b0984c2983mpzgsvca",
+      "graph_hash": "fb264707b6cb40c105724af7a3257c9c02f7f613e3b0d43d844686dd3d42e6d0",
+      "status": "ready_for_human",
+      "node_receipts": [
+        {
+          "node_id": "context_rules",
+          "usage": {
+            "cache_write_input_tokens": 0,
+            "cached_input_tokens": 0,
+            "input_tokens": 2636,
+            "output_tokens": 79,
+            "reasoning_output_tokens": 19
+          },
+          "cache_hit_fraction": 0.0,
+          "raw_sha256": "d3d68daf6cfa898d9b5e29e5c51b3d8ac0df4201c1970c48bfce3700c19d4846",
+          "output": {
+            "answer": "Context files are included first in their declared order, followed by compact dependency JSON and the current task. An explicit {{dependencies}} placeholder controls dependency placement, while include_dependencies: false omits implicit dependencies; the complete assembled prompt must fit context.max_bytes."
+          }
+        },
+        {
+          "node_id": "output_rules",
+          "usage": {
+            "cache_write_input_tokens": 0,
+            "cached_input_tokens": 0,
+            "input_tokens": 2703,
+            "output_tokens": 29,
+            "reasoning_output_tokens": 0
+          },
+          "cache_hit_fraction": 0.0,
+          "raw_sha256": "ea192bd53a833fe07f49c37107525da42cd8c0b73616bfc9b97213a52a579c81",
+          "output": {
+            "answer": "Output schemas are sent in the model instructions before invocation when configured, then validated against the returned output afterward."
+          }
+        }
+      ],
+      "journal_sha256": "93cc48212ef862ddedfa95218b2856b49037120aaa334e38f93b487ca05f7e3d"
+    }
+  ],
+  "limitations": [
+    "Two live example runs use different models; they do not measure coding pass rate or relative token savings.",
+    "The first GPT-5.5 gloop attempt exceeded its raw stdout bound; provider usage for that interrupted attempt is unknown."
+  ]
+}

@@ -1,0 +1,66 @@
+{
+  "status": "aborted_before_any_solution",
+  "reason": "Claude subscription returned HTTP 429 session limit on all three initial design calls; circuit breaker stopped the batch",
+  "protocol": {
+    "name": "gloop-context-efficiency-pilot",
+    "dataset": "Aider-AI/polyglot-benchmark",
+    "dataset_url": "https://github.com/Aider-AI/polyglot-benchmark",
+    "dataset_revision": "7e0611e77b54e2dea774cdc0aa00cf9f7ed6144f",
+    "population": "python/exercises/practice (34 exercises)",
+    "sampling": "random.Random(20260908).sample(sorted(exercise_names), 6), before any model solution",
+    "tasks": [
+      "paasio",
+      "grep",
+      "rest-api",
+      "bowling",
+      "dominoes",
+      "proverb"
+    ],
+    "model": "claude-haiku-4-5-20251001",
+    "cli_version": "2.1.263",
+    "effort": "low",
+    "arms": [
+      "retained_conversation",
+      "gloop_artifact_handoff"
+    ],
+    "stages": [
+      "design",
+      "implement",
+      "test_initial",
+      "review_or_repair_once",
+      "test_final",
+      "pr_draft"
+    ],
+    "max_model_calls": 48,
+    "max_repairs_per_task": 1,
+    "model_call_timeout_seconds": 120,
+    "test_timeout_seconds": 30,
+    "max_total_reported_api_equivalent_usd": 6,
+    "max_reported_api_equivalent_usd_per_cli_call": 0.2,
+    "test_image": "python@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea",
+    "test_network": "none",
+    "model_tools": "disabled; same fixed system prompt, no user/project hooks, plugins or memory",
+    "input": "public instructions including appendices and starter source; reference implementations and full tests are not sent to the model",
+    "feedback": "same unmodified upstream tests after implementation, output capped at 12000 UTF-8 bytes; one review stage may replace code if tests failed",
+    "retained_conversation": "one persistent Claude session per task; subsequent stages receive only new instructions and test feedback, without redundant task/source repetition",
+    "gloop_artifact_handoff": "real gloop runtime with fresh Claude session per model node; explicit predecessor outputs plus shared task brief, no conversation resume",
+    "ordering": "paired tasks in the fixed sample order; arm order alternates per task",
+    "primary_metrics": [
+      "all-model reported input tokens including cache reads and writes",
+      "all-model reported output tokens",
+      "initial and final test pass",
+      "reported API-equivalent cost",
+      "wall time",
+      "repair count"
+    ],
+    "caveats": [
+      "Custom workflow adaptation of six public Python exercises, not an official Aider leaderboard score",
+      "One run per task and arm; no statistical superiority claim",
+      "PR draft is local; no benchmark PRs are sent to GitHub",
+      "Claude subscription is used; CLI list-price estimates are not actual billing",
+      "Caches are measured, not claimed cold or identical",
+      "This two-arm pilot does not measure native subagent orchestration",
+      "Small exercise workflows do not establish results on large repository engineering tasks"
+    ]
+  }
+}

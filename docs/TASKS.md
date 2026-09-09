@@ -141,7 +141,12 @@ gloop start --graph workflow.yaml --max-calls 8 --timeout 1800 --json
 `--after` requires a finished task with readable execution results in the same
 project. It starts a new invocation; it does not resume a provider's private chat
 session. The previous request, status, provider/model names, results, and errors
-form a reference attachment capped at 24 KiB on a UTF-8 boundary. Older turns are
+form a complete JSON reference attachment capped at 24 KiB. If outputs do not
+fit, the largest outputs are replaced with explicit omission markers and their
+artifact paths; every step's status and error is retained. Follow artifact paths
+under `run_artifacts` when the omitted content is needed. Essential metadata that
+still exceeds the limit is rejected before invoking another model, rather than
+cutting off a final verification failure. Older turns are
 not automatically replayed. `job.handoff_bytes` and `job.handoff_truncated` record
 what was attached. The new user request is kept outside that bounded attachment.
 

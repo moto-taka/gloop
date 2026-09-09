@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 struct TestInvoker {
     planned: Mutex<Vec<Result<AdapterResponse, AdapterError>>>,
     call_count: AtomicUsize,
+    prompts: Mutex<Vec<String>>,
 }
 
 impl TestInvoker {
@@ -26,6 +27,7 @@ impl TestInvoker {
         Arc::new(Self {
             planned: Mutex::new(planned.into_iter().map(Ok).collect()),
             call_count: AtomicUsize::new(0),
+            prompts: Mutex::new(Vec::new()),
         })
     }
 
@@ -33,6 +35,7 @@ impl TestInvoker {
         Arc::new(Self {
             planned: Mutex::new(vec![Err(error)]),
             call_count: AtomicUsize::new(0),
+            prompts: Mutex::new(Vec::new()),
         })
     }
 }
@@ -43,10 +46,11 @@ impl ProviderInvoker for TestInvoker {
         &self,
         preferred_profile: Option<&str>,
         _required: &AdapterCapabilities,
-        _request: AdapterRequest,
+        request: AdapterRequest,
         _cancellation: CancellationToken,
     ) -> Result<ProviderInvocation, AdapterError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
+        self.prompts.lock().await.push(request.prompt);
         let response = {
             let mut lock = self.planned.lock().await;
             lock.pop().expect("provider invocation planned")
@@ -92,7 +96,12 @@ fn build_graph_and_bad_response() -> (gloop_core::Graph, serde_json::Value, Adap
         exit_code: Some(0),
         reported_model: Some("provider-model".to_owned()),
         reported_model_informational: false,
-        usage: Some(TokenUsage::default()),
+        usage: Some(TokenUsage {
+            input_tokens: Some(1000),
+            cached_input_tokens: Some(800),
+            output_tokens: Some(30),
+            ..TokenUsage::default()
+        }),
     };
     (graph, bad_output, response)
 }
@@ -121,6 +130,18 @@ async fn provider_output_and_streams_are_written_as_artifacts_on_schema_validati
     let events = read_events(run_dir.join("journal.jsonl"))
         .await
         .expect("read events");
+    let receipts = events
+        .iter()
+        .filter(|event| event.kind == RunEventKind::NodeUsage)
+        .collect::<Vec<_>>();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].data["usage"]["input_tokens"], 1000);
+    assert_eq!(receipts[0].data["usage"]["cached_input_tokens"], 800);
+    assert_eq!(receipts[0].attempt, Some(1));
+    let prompts = invoker.prompts.lock().await;
+    assert!(prompts[0].contains("Your output must satisfy this JSON Schema:"));
+    assert!(prompts[0].contains("\"required\":[\"value\"]"));
+    drop(prompts);
     let failure_event = events
         .into_iter()
         .find(|event| {
